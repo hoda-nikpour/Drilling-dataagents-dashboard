@@ -12,9 +12,6 @@ MAX_POINTS_PER_TRACE = 12000
 MAX_POINTS_PER_TRACE_ZOOM = 20000
 
 # Marker settings
-# Important:
-# Plotly zoom inside the chart does not automatically re-run Streamlit code,
-# so marker size should not rely on chart zoom alone.
 BASE_MARKER_SIZE = 0.5
 ZOOM_MARKER_SIZE = 7.0
 
@@ -23,15 +20,14 @@ REQUIRED_META_COLUMNS = ["TIME", "_section_in", "DEPT"]
 
 # Track colors
 TRACK_COLOR_PALETTE = [
-    "#8E44AD",  # purple
-    "#3498DB",  # blue
-    "#E74C3C",  # red
+    "#8E44AD",
+    "#3498DB",
+    "#E74C3C",
 ]
 
-# Sidebar labels mapped to possible raw data-file column names
 PARAMETER_ALIASES = {
     "Bit Depth": ["BDTI", "BITD", "BIT_DEPTH"],
-    "Well Depth (DBTM)": ["GS_DBTM", "DBTM"],
+    "Well Depth": ["GS_DMEA", "DMEA", "DEPT", "GS_DVER", "DVER", "DBTV", "GS_DBTM", "DBTM"],
     "BPOS": ["GS_BPOS", "BPOS"],
     "HKL": ["GS_HKLD", "HKL", "HKLD"],
     "MFI": ["GS_MFI", "MFI"],
@@ -40,11 +36,12 @@ PARAMETER_ALIASES = {
     "TRQ": ["GS_TQA", "TRQ", "TQA"],
     "ROP": ["ROP", "GS_ROP", "DRILL_RATE", "RATE_OF_PENETRATION"],
     "Pit Level": ["GS_PITLV", "GS_PITLVL", "GS_PIT", "PITLV", "PITLVL", "PIT"],
+    "WOB": ["WOB", "GS_WOB", "SWOB", "GS_SWOB", "SWOB30s"],
 }
 
 PARAMETER_DISPLAY_NAMES = {
     "Bit Depth": "Bit Depth — current bit depth",
-    "Well Depth (DBTM)": "DBTM — well depth / depth to bottom",
+    "Well Depth": "Well Depth — measured/hole depth",
     "BPOS": "BPOS — block position",
     "HKL": "HKL — hook load",
     "MFI": "MFI — mud flow in",
@@ -53,9 +50,9 @@ PARAMETER_DISPLAY_NAMES = {
     "TRQ": "TRQ — torque",
     "ROP": "ROP — rate of penetration",
     "Pit Level": "Pit Level — mud pit level",
+    "WOB": "WOB — weight on bit",
 }
 
-# Parameter catalog for boss review
 PARAMETER_CATALOG = {
     "Bit Depth": {
         "meaning": "Current bit depth",
@@ -63,11 +60,12 @@ PARAMETER_CATALOG = {
         "logical_min": 0.0,
         "logical_max": 6000.0,
     },
-    "Well Depth (DBTM)": {
-        "meaning": "Well depth / depth to bottom",
+    "Well Depth": {
+        "meaning": "Measured/hole depth",
         "unit": "m",
         "logical_min": 0.0,
         "logical_max": 6000.0,
+    
     },
     "BPOS": {
         "meaning": "Block position",
@@ -117,6 +115,12 @@ PARAMETER_CATALOG = {
         "logical_min": 0.0,
         "logical_max": 100.0,
     },
+    "WOB": {
+        "meaning": "Weight on bit",
+        "unit": "ton",
+        "logical_min": -5.0,
+        "logical_max": 60.0,
+    },
 }
 
 LOGICAL_PARAMETER_RANGES = {
@@ -125,3 +129,22 @@ LOGICAL_PARAMETER_RANGES = {
 }
 
 AGENT_TRACK_XRANGE = (0.0, 1.0)
+
+ACTIVITY_COLOR_MAP = {
+    "MakingConnection": "rgba(155, 89, 182, 0.92)",
+    "Drilling": "rgba(231, 76, 60, 0.92)",
+    "Reaming": "rgba(52, 152, 219, 0.92)",
+    "TrippingIn": "rgba(46, 204, 113, 0.92)",
+    "TrippingOut": "rgba(241, 196, 15, 0.92)",
+    "Conditioning": "rgba(26, 188, 156, 0.92)",
+    "Circulating": "rgba(230, 126, 34, 0.92)",
+    "Other": "rgba(149, 165, 166, 0.88)",
+}
+
+SYMPTOM_COLOR_MAP = {
+    "OpenHoleLength": "rgba(142, 68, 173, 0.92)",
+    "TRQSpike": "rgba(192, 57, 43, 0.92)",
+    "PSpike": "rgba(41, 128, 185, 0.92)",
+    "OverPull": "rgba(39, 174, 96, 0.92)",
+    "TookWeight": "rgba(243, 156, 18, 0.92)",
+}

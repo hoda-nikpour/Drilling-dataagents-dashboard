@@ -3,9 +3,15 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import AGENT_TRACK_XRANGE, LOGICAL_PARAMETER_RANGES, N_TRACKS, PARAMETER_CATALOG
-from helpers import downsample_xy, format_number, get_display_mode, get_target_points
-
+from config import (
+    ACTIVITY_COLOR_MAP,
+    AGENT_TRACK_XRANGE,
+    LOGICAL_PARAMETER_RANGES,
+    N_TRACKS,
+    PARAMETER_CATALOG,
+    SYMPTOM_COLOR_MAP,
+)
+from utils.helpers import downsample_xy, format_number, get_display_mode, get_target_points
 
 TAG_X = 0.24
 OVERLAP_X = 0.50
@@ -86,6 +92,10 @@ def _agent_line_width(severity: str) -> int:
     return {"Low": 2, "Medium": 4, "High": 7}.get(severity, 4)
 
 
+def _activity_line_width(label: str) -> int:
+    return 5 if label in {"Drilling", "Reaming", "TrippingIn", "TrippingOut"} else 4
+
+
 def _interval_overlap(a_start, a_end, b_start, b_end):
     start = max(pd.Timestamp(a_start), pd.Timestamp(b_start))
     end = min(pd.Timestamp(a_end), pd.Timestamp(b_end))
@@ -96,6 +106,7 @@ def _interval_overlap(a_start, a_end, b_start, b_end):
 
 def _compute_overlap_intervals(tag_intervals: list[dict], agent_intervals: list[dict]) -> list[dict]:
     overlaps = []
+
     for tag in tag_intervals:
         for agent in agent_intervals:
             ov = _interval_overlap(tag["start"], tag["end"], agent["start"], agent["end"])
@@ -108,6 +119,7 @@ def _compute_overlap_intervals(tag_intervals: list[dict], agent_intervals: list[
                         "agent_label": agent.get("label", ""),
                     }
                 )
+
     return overlaps
 
 
@@ -134,6 +146,9 @@ def _add_vertical_interval_line(
     col: int,
     hover_text: str | None = None,
 ):
+    if pd.Timestamp(end_time) < pd.Timestamp(start_time):
+        return
+
     y_vals = pd.date_range(pd.Timestamp(start_time), pd.Timestamp(end_time), periods=20)
     x_vals = np.full(len(y_vals), x_pos)
 
@@ -149,6 +164,79 @@ def _add_vertical_interval_line(
         row=row,
         col=col,
     )
+
+
+def _compute_activity_lane_summary(activity_intervals: list[dict]) -> list[dict]:
+    if not activity_intervals:
+        return []
+
+    rows = []
+    for item in activity_intervals:
+        duration_hours = (
+            pd.Timestamp(item["end"]) - pd.Timestamp(item["start"])
+        ).total_seconds() / 3600.0
+
+        rows.append(
+            {
+                "label": item["label"],
+                "duration_hours": max(duration_hours, 0.0),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    summary = (
+        df.groupby("label", dropna=False)
+        .agg(
+            count=("label", "size"),
+            duration_hours=("duration_hours", "sum"),
+        )
+        .reset_index()
+        .sort_values(["count", "duration_hours"], ascending=[False, False])
+    )
+
+    return summary.to_dict("records")
+
+
+def _add_activity_summary_annotations(fig: go.Figure, activity_intervals: list[dict]):
+    summary_rows = _compute_activity_lane_summary(activity_intervals)
+    if not summary_rows:
+        return
+
+    summary_rows = summary_rows[:6]
+    y_start = 0.97
+    y_step = 0.055
+
+    fig.add_annotation(
+        xref="x4",
+        yref="paper",
+        x=0.50,
+        y=0.995,
+        text="<b>Activity Summary</b>",
+        showarrow=False,
+        font=dict(size=10, color="#333"),
+    )
+
+    for i, row in enumerate(summary_rows):
+        y = y_start - i * y_step
+        label = row["label"]
+        count = row["count"]
+        duration_hours = row["duration_hours"]
+        color = ACTIVITY_COLOR_MAP.get(label, "rgba(149, 165, 166, 0.88)")
+
+        fig.add_annotation(
+            xref="x4",
+            yref="paper",
+            x=0.50,
+            y=y,
+            text=(
+                f"<span style='color:{color}'><b>{label}</b></span>"
+                f" &nbsp;|&nbsp; n={count}"
+                f" &nbsp;|&nbsp; {duration_hours:.2f} h"
+            ),
+            showarrow=False,
+            font=dict(size=9, color="#444"),
+            align="center",
+        )
 
 
 def add_reference_line(fig: go.Figure, reference_time):
@@ -217,18 +305,36 @@ def add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
     for i, agent in enumerate(agent_intervals, start=1):
         label = agent.get("label", f"Hit {i}")
         severity = agent.get("severity", "Medium")
-        hover_text = f"Agent hit<br>{label}<br>Severity: {severity}"
+
+        if agent.get("source") == "activity_agent":
+            color = ACTIVITY_COLOR_MAP.get(label, "rgba(149, 165, 166, 0.88)")
+            width = _activity_line_width(label)
+            hover_text = f"Activity<br>{label}"
+        elif agent.get("source") == "symptom_agent":
+            color = SYMPTOM_COLOR_MAP.get(label, "rgba(220, 50, 47, 0.92)")
+            width = _agent_line_width(severity)
+            hover_text = f"Symptom<br>{label}<br>Severity: {severity}"
+        else:
+            color = "rgba(220, 50, 47, 0.92)"
+            width = _agent_line_width(severity)
+            hover_text = f"Agent hit<br>{label}<br>Severity: {severity}"
+
         _add_vertical_interval_line(
             fig=fig,
             x_pos=AGENT_X,
             start_time=agent["start"],
             end_time=agent["end"],
-            color="rgba(220, 50, 47, 0.92)",
-            width=_agent_line_width(severity),
+            color=color,
+            width=width,
             row=row,
             col=col,
             hover_text=hover_text,
         )
+
+    activity_intervals_only = [
+        item for item in agent_intervals if item.get("source") == "activity_agent"
+    ]
+    _add_activity_summary_annotations(fig, activity_intervals_only)
 
     fig.add_annotation(
         xref="x4",
@@ -548,15 +654,18 @@ def create_multi_track_chart(
     if t_min_view is not None and t_max_view is not None:
         y_range = [t_max_view, t_min_view]
 
+    tickvals, ticktext = _build_dual_time_ticks(t_min_view, t_max_view, n_ticks=12)
+
     fig.update_yaxes(
         range=y_range,
         autorange=False if y_range else "reversed",
         showgrid=True,
         gridcolor="rgba(140,140,140,0.20)",
         gridwidth=0.6,
+        tickmode="array" if tickvals is not None else "auto",
+        tickvals=tickvals,
+        ticktext=ticktext,
         tickfont=dict(size=10, family="Courier New"),
-        tickformat="%d-%b-%y\n%H:%M:%S",
-        nticks=12,
     )
 
     fig.add_annotation(
