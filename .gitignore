@@ -11,6 +11,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
 
 # =========================
 # System files
@@ -32,11 +33,6 @@ env/
 # =========================
 comparecsv.py
 code.txt
-# =========================
-# Optional: Large raw data (uncomment if needed)
-# =========================
-# data/raw/
-# *.mat
 
 # =========================
 # Jupyter (if you ever use it)
