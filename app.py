@@ -3,7 +3,7 @@ import streamlit as st
 
 from agents.activity_agents import REQUIRED_ACTIVITY_INPUTS
 from agents.symptom_agents import REQUIRED_SYMPTOM_INPUTS
-from config import PARAMETER_ALIASES, PARAMETER_CATALOG, TRACK_COLOR_PALETTE
+from config import DEFAULT_MARKER_DISPLAY, PARAMETER_ALIASES, PARAMETER_CATALOG, TRACK_COLOR_PALETTE
 from data_access.data_loader import (
     get_available_numeric_columns,
     load_catalog,
@@ -126,6 +126,10 @@ def main():
 
     time_range, zoom_percent = render_time_filter(df, context_key)
 
+    # Keep the initial chart style fixed.
+    # Users can still switch style using the Plotly buttons above the chart.
+    marker_display = DEFAULT_MARKER_DISPLAY
+        
     # Create sidebar containers in the visual order we want.
     # Track 4 will appear before the agent settings, even though the
     # agent settings are read first internally.
@@ -220,7 +224,8 @@ def main():
         agent_cfg=agent_cfg,
         chart_height=agent_cfg.get("chart_height", 950),
         parameter_ranges=parameter_ranges,
-    )
+        marker_display=marker_display,
+)
 
     chart_key = f"multi_track_chart_{context_key}"
     render_chart(fig, chart_key)

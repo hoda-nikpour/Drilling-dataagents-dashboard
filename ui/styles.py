@@ -1,6 +1,9 @@
 import streamlit as st
 
 
+import streamlit as st
+
+
 def apply_global_styles():
     st.markdown(
         """
@@ -25,14 +28,16 @@ def apply_global_styles():
             margin-bottom: 0rem;
         }
 
+        /* Reserve real space above the chart for the Plotly modebar,
+           so it no longer sits on top of the custom chart buttons. */
         div[data-testid="stPlotlyChart"] {
             position: relative;
-            padding-top: 18px;
+            padding-top: 56px;
         }
 
         div[data-testid="stPlotlyChart"] .modebar-container {
             position: absolute !important;
-            top: -8px !important;
+            top: 4px !important;
             left: 0 !important;
             width: 100% !important;
             display: flex !important;
@@ -54,6 +59,7 @@ def apply_global_styles():
             border-radius: 0 !important;
             box-shadow: none !important;
             padding: 3px 6px !important;
+            margin: 0 auto !important;
             pointer-events: auto !important;
         }
 

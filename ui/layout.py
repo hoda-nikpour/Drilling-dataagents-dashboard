@@ -69,9 +69,8 @@ def render_chart(fig, chart_key: str):
             "scrollZoom": False,
             "doubleClick": "reset+autosize",
             "modeBarButtonsToRemove": [
-                "lasso2d",
-                "select2d",
-                "toggleSpikelines",
-            ],
+            "lasso2d",
+            "select2d",
+        ],
         },
     )

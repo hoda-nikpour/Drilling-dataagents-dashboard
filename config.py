@@ -12,8 +12,17 @@ MAX_POINTS_PER_TRACE = 12000
 MAX_POINTS_PER_TRACE_ZOOM = 20000
 
 # Marker settings
-BASE_MARKER_SIZE = 0.5
-ZOOM_MARKER_SIZE = 7.0
+# Default dashboard view should be clean lines without dots.
+BASE_MARKER_SIZE = 2.0
+ZOOM_MARKER_SIZE = 4.0
+
+MARKER_DISPLAY_OPTIONS = [
+    "Lines only",
+    "Small dots",
+    "Larger dots",
+]
+
+DEFAULT_MARKER_DISPLAY = "Lines only"
 
 # Metadata columns required for the app
 REQUIRED_META_COLUMNS = ["TIME", "_section_in", "DEPT"]

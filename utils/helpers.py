@@ -9,29 +9,36 @@ from config import (
 )
 
 
-def get_display_mode(zoom_percent: float) -> tuple[str, float]:
+def get_display_mode(marker_display: str = "Lines only") -> tuple[str, float]:
     """
-    Keep markers visible at all times.
+    Control whether parameter curves are shown as clean lines or lines with dots.
 
-    Important note:
-    Plotly zooming inside the chart does not automatically update Streamlit state,
-    so the marker size must remain usable even without a sidebar time-range change.
+    Important:
+    This is intentionally independent of the sidebar time filter.
+
+    True automatic marker switching based on manual Plotly zoom is not available
+    through plain st.plotly_chart(), because Plotly zoom events are not sent back
+    to Python. Therefore, the dashboard uses chart buttons and a sidebar default
+    setting instead.
     """
-    if zoom_percent < 20:
+    if marker_display == "Small dots":
         return "lines+markers", BASE_MARKER_SIZE
-    if zoom_percent < 60:
-        return "lines+markers", max(BASE_MARKER_SIZE, 4.0)
-    return "lines+markers", ZOOM_MARKER_SIZE
 
+    if marker_display == "Larger dots":
+        return "lines+markers", ZOOM_MARKER_SIZE
+
+    return "lines", BASE_MARKER_SIZE
 
 def get_target_points(zoom_percent: float) -> int:
     """
     Keep enough points so direct chart zoom remains informative.
+
+    This can still depend on sidebar time-filter zoom for performance only.
+    Marker visibility is controlled separately.
     """
     if zoom_percent < 20:
         return MAX_POINTS_PER_TRACE
     return MAX_POINTS_PER_TRACE_ZOOM
-
 
 def downsample_xy(x_series: pd.Series, y_series: pd.Series, n_max: int):
     n = len(x_series)

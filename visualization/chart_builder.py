@@ -26,6 +26,7 @@ def create_multi_track_chart(
     agent_cfg: dict | None = None,
     chart_height: int = 950,
     parameter_ranges: dict[str, tuple[float, float]] | None = None,
+    marker_display: str = "Lines only",
 ) -> go.Figure:
     subplot_titles = ["Track 1", "Track 2", "Track 3", "Track 4"]
 
@@ -37,8 +38,9 @@ def create_multi_track_chart(
         subplot_titles=subplot_titles,
     )
 
-    mode, marker_size = get_display_mode(zoom_percent)
+    mode, marker_size = get_display_mode(marker_display)
     target_points = get_target_points(zoom_percent)
+    parameter_trace_indices = []
 
     t_min_view = df.index.min() if not df.empty else None
     t_max_view = df.index.max() if not df.empty else None
@@ -100,8 +102,8 @@ def create_multi_track_chart(
                     marker=dict(
                         size=marker_size,
                         color=color,
-                        opacity=0.95,
-                        line=dict(width=0.5, color="rgba(40,40,40,0.55)"),
+                        opacity=0.75,
+                        line=dict(width=0),
                     ),
                     customdata=np.column_stack([raw_vals.values]),
                     hovertemplate=hovertemplate,
@@ -109,6 +111,8 @@ def create_multi_track_chart(
                 row=1,
                 col=track_idx + 1,
             )
+
+            parameter_trace_indices.append(len(fig.data) - 1)
 
             _add_scale_row(
                 fig=fig,
@@ -170,6 +174,15 @@ def create_multi_track_chart(
         tickvals=tickvals,
         ticktext=ticktext,
         tickfont=dict(size=10, family="Courier New"),
+
+        # Cursor-attached horizontal reference line.
+        # This lets the reviewer see the same timestamp across all 4 tracks.
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+        spikecolor="rgba(60,60,60,0.55)",
+        spikethickness=1,
+        spikedash="solid",
     )
 
     fig.add_annotation(
@@ -185,11 +198,77 @@ def create_multi_track_chart(
 
     fig.update_layout(
         height=chart_height,
-        margin=dict(l=120, r=20, t=75, b=320),
+        margin=dict(l=120, r=20, t=145, b=320),
+
+        # Keeps normal point hover, but also allows the horizontal spike line.
         hovermode="closest",
+
+        # Helps Plotly keep spike lines responsive near the cursor.
+        spikedistance=-1,
+        hoverdistance=30,
+
         plot_bgcolor="white",
         paper_bgcolor="white",
         uirevision="keep_zoom_state",
     )
+
+    if parameter_trace_indices:
+        fig.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="right",
+                    x=0.42,
+                    y=1.075,
+                    xanchor="center",
+                    yanchor="top",
+                    showactive=True,
+                    bgcolor="rgba(245,245,245,0.95)",
+                    bordercolor="rgba(160,160,160,0.6)",
+                    borderwidth=1,
+                    pad=dict(l=4, r=4, t=2, b=2),
+                    buttons=[
+                        dict(
+                            label="Lines only",
+                            method="restyle",
+                            args=[
+                                {
+                                    "mode": "lines",
+                                    "marker.size": 2.0,
+                                    "marker.opacity": 0.0,
+                                },
+                                parameter_trace_indices,
+                            ],
+                        ),
+                        dict(
+                            label="Small dots",
+                            method="restyle",
+                            args=[
+                                {
+                                    "mode": "lines+markers",
+                                    "marker.size": 2.0,
+                                    "marker.opacity": 0.75,
+                                    "marker.line.width": 0,
+                                },
+                                parameter_trace_indices,
+                            ],
+                        ),
+                        dict(
+                            label="Larger dots",
+                            method="restyle",
+                            args=[
+                                {
+                                    "mode": "lines+markers",
+                                    "marker.size": 4.0,
+                                    "marker.opacity": 0.75,
+                                    "marker.line.width": 0,
+                                },
+                                parameter_trace_indices,
+                            ],
+                        ),
+                    ],
+                )
+            ]
+        )
 
     return fig

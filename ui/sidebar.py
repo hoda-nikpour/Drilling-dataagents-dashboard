@@ -9,8 +9,11 @@ import streamlit as st
 from agents.activity_agents import ActivityConfig
 from agents.activity_support import interval_overlap, overlap_ratio
 from agents.symptom_agents import SymptomConfig
-from config import MAX_PARAMS_PER_TRACK, PARAMETER_CATALOG, PARAMETER_DISPLAY_NAMES
-
+from config import (
+    MAX_PARAMS_PER_TRACK,
+    PARAMETER_CATALOG,
+    PARAMETER_DISPLAY_NAMES,
+)
 
 
 ACCEPTANCE_THRESHOLD_PERCENT = 95.0
@@ -348,32 +351,79 @@ def render_time_filter(df, context_key: str):
         t_max_all = df.index.max().to_pydatetime()
 
         default_value = (t_min_all, t_max_all)
-        slider_key = f"time_range_{context_key}"
 
-        if slider_key not in st.session_state:
-            st.session_state[slider_key] = default_value
+        reset_counter_key = f"time_reset_counter_{context_key}"
+        range_store_key = f"time_range_store_{context_key}"
+
+        if reset_counter_key not in st.session_state:
+            st.session_state[reset_counter_key] = 0
+
+        if range_store_key not in st.session_state:
+            st.session_state[range_store_key] = default_value
+
+        # Be strict if the selected well/section/data range changes.
+        stored_start, stored_end = st.session_state[range_store_key]
+
+        if (
+            pd.Timestamp(stored_start) < pd.Timestamp(t_min_all)
+            or pd.Timestamp(stored_end) > pd.Timestamp(t_max_all)
+            or pd.Timestamp(stored_start) >= pd.Timestamp(stored_end)
+        ):
+            st.session_state[range_store_key] = default_value
+            st.session_state[reset_counter_key] += 1
 
         if st.button("Reset time filter", key=f"reset_time_{context_key}"):
-            st.session_state[slider_key] = default_value
+            st.session_state[range_store_key] = default_value
+            st.session_state[reset_counter_key] += 1
+            st.rerun()
+
+        slider_key = f"time_range_{context_key}_{st.session_state[reset_counter_key]}"
 
         time_range = st.slider(
             "Select Time Range",
             min_value=t_min_all,
             max_value=t_max_all,
-            value=st.session_state[slider_key],
+            value=st.session_state[range_store_key],
             format="YYYY-MM-DD HH:mm",
             key=slider_key,
         )
 
+        st.session_state[range_store_key] = time_range
+
         total_sec = (t_max_all - t_min_all).total_seconds()
         sel_sec = (time_range[1] - time_range[0]).total_seconds()
+
         zoom_percent = 100.0 - (sel_sec / total_sec * 100.0) if total_sec > 0 else 0.0
+        zoom_percent = max(0.0, min(100.0, zoom_percent))
 
         st.metric("Records", f"{len(df):,}")
         st.metric("Zoom", f"{zoom_percent:.0f}%")
         st.caption("To reduce magnification, click 'Reset time filter' or widen the time range.")
 
     return time_range, zoom_percent
+
+def render_plot_marker_controls(context_key: str) -> str:
+    with st.sidebar:
+        st.subheader("Plot Marker Display")
+
+        marker_display = st.selectbox(
+            "Default curve style",
+            options=MARKER_DISPLAY_OPTIONS,
+            index=MARKER_DISPLAY_OPTIONS.index(DEFAULT_MARKER_DISPLAY),
+            key=f"marker_display_{context_key}",
+            help=(
+                "Use 'Lines only' for clean normal viewing. "
+                "Use the buttons above the chart to switch dots on/off without changing the time filter."
+            ),
+        )
+
+        st.caption(
+            "Dots are independent of the sidebar time filter. "
+            "Inside the chart, use the buttons above the plot to switch between clean lines and dotted lines."
+        )
+
+    return marker_display
+
 
 def _default_activity_ui(enabled: bool = True) -> dict:
     return {
@@ -390,6 +440,41 @@ def _default_symptom_ui(enabled: bool = False) -> dict:
         "selected_symptom": "OpenHoleLength",
         "config": SymptomConfig(),
     }
+
+def _safe_datetime_input(
+    label: str,
+    key: str,
+    default_value,
+    min_value,
+    max_value,
+):
+    """
+    Calendar-style datetime selector with bounds protection.
+
+    This avoids crashes when the selected well/section/time range changes
+    and an old stored center time is outside the new available range.
+    """
+    current_value = st.session_state.get(key, default_value)
+
+    try:
+        current_value = pd.Timestamp(current_value).to_pydatetime()
+    except Exception:
+        current_value = default_value
+
+    if (
+        pd.Timestamp(current_value) < pd.Timestamp(min_value)
+        or pd.Timestamp(current_value) > pd.Timestamp(max_value)
+    ):
+        current_value = default_value
+        st.session_state[key] = current_value
+
+    return st.datetime_input(
+        label,
+        value=current_value,
+        min_value=min_value,
+        max_value=max_value,
+        key=key,
+    )
 
 def render_manual_activity_validation_tags(
     context_key: str,
@@ -445,17 +530,12 @@ def render_manual_activity_validation_tags(
                     key=f"activity_tag_interval_{i}_{context_key}",
                 )
             else:
-                center_default = st.session_state.get(
-                    f"activity_tag_center_{i}_{context_key}",
-                    t_min,
-                )
-                center_time = st.slider(
-                    f"Activity Tag {i} center time",
+                center_time = _safe_datetime_input(
+                    label=f"Activity Tag {i} center time",
+                    key=f"activity_tag_center_{i}_{context_key}",
+                    default_value=t_min,
                     min_value=t_min,
                     max_value=t_max,
-                    value=center_default,
-                    format="YYYY-MM-DD HH:mm",
-                    key=f"activity_tag_center_{i}_{context_key}",
                 )
 
                 duration = duration_options[duration_choice]
@@ -1029,17 +1109,12 @@ def render_agent_controls(
                         key=f"tag_interval_{i}_{context_key}",
                     )
                 else:
-                    center_default = st.session_state.get(
-                        f"tag_center_{i}_{context_key}",
-                        t_min,
-                    )
-                    center_time = st.slider(
-                        f"Tag {i} center time",
+                    center_time = _safe_datetime_input(
+                        label=f"Tag {i} center time",
+                        key=f"tag_center_{i}_{context_key}",
+                        default_value=t_min,
                         min_value=t_min,
                         max_value=t_max,
-                        value=center_default,
-                        format="YYYY-MM-DD HH:mm",
-                        key=f"tag_center_{i}_{context_key}",
                     )
 
                     duration = duration_options[duration_choice]
