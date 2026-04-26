@@ -39,11 +39,25 @@ def test_format_number_handles_nan():
     assert format_number(float("nan")) == "NA"
 
 
-def test_get_display_mode_returns_lines_and_markers():
-    mode, marker_size = get_display_mode(zoom_percent=0)
+def test_get_display_mode_lines_only():
+    mode, marker_size = get_display_mode("Lines only")
+
+    assert mode == "lines"
+    assert marker_size >= 0
+
+
+def test_get_display_mode_small_dots():
+    mode, marker_size = get_display_mode("Small dots")
 
     assert mode == "lines+markers"
-    assert marker_size >= 0
+    assert marker_size == 2.0
+
+
+def test_get_display_mode_larger_dots():
+    mode, marker_size = get_display_mode("Larger dots")
+
+    assert mode == "lines+markers"
+    assert marker_size == 4.0
 
 
 def test_get_target_points_increases_when_zoomed():

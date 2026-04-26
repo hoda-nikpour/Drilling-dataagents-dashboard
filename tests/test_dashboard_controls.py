@@ -97,7 +97,6 @@ def test_build_time_filter_result_returns_filtered_df_and_zoom():
     assert result["zoom_percent"] == 50.0
     assert result["time_range"] == time_range
 
-
 def test_track_parameter_change_updates_selected_labels_requested_columns_and_plot_inputs():
     discovered_columns = [
         "BDTI",
@@ -134,7 +133,6 @@ def test_track_parameter_change_updates_selected_labels_requested_columns_and_pl
             "HKL",
             "MFI",
             "RPMB",
-            "ROP",
             "WOB",
         ],
         required_symptom_labels=[
@@ -167,14 +165,15 @@ def test_track_parameter_change_updates_selected_labels_requested_columns_and_pl
     assert "MFI" in requested_columns
     assert "BPOS" in requested_columns
     assert "HKL" in requested_columns
-    assert "ROP" in requested_columns
     assert "SPP" in requested_columns
     assert "TRQ" in requested_columns
+
+    # ROP is available, but it is not selected and is not required by the Activity/Symptom Agents.
+    assert "ROP" not in requested_columns
 
     assert track_params_real == [["BDTI", "WOB"], ["RPMB"], [], []]
     assert chart_labels == [["Bit Depth", "WOB"], ["RPMB"], [], []]
     assert len(chart_colors) == 4
-
 
 def test_activity_agent_disabled_returns_empty_safe_result():
     df = make_time_df()
