@@ -33,6 +33,7 @@ env/
 # =========================
 comparecsv.py
 code.txt
+testscode.txt
 
 # =========================
 # Jupyter (if you ever use it)
