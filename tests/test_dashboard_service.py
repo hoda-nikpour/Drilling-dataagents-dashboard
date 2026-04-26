@@ -133,11 +133,12 @@ def test_build_requested_columns_includes_selected_activity_and_symptom_columns(
     label_to_column = {
         "Bit Depth": "BDTI",
         "Well Depth": "DMEA",
+        "Casing Depth": "DepthCsg",
+        "Mud Motor On": "MudMotorOn",
         "BPOS": "BPOS",
         "HKL": "HKL",
         "MFI": "MFI",
         "RPMB": "RPMB",
-        "ROP": "ROP",
         "WOB": "WOB",
         "SPP": "SPP",
         "TRQ": "TRQ",
@@ -166,9 +167,13 @@ def test_build_requested_columns_includes_selected_activity_and_symptom_columns(
     assert "HKL" in result
     assert "MFI" in result
     assert "RPMB" in result
-    assert "ROP" in result
     assert "SPP" in result
     assert "TRQ" in result
+    assert "DepthCsg" in result
+    assert "MudMotorOn" in result
+
+    # ROP is no longer required by the VT-style activity logic.
+    assert "ROP" not in result
 
     assert len(result) == len(set(result))
 

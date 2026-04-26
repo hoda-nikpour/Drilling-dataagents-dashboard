@@ -28,6 +28,22 @@ TRACK_COLOR_PALETTE = [
 PARAMETER_ALIASES = {
     "Bit Depth": ["BDTI", "BITD", "BIT_DEPTH"],
     "Well Depth": ["GS_DMEA", "DMEA", "DEPT", "GS_DVER", "DVER", "DBTV", "GS_DBTM", "DBTM"],
+    "Casing Depth": [
+        "DepthCsg",
+        "DEPTH_CSG",
+        "CSG_DEPTH",
+        "CASING_DEPTH",
+        "Depth Casing",
+        "DEPTH_CASING",
+        "DCAS",
+    ],
+    "Mud Motor On": [
+        "MudMotorOn",
+        "MUD_MOTOR_ON",
+        "MOTOR_ON",
+        "MMOTOR",
+        "GS_MUD_MOTOR_ON",
+    ],
     "BPOS": ["GS_BPOS", "BPOS"],
     "HKL": ["GS_HKLD", "HKL", "HKLD"],
     "MFI": ["GS_MFI", "MFI"],
@@ -42,6 +58,8 @@ PARAMETER_ALIASES = {
 PARAMETER_DISPLAY_NAMES = {
     "Bit Depth": "Bit Depth — current bit depth",
     "Well Depth": "Well Depth — measured/hole depth",
+    "Casing Depth": "Casing Depth — casing shoe / last casing depth",
+    "Mud Motor On": "Mud Motor On — motor status flag",
     "BPOS": "BPOS — block position",
     "HKL": "HKL — hook load",
     "MFI": "MFI — mud flow in",
@@ -65,7 +83,18 @@ PARAMETER_CATALOG = {
         "unit": "m",
         "logical_min": 0.0,
         "logical_max": 6000.0,
-    
+    },
+    "Casing Depth": {
+        "meaning": "Casing shoe depth / last casing depth used for open-hole length",
+        "unit": "m",
+        "logical_min": 0.0,
+        "logical_max": 6000.0,
+    },
+    "Mud Motor On": {
+        "meaning": "Mud motor status flag",
+        "unit": "0/1",
+        "logical_min": 0.0,
+        "logical_max": 1.0,
     },
     "BPOS": {
         "meaning": "Block position",

@@ -113,7 +113,9 @@ def test_full_dashboard_preparation_path_works():
     assert "GS_DMEA" in requested_columns
     assert "GS_BPOS" in requested_columns
     assert "GS_HKLD" in requested_columns
-    assert "ROP" in requested_columns
+
+    # ROP is no longer required by the VT-style activity logic.
+    assert "ROP" not in requested_columns
 
     # No duplicate raw columns.
     assert len(requested_columns) == len(set(requested_columns))

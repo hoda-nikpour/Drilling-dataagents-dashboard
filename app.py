@@ -27,15 +27,16 @@ from ui.layout import (
 )
 from ui.sidebar import (
     build_activity_validation_df,
+    build_agent_cfg_from_controls,
     build_manual_review_df,
-    render_activity_agent_controls,
     render_agent_controls,
+    render_agent_review_outputs,
     render_parameter_range_controls,
-    render_symptom_agent_controls,
     render_time_filter,
     render_track_parameter_selector,
     render_well_section_selector,
 )
+
 from ui.styles import apply_global_styles
 from utils.helpers import compute_section_ranges
 from visualization.chart_builder import create_multi_track_chart
@@ -124,13 +125,25 @@ def main():
         st.stop()
 
     time_range, zoom_percent = render_time_filter(df, context_key)
-    activity_ui = render_activity_agent_controls(context_key)
-    symptom_ui = render_symptom_agent_controls(context_key)
 
+    # Create sidebar containers in the visual order we want.
+    # Track 4 will appear before the agent settings, even though the
+    # agent settings are read first internally.
     df = df.loc[pd.Timestamp(time_range[0]) : pd.Timestamp(time_range[1])]
     if df.empty:
         st.warning("No data available in the selected time range.")
         st.stop()
+        
+    review_controls_container = st.sidebar.container()
+
+    agent_controls = render_agent_controls(
+        df=df,
+        context_key=context_key,
+        parent=review_controls_container,
+    )
+
+    activity_ui = agent_controls["activity_ui"]
+    symptom_ui = agent_controls["symptom_ui"]
 
     activity_cfg = run_activity_agent(
         df=df,
@@ -149,11 +162,18 @@ def main():
         activity_cfg=activity_cfg,
     )
 
-    agent_cfg = render_agent_controls(
-        df=df,
+    # This is visually placed above the agent settings because it is rendered
+    # into review_controls_container, which was created first.
+    agent_cfg = build_agent_cfg_from_controls(
+    controls=agent_controls,
+    activity_cfg=activity_cfg,
+    symptom_cfg=symptom_cfg,
+    )
+
+    render_agent_review_outputs(
+        agent_cfg=agent_cfg,
         context_key=context_key,
-        activity_cfg=activity_cfg,
-        symptom_cfg=symptom_cfg,
+        parent=review_controls_container,
     )
 
     render_dashboard_header(

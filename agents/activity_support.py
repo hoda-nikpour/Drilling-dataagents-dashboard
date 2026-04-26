@@ -6,22 +6,36 @@ def coerce_numeric(series: pd.Series) -> pd.Series:
 
 
 def rolling_median(series: pd.Series, window: int) -> pd.Series:
-    return coerce_numeric(series).rolling(window=window, min_periods=1, center=True).median()
+    """
+    Causal rolling median.
+
+    Important:
+    This intentionally uses center=False so the agent only uses current and past values.
+    The VT procedure says agents should not see future values.
+    """
+    return coerce_numeric(series).rolling(window=window, min_periods=1, center=False).median()
 
 
 def rolling_mean(series: pd.Series, window: int) -> pd.Series:
-    return coerce_numeric(series).rolling(window=window, min_periods=1, center=True).mean()
+    """
+    Causal rolling mean.
+
+    Important:
+    This intentionally uses center=False so the agent only uses current and past values.
+    The VT procedure says agents should not see future values.
+    """
+    return coerce_numeric(series).rolling(window=window, min_periods=1, center=False).mean()
 
 
 def rolling_abs_change(series: pd.Series, window: int) -> pd.Series:
     s = coerce_numeric(series)
-    return s.diff().abs().rolling(window=window, min_periods=1).mean()
+    return s.diff().abs().rolling(window=window, min_periods=1, center=False).mean()
 
 
 def stable_within_band(series: pd.Series, window: int, band: float) -> pd.Series:
     s = coerce_numeric(series)
-    rolling_max = s.rolling(window=window, min_periods=1).max()
-    rolling_min = s.rolling(window=window, min_periods=1).min()
+    rolling_max = s.rolling(window=window, min_periods=1, center=False).max()
+    rolling_min = s.rolling(window=window, min_periods=1, center=False).min()
     return (rolling_max - rolling_min) <= band
 
 

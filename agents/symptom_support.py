@@ -2,11 +2,34 @@ import pandas as pd
 
 
 def rolling_baseline(series: pd.Series, window: int) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").rolling(window=window, min_periods=1).median()
+    """
+    Causal rolling median baseline using current and past values only.
+    """
+    return pd.to_numeric(series, errors="coerce").rolling(window=window, min_periods=1, center=False).median()
+
+
+def rolling_past_mean(series: pd.Series, window: int) -> pd.Series:
+    """
+    Causal rolling mean using current and past values only.
+    """
+    return pd.to_numeric(series, errors="coerce").rolling(window=window, min_periods=1, center=False).mean()
+
+
+def rolling_past_median(series: pd.Series, window: int) -> pd.Series:
+    """
+    Causal rolling median using current and past values only.
+    """
+    return pd.to_numeric(series, errors="coerce").rolling(window=window, min_periods=1, center=False).median()
 
 
 def rolling_std(series: pd.Series, window: int) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").rolling(window=window, min_periods=1).std()
+    return pd.to_numeric(series, errors="coerce").rolling(window=window, min_periods=1, center=False).std()
+
+
+def relative_change(series: pd.Series, baseline: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    b = pd.to_numeric(baseline, errors="coerce")
+    return (s - b) / b.replace(0.0, pd.NA)
 
 
 def spike_above_baseline(series: pd.Series, baseline: pd.Series, threshold: float) -> pd.Series:
@@ -58,5 +81,35 @@ def mask_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severit
                 "source": "symptom_agent",
             }
         )
+
+    return intervals
+
+
+def first_crossing_intervals(mask: pd.Series, label: str, severity: str | None = None) -> list[dict]:
+    """
+    Return one timestamp interval each time a mask crosses from False to True.
+
+    Used for OpenHoleLength because the VT document says it is sufficient to
+    report the symptom the first time a severity level appears.
+    """
+    if mask.empty:
+        return []
+
+    mask = mask.fillna(False).astype(bool)
+    previous = mask.shift(1, fill_value=False)
+    crossings = mask & ~previous
+
+    intervals = []
+    for ts, flag in crossings.items():
+        if flag:
+            intervals.append(
+                {
+                    "label": label,
+                    "start": ts,
+                    "end": ts,
+                    "severity": severity,
+                    "source": "symptom_agent",
+                }
+            )
 
     return intervals

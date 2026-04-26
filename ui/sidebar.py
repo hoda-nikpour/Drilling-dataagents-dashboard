@@ -375,9 +375,111 @@ def render_time_filter(df, context_key: str):
 
     return time_range, zoom_percent
 
+def _default_activity_ui(enabled: bool = True) -> dict:
+    return {
+        "enabled": enabled,
+        "selected_activity": "MakingConnection",
+        "config": ActivityConfig(),
+        "manual_activity_tags": [],
+    }
 
-def render_activity_agent_controls(context_key: str):
-    with st.sidebar:
+
+def _default_symptom_ui(enabled: bool = False) -> dict:
+    return {
+        "enabled": enabled,
+        "selected_symptom": "OpenHoleLength",
+        "config": SymptomConfig(),
+    }
+
+def render_manual_activity_validation_tags(
+    context_key: str,
+    t_min,
+    t_max,
+    duration_options: dict,
+) -> list[dict]:
+    st.markdown("**Manual activity validation tags**")
+    st.caption("Use these to validate the automatic Activity Agent intervals.")
+
+    manual_activity_tags = []
+
+    activity_options = [
+        "MakingConnection",
+        "Drilling",
+        "Reaming",
+        "TrippingIn",
+        "TrippingOut",
+        "Conditioning",
+        "Circulating",
+        "Other",
+    ]
+
+    for i in range(1, 4):
+        enabled = st.checkbox(
+            f"Enable Activity Tag {i}",
+            value=False,
+            key=f"enable_activity_tag_{i}_{context_key}",
+        )
+
+        if enabled:
+            activity_label = st.selectbox(
+                f"Activity Tag {i} label",
+                options=activity_options,
+                index=1,
+                key=f"activity_tag_label_{i}_{context_key}",
+            )
+
+            duration_choice = st.selectbox(
+                f"Activity Tag {i} segment length",
+                options=list(duration_options.keys()),
+                index=2,
+                key=f"activity_tag_duration_choice_{i}_{context_key}",
+            )
+
+            if duration_choice == "Custom":
+                interval = st.slider(
+                    f"Activity Tag {i} interval",
+                    min_value=t_min,
+                    max_value=t_max,
+                    value=(t_min, t_max),
+                    format="YYYY-MM-DD HH:mm",
+                    key=f"activity_tag_interval_{i}_{context_key}",
+                )
+            else:
+                center_default = st.session_state.get(
+                    f"activity_tag_center_{i}_{context_key}",
+                    t_min,
+                )
+                center_time = st.slider(
+                    f"Activity Tag {i} center time",
+                    min_value=t_min,
+                    max_value=t_max,
+                    value=center_default,
+                    format="YYYY-MM-DD HH:mm",
+                    key=f"activity_tag_center_{i}_{context_key}",
+                )
+
+                duration = duration_options[duration_choice]
+                half_duration = duration / 2
+                start = max(t_min, center_time - half_duration)
+                end = min(t_max, center_time + half_duration)
+                interval = (start, end)
+
+                st.caption(f"Activity segment: {start} → {end}")
+
+            manual_activity_tags.append(
+                {
+                    "label": activity_label,
+                    "start": interval[0],
+                    "end": interval[1],
+                }
+            )
+
+    return manual_activity_tags
+
+def render_activity_agent_controls(context_key: str, df=None, parent=None):
+    container = parent if parent is not None else st.sidebar
+
+    with container:
         st.subheader("Activity Agent Settings")
 
         enabled = st.checkbox(
@@ -403,16 +505,38 @@ def render_activity_agent_controls(context_key: str):
             key=f"selected_activity_lane_{context_key}",
         )
 
-        with st.expander("Activity thresholds", expanded=False):
+        manual_activity_tags = []
+
+        if df is not None and not df.empty:
+            t_min = df.index.min().to_pydatetime()
+            t_max = df.index.max().to_pydatetime()
+
+            duration_options = {
+                "5 min": timedelta(minutes=5),
+                "15 min": timedelta(minutes=15),
+                "30 min": timedelta(minutes=30),
+                "1 hour": timedelta(hours=1),
+                "3 hours": timedelta(hours=3),
+                "Custom": None,
+            }
+
+            manual_activity_tags = render_manual_activity_validation_tags(
+                context_key=context_key,
+                t_min=t_min,
+                t_max=t_max,
+                duration_options=duration_options,
+            )
+
+        with st.expander("Activity thresholds — VT document definitions", expanded=False):
             short_window = st.number_input(
-                "Short window (samples)",
+                "Short causal window (samples)",
                 min_value=3,
                 max_value=21,
                 value=5,
                 key=f"act_short_window_{context_key}",
             )
             medium_window = st.number_input(
-                "Medium window (samples)",
+                "Medium causal window (samples)",
                 min_value=6,
                 max_value=60,
                 value=15,
@@ -433,24 +557,117 @@ def render_activity_agent_controls(context_key: str):
                 key=f"act_gap_fill_{context_key}",
             )
 
-            pump_on_threshold = st.number_input("Pump on threshold (lpm)", value=100.0, key=f"act_pump_thr_{context_key}")
-            rpm_on_threshold = st.number_input("RPM on threshold", value=10.0, key=f"act_rpm_thr_{context_key}")
-            rpm_low_threshold = st.number_input("RPM low threshold", value=30.0, key=f"act_rpm_low_thr_{context_key}")
-            trip_rpm_max = st.number_input("Trip RPM max", value=5.0, key=f"act_trip_rpm_{context_key}")
-            trip_flow_max = st.number_input("Trip flow max (lpm)", value=100.0, key=f"act_trip_flow_{context_key}")
+            pump_on_threshold = st.number_input(
+                "Pump on threshold (lpm)",
+                value=100.0,
+                key=f"act_pump_thr_{context_key}",
+            )
+            rpm_on_threshold = st.number_input(
+                "RPM on threshold",
+                value=10.0,
+                key=f"act_rpm_thr_{context_key}",
+            )
+            rpm_zero_threshold = st.number_input(
+                "RPM zero threshold",
+                value=1.0,
+                key=f"act_rpm_zero_thr_{context_key}",
+            )
+            rpm_low_threshold = st.number_input(
+                "RPM low/slow threshold",
+                value=30.0,
+                key=f"act_rpm_low_thr_{context_key}",
+            )
 
-            wob_zero_band = st.number_input("WOB zero band", value=0.5, key=f"act_wob_zero_{context_key}")
-            wob_drilling_min = st.number_input("WOB drilling minimum", value=1.0, key=f"act_wob_drill_{context_key}")
-            rop_min = st.number_input("ROP drilling minimum (m/h)", value=0.5, key=f"act_rop_min_{context_key}")
+            wob_zero_band = st.number_input(
+                "WOB zero band",
+                value=0.5,
+                key=f"act_wob_zero_{context_key}",
+            )
+            wob_drilling_min = st.number_input(
+                "WOB drilling minimum",
+                value=0.1,
+                key=f"act_wob_drill_{context_key}",
+            )
 
-            near_bottom_threshold = st.number_input("Near-bottom threshold (m)", value=5.0, key=f"act_near_bottom_{context_key}")
-            bit_on_bottom_threshold = st.number_input("Bit-on-bottom threshold (m)", value=1.0, key=f"act_bottom_{context_key}")
+            drilling_depth_step_min = st.number_input(
+                "Drilling: well depth increase per step (m)",
+                value=0.01,
+                format="%.4f",
+                key=f"act_drill_depth_step_{context_key}",
+            )
+            drilling_depth_gap_max = st.number_input(
+                "Drilling: BitDepth-WellDepth max gap (m)",
+                value=0.05,
+                format="%.4f",
+                key=f"act_drill_gap_{context_key}",
+            )
 
-            movement_threshold = st.number_input("Movement threshold", value=0.3, key=f"act_move_thr_{context_key}")
+            reaming_flow_min = st.number_input(
+                "Reaming: MFI minimum (lpm)",
+                value=100.0,
+                key=f"act_ream_flow_{context_key}",
+            )
+            reaming_rpm_min = st.number_input(
+                "Reaming: RPM minimum",
+                value=10.0,
+                key=f"act_ream_rpm_{context_key}",
+            )
+            reaming_depth_step_max = st.number_input(
+                "Reaming: max slow depth change per step (m)",
+                value=0.30,
+                key=f"act_ream_depth_step_max_{context_key}",
+            )
+
+            tripping_flow_max = st.number_input(
+                "Tripping: MFI max (lpm)",
+                value=1000.0,
+                key=f"act_trip_flow_{context_key}",
+            )
+            tripping_rpm_max = st.number_input(
+                "Tripping: RPM max",
+                value=1.0,
+                key=f"act_trip_rpm_{context_key}",
+            )
+            tripping_max_consecutive_static_samples = st.number_input(
+                "Tripping: max consecutive no-motion samples",
+                min_value=1,
+                max_value=10,
+                value=3,
+                key=f"act_trip_static_{context_key}",
+            )
+
+            conditioning_depth_gap_max = st.number_input(
+                "Conditioning: WellDepth-BitDepth max gap (m)",
+                value=100.0,
+                key=f"act_cond_gap_{context_key}",
+            )
+
+            connection_depth_gap_max = st.number_input(
+                "MakingCnx: BitDepth-WellDepth max gap (m)",
+                value=10.0,
+                key=f"act_conn_gap_{context_key}",
+            )
+            connection_depth_constant_band = st.number_input(
+                "MakingCnx: depth constant tolerance (m)",
+                value=0.05,
+                format="%.4f",
+                key=f"act_conn_depth_const_{context_key}",
+            )
             connection_block_travel_threshold = st.number_input(
-                "Connection block travel threshold",
+                "MakingCnx: BPOS travel threshold (m)",
                 value=2.0,
                 key=f"act_conn_move_{context_key}",
+            )
+            hkl_dead_weight_stability_band = st.number_input(
+                "MakingCnx: HKL dead-weight stability band",
+                value=3.0,
+                key=f"act_conn_hkl_stable_{context_key}",
+            )
+
+            movement_threshold = st.number_input(
+                "BPOS movement threshold",
+                value=0.3,
+                key=f"act_move_thr_{context_key}",
             )
 
         cfg = ActivityConfig(
@@ -460,27 +677,37 @@ def render_activity_agent_controls(context_key: str):
             gap_fill_samples=int(gap_fill_samples),
             pump_on_threshold=float(pump_on_threshold),
             rpm_on_threshold=float(rpm_on_threshold),
+            rpm_zero_threshold=float(rpm_zero_threshold),
             rpm_low_threshold=float(rpm_low_threshold),
             wob_zero_band=float(wob_zero_band),
             wob_drilling_min=float(wob_drilling_min),
-            rop_min=float(rop_min),
-            near_bottom_threshold=float(near_bottom_threshold),
-            bit_on_bottom_threshold=float(bit_on_bottom_threshold),
-            movement_threshold=float(movement_threshold),
+            drilling_depth_step_min=float(drilling_depth_step_min),
+            drilling_depth_gap_max=float(drilling_depth_gap_max),
+            reaming_flow_min=float(reaming_flow_min),
+            reaming_rpm_min=float(reaming_rpm_min),
+            reaming_depth_step_max=float(reaming_depth_step_max),
+            tripping_flow_max=float(tripping_flow_max),
+            tripping_rpm_max=float(tripping_rpm_max),
+            tripping_max_consecutive_static_samples=int(tripping_max_consecutive_static_samples),
+            conditioning_depth_gap_max=float(conditioning_depth_gap_max),
+            connection_depth_gap_max=float(connection_depth_gap_max),
+            connection_depth_constant_band=float(connection_depth_constant_band),
             connection_block_travel_threshold=float(connection_block_travel_threshold),
-            trip_flow_max=float(trip_flow_max),
-            trip_rpm_max=float(trip_rpm_max),
+            hkl_dead_weight_stability_band=float(hkl_dead_weight_stability_band),
+            movement_threshold=float(movement_threshold),
         )
 
     return {
         "enabled": enabled,
         "selected_activity": selected_activity,
         "config": cfg,
+        "manual_activity_tags": manual_activity_tags,
     }
 
+def render_symptom_agent_controls(context_key: str, parent=None):
+    container = parent if parent is not None else st.sidebar
 
-def render_symptom_agent_controls(context_key: str):
-    with st.sidebar:
+    with container:
         st.subheader("Symptom Agent Settings")
 
         enabled = st.checkbox(
@@ -496,32 +723,38 @@ def render_symptom_agent_controls(context_key: str):
             key=f"selected_symptom_lane_{context_key}",
         )
 
-        with st.expander("Symptom thresholds", expanded=False):
+        with st.expander("Symptom thresholds — VT document definitions", expanded=False):
+            casing_depth_fallback = st.number_input(
+                "OpenHoleLength casing depth fallback (m, 0 = use Casing Depth column only)",
+                value=0.0,
+                min_value=0.0,
+                key=f"sym_ohl_casing_depth_{context_key}",
+            )
             open_hole_length_threshold_1 = st.number_input(
-                "OpenHoleLength threshold 1 (m)",
+                "OpenHoleLength severity 1 (m)",
                 value=500.0,
                 key=f"sym_ohl_1_{context_key}",
             )
             open_hole_length_threshold_2 = st.number_input(
-                "OpenHoleLength threshold 2 (m)",
+                "OpenHoleLength severity 2 (m)",
                 value=750.0,
                 key=f"sym_ohl_2_{context_key}",
             )
 
             trq_baseline_window = st.number_input(
-                "TRQ baseline window",
+                "TRQSpike mean-long window (preceding samples)",
                 min_value=10,
                 max_value=300,
                 value=60,
                 key=f"sym_trq_window_{context_key}",
             )
             trq_spike_ratio_level_1 = st.number_input(
-                "TRQ spike ratio level 1",
+                "TRQSpike level 1 ratio",
                 value=1.25,
                 key=f"sym_trq_l1_{context_key}",
             )
             trq_spike_ratio_level_2 = st.number_input(
-                "TRQ spike ratio level 2",
+                "TRQSpike level 2 ratio",
                 value=1.40,
                 key=f"sym_trq_l2_{context_key}",
             )
@@ -550,23 +783,33 @@ def render_symptom_agent_controls(context_key: str):
                 value=2,
                 key=f"sym_ps_gap_{context_key}",
             )
+            pspike_flow_delta_max = st.number_input(
+                "PSpike max ΔMFI",
+                value=50.0,
+                key=f"sym_ps_dmfi_{context_key}",
+            )
+            pspike_rpm_delta_max = st.number_input(
+                "PSpike max ΔRPM",
+                value=3.0,
+                key=f"sym_ps_drpm_{context_key}",
+            )
+            pspike_wob_delta_max = st.number_input(
+                "PSpike max ΔWOB",
+                value=0.5,
+                key=f"sym_ps_dwob_{context_key}",
+            )
 
             overpull_baseline_window = st.number_input(
-                "OverPull baseline window",
+                "OverPull HKL baseline window",
                 min_value=5,
                 max_value=200,
-                value=30,
+                value=20,
                 key=f"sym_op_window_{context_key}",
             )
-            overpull_threshold_1 = st.number_input(
-                "OverPull threshold 1",
-                value=3.0,
-                key=f"sym_op_thr1_{context_key}",
-            )
-            overpull_threshold_2 = st.number_input(
-                "OverPull threshold 2",
+            overpull_threshold = st.number_input(
+                "OverPull HKL increase threshold",
                 value=6.0,
-                key=f"sym_op_thr2_{context_key}",
+                key=f"sym_op_thr_{context_key}",
             )
             overpull_gap_fill_samples = st.number_input(
                 "OverPull gap fill",
@@ -577,21 +820,16 @@ def render_symptom_agent_controls(context_key: str):
             )
 
             tookweight_baseline_window = st.number_input(
-                "TookWeight baseline window",
+                "TookWeight HKL baseline window",
                 min_value=5,
                 max_value=200,
-                value=30,
+                value=20,
                 key=f"sym_tw_window_{context_key}",
             )
-            tookweight_threshold_1 = st.number_input(
-                "TookWeight threshold 1",
-                value=3.0,
-                key=f"sym_tw_thr1_{context_key}",
-            )
-            tookweight_threshold_2 = st.number_input(
-                "TookWeight threshold 2",
+            tookweight_threshold = st.number_input(
+                "TookWeight HKL drop threshold",
                 value=6.0,
-                key=f"sym_tw_thr2_{context_key}",
+                key=f"sym_tw_thr_{context_key}",
             )
             tookweight_gap_fill_samples = st.number_input(
                 "TookWeight gap fill",
@@ -601,7 +839,19 @@ def render_symptom_agent_controls(context_key: str):
                 key=f"sym_tw_gap_{context_key}",
             )
 
+            hoisting_velocity_min = st.number_input(
+                "Min hoisting velocity",
+                value=0.15,
+                key=f"sym_hoist_min_{context_key}",
+            )
+            hoisting_velocity_max = st.number_input(
+                "Max hoisting velocity",
+                value=1.5,
+                key=f"sym_hoist_max_{context_key}",
+            )
+
         cfg = SymptomConfig(
+            casing_depth=None if float(casing_depth_fallback) <= 0 else float(casing_depth_fallback),
             open_hole_length_threshold_1=float(open_hole_length_threshold_1),
             open_hole_length_threshold_2=float(open_hole_length_threshold_2),
             trq_baseline_window=int(trq_baseline_window),
@@ -611,14 +861,17 @@ def render_symptom_agent_controls(context_key: str):
             pspike_threshold_normal=float(pspike_threshold_normal),
             pspike_threshold_motor_on=float(pspike_threshold_motor_on),
             pspike_gap_fill_samples=int(pspike_gap_fill_samples),
+            pspike_flow_delta_max=float(pspike_flow_delta_max),
+            pspike_rpm_delta_max=float(pspike_rpm_delta_max),
+            pspike_wob_delta_max=float(pspike_wob_delta_max),
             overpull_baseline_window=int(overpull_baseline_window),
-            overpull_threshold_1=float(overpull_threshold_1),
-            overpull_threshold_2=float(overpull_threshold_2),
+            overpull_threshold=float(overpull_threshold),
             overpull_gap_fill_samples=int(overpull_gap_fill_samples),
             tookweight_baseline_window=int(tookweight_baseline_window),
-            tookweight_threshold_1=float(tookweight_threshold_1),
-            tookweight_threshold_2=float(tookweight_threshold_2),
+            tookweight_threshold=float(tookweight_threshold),
             tookweight_gap_fill_samples=int(tookweight_gap_fill_samples),
+            hoisting_velocity_min=float(hoisting_velocity_min),
+            hoisting_velocity_max=float(hoisting_velocity_max),
         )
 
     return {
@@ -626,7 +879,6 @@ def render_symptom_agent_controls(context_key: str):
         "selected_symptom": selected_symptom,
         "config": cfg,
     }
-
 
 def build_manual_review_df(summary: dict) -> pd.DataFrame:
     rows = summary.get("tag_status_rows", [])
@@ -680,15 +932,16 @@ def build_activity_validation_df(activity_validation_summary: dict) -> pd.DataFr
         ]
     )
 
-
 def render_agent_controls(
     df,
     context_key: str,
-    activity_cfg: dict | None = None,
-    symptom_cfg: dict | None = None,
+    parent=None,
 ):
-    with st.sidebar:
+    container = parent if parent is not None else st.sidebar
+
+    with container:
         st.subheader("Track 4 — Review and Agent Track")
+
         t_min = df.index.min().to_pydatetime()
         t_max = df.index.max().to_pydatetime()
 
@@ -730,10 +983,6 @@ def render_agent_controls(
                 key=f"reference_time_{context_key}",
             )
 
-        tag_intervals = []
-        manual_agent_intervals = []
-        manual_activity_tags = []
-
         duration_options = {
             "5 min": timedelta(minutes=5),
             "15 min": timedelta(minutes=15),
@@ -742,6 +991,9 @@ def render_agent_controls(
             "3 hours": timedelta(hours=3),
             "Custom": None,
         }
+
+        tag_intervals = []
+        manual_agent_intervals = []
 
         st.markdown("**Tagger lane**")
         st.caption("Use short or long time segments to mark deviation tags.")
@@ -752,12 +1004,14 @@ def render_agent_controls(
                 value=(i == 1),
                 key=f"enable_tag_{i}_{context_key}",
             )
+
             if enabled:
                 label = st.text_input(
                     f"Tag {i} label",
                     value=f"Observation {i}",
                     key=f"tag_label_{i}_{context_key}",
                 )
+
                 duration_choice = st.selectbox(
                     f"Tag {i} segment length",
                     options=list(duration_options.keys()),
@@ -775,7 +1029,10 @@ def render_agent_controls(
                         key=f"tag_interval_{i}_{context_key}",
                     )
                 else:
-                    center_default = st.session_state.get(f"tag_center_{i}_{context_key}", t_min)
+                    center_default = st.session_state.get(
+                        f"tag_center_{i}_{context_key}",
+                        t_min,
+                    )
                     center_time = st.slider(
                         f"Tag {i} center time",
                         min_value=t_min,
@@ -784,11 +1041,13 @@ def render_agent_controls(
                         format="YYYY-MM-DD HH:mm",
                         key=f"tag_center_{i}_{context_key}",
                     )
+
                     duration = duration_options[duration_choice]
                     half_duration = duration / 2
                     start = max(t_min, center_time - half_duration)
                     end = min(t_max, center_time + half_duration)
                     interval = (start, end)
+
                     st.caption(f"Segment: {start} → {end}")
 
                 tag_intervals.append(
@@ -799,82 +1058,17 @@ def render_agent_controls(
                     }
                 )
 
-        st.markdown("**Manual activity validation tags**")
-        st.caption("Use these to validate the automatic activity intervals.")
-
-        activity_options = [
-            "MakingConnection",
-            "Drilling",
-            "Reaming",
-            "TrippingIn",
-            "TrippingOut",
-            "Conditioning",
-            "Circulating",
-            "Other",
-        ]
-
-        for i in range(1, 4):
-            enabled = st.checkbox(
-                f"Enable Activity Tag {i}",
-                value=False,
-                key=f"enable_activity_tag_{i}_{context_key}",
-            )
-            if enabled:
-                activity_label = st.selectbox(
-                    f"Activity Tag {i} label",
-                    options=activity_options,
-                    index=1,
-                    key=f"activity_tag_label_{i}_{context_key}",
-                )
-
-                duration_choice = st.selectbox(
-                    f"Activity Tag {i} segment length",
-                    options=list(duration_options.keys()),
-                    index=2,
-                    key=f"activity_tag_duration_choice_{i}_{context_key}",
-                )
-
-                if duration_choice == "Custom":
-                    interval = st.slider(
-                        f"Activity Tag {i} interval",
-                        min_value=t_min,
-                        max_value=t_max,
-                        value=(t_min, t_max),
-                        format="YYYY-MM-DD HH:mm",
-                        key=f"activity_tag_interval_{i}_{context_key}",
-                    )
-                else:
-                    center_default = st.session_state.get(f"activity_tag_center_{i}_{context_key}", t_min)
-                    center_time = st.slider(
-                        f"Activity Tag {i} center time",
-                        min_value=t_min,
-                        max_value=t_max,
-                        value=center_default,
-                        format="YYYY-MM-DD HH:mm",
-                        key=f"activity_tag_center_{i}_{context_key}",
-                    )
-                    duration = duration_options[duration_choice]
-                    half_duration = duration / 2
-                    start = max(t_min, center_time - half_duration)
-                    end = min(t_max, center_time + half_duration)
-                    interval = (start, end)
-                    st.caption(f"Activity segment: {start} → {end}")
-
-                manual_activity_tags.append(
-                    {
-                        "label": activity_label,
-                        "start": interval[0],
-                        "end": interval[1],
-                    }
-                )
-
         st.markdown("**Agent lane**")
+
         agent_source = st.radio(
             "Agent lane source",
-            options=["Activity agent", "Symptom agent", "Manual interval"],
-            index=1,
+            options=["Manual interval", "Activity agent", "Symptom agent"],
+            index=0,
             key=f"agent_source_{context_key}",
         )
+
+        activity_ui = _default_activity_ui(enabled=False)
+        symptom_ui = _default_symptom_ui(enabled=False)
 
         if agent_source == "Manual interval":
             enabled = st.checkbox(
@@ -882,12 +1076,14 @@ def render_agent_controls(
                 value=True,
                 key=f"enable_agent_1_{context_key}",
             )
+
             if enabled:
                 label = st.text_input(
                     "Agent Hit label",
                     value="Hit 1",
                     key=f"agent_label_1_{context_key}",
                 )
+
                 interval = st.slider(
                     "Agent Hit interval",
                     min_value=t_min,
@@ -896,12 +1092,14 @@ def render_agent_controls(
                     format="YYYY-MM-DD HH:mm",
                     key=f"agent_interval_1_{context_key}",
                 )
+
                 severity = st.selectbox(
                     "Agent Hit severity",
                     options=["Low", "Medium", "High"],
                     index=1,
                     key=f"agent_severity_1_{context_key}",
                 )
+
                 manual_agent_intervals.append(
                     {
                         "label": label.strip() or "Hit 1",
@@ -912,27 +1110,104 @@ def render_agent_controls(
                     }
                 )
 
-        auto_agent_intervals = []
-        if agent_source == "Activity agent" and activity_cfg and activity_cfg.get("intervals"):
-            selected_activity = activity_cfg.get("selected_activity", "All activities")
-            if selected_activity == "All activities":
-                auto_agent_intervals = activity_cfg["intervals"]
-            else:
-                auto_agent_intervals = [
-                    item for item in activity_cfg["intervals"] if item["label"] == selected_activity
-                ]
+        elif agent_source == "Activity agent":
+            activity_ui = render_activity_agent_controls(
+                context_key=context_key,
+                df=df,
+                parent=container,
+            )
+            symptom_ui = _default_symptom_ui(enabled=False)
 
-        if agent_source == "Symptom agent" and symptom_cfg and symptom_cfg.get("intervals"):
-            auto_agent_intervals = symptom_cfg["intervals"]
+        elif agent_source == "Symptom agent":
+            # Important:
+            # Symptom agents need activity labels/features internally,
+            # so Activity Agent runs in the background with default settings.
+            activity_ui = _default_activity_ui(enabled=True)
 
-        agent_intervals = auto_agent_intervals if agent_source != "Manual interval" else manual_agent_intervals
+            symptom_ui = render_symptom_agent_controls(
+                context_key=context_key,
+                parent=container,
+            )
 
-        summary = _build_summary(tag_intervals, agent_intervals)
+    return {
+        "agent_source": agent_source,
+        "tag_intervals": tag_intervals,
+        "manual_agent_intervals": manual_agent_intervals,
+        "activity_ui": activity_ui,
+        "symptom_ui": symptom_ui,
+        "show_reference_line": show_reference_line,
+        "reference_time": reference_time,
+        "chart_height": chart_height,
+        "review_mode": review_mode,
+    }
 
-        activity_validation_summary = _build_activity_validation_summary(
-            manual_activity_tags=manual_activity_tags,
-            activity_intervals=activity_cfg.get("intervals", []) if activity_cfg else [],
-        )
+def build_agent_cfg_from_controls(
+    controls: dict,
+    activity_cfg: dict,
+    symptom_cfg: dict,
+) -> dict:
+    agent_source = controls["agent_source"]
+    tag_intervals = controls["tag_intervals"]
+    manual_agent_intervals = controls["manual_agent_intervals"]
+
+    auto_agent_intervals = []
+
+    if agent_source == "Activity agent" and activity_cfg and activity_cfg.get("intervals"):
+        selected_activity = activity_cfg.get("selected_activity", "All activities")
+
+        if selected_activity == "All activities":
+            auto_agent_intervals = activity_cfg["intervals"]
+        else:
+            auto_agent_intervals = [
+                item
+                for item in activity_cfg["intervals"]
+                if item["label"] == selected_activity
+            ]
+
+    elif agent_source == "Symptom agent" and symptom_cfg and symptom_cfg.get("intervals"):
+        auto_agent_intervals = symptom_cfg["intervals"]
+
+    if agent_source == "Manual interval":
+        agent_intervals = manual_agent_intervals
+    else:
+        agent_intervals = auto_agent_intervals
+
+    activity_ui = controls.get("activity_ui", {})
+    manual_activity_tags = activity_ui.get("manual_activity_tags", [])
+
+    summary = _build_summary(tag_intervals, agent_intervals)
+
+    activity_validation_summary = _build_activity_validation_summary(
+        manual_activity_tags=manual_activity_tags,
+        activity_intervals=activity_cfg.get("intervals", []) if activity_cfg else [],
+    )
+
+    return {
+        "agent_source": agent_source,
+        "tag_intervals": tag_intervals,
+        "agent_intervals": agent_intervals,
+        "summary": summary,
+        "show_reference_line": controls["show_reference_line"],
+        "reference_time": controls["reference_time"],
+        "chart_height": controls["chart_height"],
+        "review_mode": controls["review_mode"],
+        "activity_cfg": activity_cfg or {},
+        "symptom_cfg": symptom_cfg or {},
+        "manual_activity_tags": manual_activity_tags,
+        "activity_validation_summary": activity_validation_summary,
+    }
+
+def render_agent_review_outputs(
+    agent_cfg: dict,
+    context_key: str,
+    parent=None,
+):
+    container = parent if parent is not None else st.sidebar
+
+    with container:
+        summary = agent_cfg["summary"]
+        manual_activity_tags = agent_cfg.get("manual_activity_tags", [])
+        activity_validation_summary = agent_cfg.get("activity_validation_summary", {})
 
         score_text = f"{summary['score_percent']:.1f}%"
         threshold_text = f"{summary['acceptance_threshold_percent']:.0f}%"
@@ -943,8 +1218,10 @@ def render_agent_controls(
             f"Hits: {summary['agent_count']} | "
             f"Overlap: {summary['overlap_count']} / {summary['tag_count']}"
         )
+
         st.caption(
-            f"Score: {score_text} | Acceptance threshold: {threshold_text} | Status: {acceptance_text}"
+            f"Score: {score_text} | Acceptance threshold: {threshold_text} | "
+            f"Status: {acceptance_text}"
         )
 
         if manual_activity_tags:
@@ -962,8 +1239,8 @@ def render_agent_controls(
                 st.caption(f"{row['label']}: {row['status']}")
 
         json_text, csv_text = _build_export_payload(
-            tag_intervals=tag_intervals,
-            agent_intervals=agent_intervals,
+            tag_intervals=agent_cfg["tag_intervals"],
+            agent_intervals=agent_cfg["agent_intervals"],
             summary=summary,
             manual_activity_tags=manual_activity_tags,
             activity_validation_summary=activity_validation_summary,
@@ -984,17 +1261,3 @@ def render_agent_controls(
             mime="text/csv",
             key=f"download_csv_{context_key}",
         )
-
-    return {
-        "tag_intervals": tag_intervals,
-        "agent_intervals": agent_intervals,
-        "summary": summary,
-        "show_reference_line": show_reference_line,
-        "reference_time": reference_time,
-        "chart_height": chart_height,
-        "review_mode": review_mode,
-        "activity_cfg": activity_cfg or {},
-        "symptom_cfg": symptom_cfg or {},
-        "manual_activity_tags": manual_activity_tags,
-        "activity_validation_summary": activity_validation_summary,
-    }

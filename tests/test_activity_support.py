@@ -6,8 +6,21 @@ from agents.activity_support import (
     intervals_from_label_series,
     interval_overlap,
     overlap_ratio,
+    rolling_mean,
     stable_within_band,
 )
+
+
+def test_rolling_mean_is_past_looking_not_centered():
+    index = pd.date_range("2024-01-01", periods=5, freq="min")
+    series = pd.Series([1, 1, 100, 1, 1], index=index)
+
+    result = rolling_mean(series, window=3)
+
+    assert result.iloc[0] == 1
+    assert result.iloc[1] == 1
+    assert result.iloc[2] == 34
+    assert result.iloc[1] != 34
 
 
 def test_interval_overlap_returns_overlap():
