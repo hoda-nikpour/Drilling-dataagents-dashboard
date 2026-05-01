@@ -133,12 +133,15 @@ def build_open_hole_length_agent(
     )
 
     open_hole_length = (well_depth - casing_depth).clip(lower=0.0)
-    out["well_depth"] = well_depth
-    out["casing_depth"] = casing_depth
-    out["open_hole_length"] = open_hole_length
 
     lvl1_mask = open_hole_length > cfg.open_hole_length_threshold_1
     lvl2_mask = open_hole_length > cfg.open_hole_length_threshold_2
+
+    out["well_depth"] = well_depth
+    out["casing_depth"] = casing_depth
+    out["open_hole_length"] = open_hole_length
+    out["open_hole_lvl1_mask"] = lvl1_mask
+    out["open_hole_lvl2_mask"] = lvl2_mask
 
     lvl1_intervals = first_crossing_intervals(
         mask=lvl1_mask & ~lvl2_mask,
@@ -175,14 +178,6 @@ def build_trq_spike_agent(
     trq_ratio = trq / trq_mean_long
     trq_zscore = (trq - trq_mean_long) / trq_std_long.replace(0.0, pd.NA)
 
-    out["trq"] = trq
-    out["rpm"] = rpm
-    out["trq_mean_long"] = trq_mean_long
-    out["trq_std_long"] = trq_std_long
-    out["trq_ratio"] = trq_ratio
-    out["trq_zscore"] = trq_zscore
-    out["trq_min_previous_7"] = trq_min_previous_7
-
     rpm_on = rpm > 0
 
     rpm_stable = pd.Series(True, index=df.index)
@@ -202,7 +197,6 @@ def build_trq_spike_agent(
     )
 
     extreme_spike = trq_ratio > cfg.trq_spike_extreme_ratio
-
     spike_gate = normal_spike_shape | extreme_spike
 
     lvl1_mask = (
@@ -217,6 +211,23 @@ def build_trq_spike_agent(
         & spike_gate
         & (trq_ratio > cfg.trq_spike_ratio_level_2)
     )
+
+    out["trq"] = trq
+    out["rpm"] = rpm
+    out["trq_mean_long"] = trq_mean_long
+    out["trq_std_long"] = trq_std_long
+    out["trq_ratio"] = trq_ratio
+    out["trq_zscore"] = trq_zscore
+    out["trq_min_previous_7"] = trq_min_previous_7
+    out["rpm_on"] = rpm_on
+    out["rpm_stable"] = rpm_stable
+    out["context_mask"] = context_mask
+    out["started_low"] = started_low
+    out["normal_spike_shape"] = normal_spike_shape
+    out["extreme_spike"] = extreme_spike
+    out["spike_gate"] = spike_gate
+    out["lvl1_mask"] = lvl1_mask
+    out["lvl2_mask"] = lvl2_mask
 
     lvl1_intervals = mask_to_intervals(
         mask=lvl1_mask,
@@ -233,7 +244,6 @@ def build_trq_spike_agent(
     )
 
     return out, (lvl1_intervals + lvl2_intervals)
-
 
 def build_trq_erratic_agent(
     df: pd.DataFrame,
@@ -298,6 +308,9 @@ def build_trq_erratic_agent(
     out["trq_sign_change"] = sign_change
     out["trq_cycle_count"] = cycle_count
     out["rpm_stable"] = rpm_stable
+    out["context_mask"] = context_mask
+    out["lvl1_mask"] = lvl1_mask
+    out["lvl2_mask"] = lvl2_mask
 
     lvl1_intervals = mask_to_intervals(
         mask=lvl1_mask,
@@ -314,7 +327,6 @@ def build_trq_erratic_agent(
     )
 
     return out, (lvl1_intervals + lvl2_intervals)
-
 
 def build_pspike_agent(
     df: pd.DataFrame,
@@ -334,31 +346,31 @@ def build_pspike_agent(
     spp_baseline = rolling_baseline(spp, cfg.pspike_baseline_window)
     spp_delta = spp - spp_baseline
 
-    out["spp"] = spp
-    out["spp_baseline"] = spp_baseline
-    out["spp_delta"] = spp_delta
-    out["wob"] = wob
-    out["rpm"] = rpm
-    out["mfi"] = mfi
-
     context_mask = activity_labels.isin(["Drilling", "Reaming"])
 
     stable_mask = pd.Series(True, index=df.index)
 
+    stable_flow_mask = pd.Series(True, index=df.index)
+    stable_rpm_mask = pd.Series(True, index=df.index)
+    stable_wob_mask = pd.Series(True, index=df.index)
+
     if cfg.require_stable_flow_for_pspike:
-        stable_mask &= mfi.diff().abs().fillna(0.0) <= cfg.pspike_flow_delta_max
+        stable_flow_mask = mfi.diff().abs().fillna(0.0) <= cfg.pspike_flow_delta_max
         if "stable_flow" in activity_features.columns:
-            stable_mask &= activity_features["stable_flow"]
+            stable_flow_mask &= activity_features["stable_flow"]
+        stable_mask &= stable_flow_mask
 
     if cfg.require_stable_rpm_for_pspike:
-        stable_mask &= rpm.diff().abs().fillna(0.0) <= cfg.pspike_rpm_delta_max
+        stable_rpm_mask = rpm.diff().abs().fillna(0.0) <= cfg.pspike_rpm_delta_max
         if "stable_rpm" in activity_features.columns:
-            stable_mask &= activity_features["stable_rpm"]
+            stable_rpm_mask &= activity_features["stable_rpm"]
+        stable_mask &= stable_rpm_mask
 
     if cfg.require_stable_wob_for_pspike:
-        stable_mask &= wob.diff().abs().fillna(0.0) <= cfg.pspike_wob_delta_max
+        stable_wob_mask = wob.diff().abs().fillna(0.0) <= cfg.pspike_wob_delta_max
         if "stable_wob" in activity_features.columns:
-            stable_mask &= activity_features["stable_wob"]
+            stable_wob_mask &= activity_features["stable_wob"]
+        stable_mask &= stable_wob_mask
 
     spp_stable_before_spike = stable_within_band(
         spp.shift(1),
@@ -369,7 +381,6 @@ def build_pspike_agent(
     if mud_motor_signal.notna().any():
         mud_motor_on = mud_motor_signal.fillna(0.0) > 0.0
     else:
-        # AI made assumption on this part: fallback uses WOB as a proxy when a Mud Motor On signal is unavailable.
         mud_motor_on = wob > cfg.pspike_motor_wob_threshold
 
     normal_mask = (
@@ -392,6 +403,24 @@ def build_pspike_agent(
         normal_mask | motor_mask,
         cfg.pspike_gap_fill_samples,
     )
+
+    out["spp"] = spp
+    out["spp_baseline"] = spp_baseline
+    out["spp_delta"] = spp_delta
+    out["wob"] = wob
+    out["rpm"] = rpm
+    out["mfi"] = mfi
+    out["mud_motor_signal"] = mud_motor_signal
+    out["mud_motor_on"] = mud_motor_on
+    out["context_mask"] = context_mask
+    out["stable_flow_mask"] = stable_flow_mask
+    out["stable_rpm_mask"] = stable_rpm_mask
+    out["stable_wob_mask"] = stable_wob_mask
+    out["stable_mask"] = stable_mask
+    out["spp_stable_before_spike"] = spp_stable_before_spike
+    out["normal_mask"] = normal_mask
+    out["motor_mask"] = motor_mask
+    out["combined_mask"] = combined_mask
 
     lvl1_intervals = mask_to_intervals(
         mask=combined_mask & normal_mask,
@@ -423,10 +452,6 @@ def build_overpull_agent(
     baseline = rolling_baseline(hkl, cfg.overpull_baseline_window)
     delta = hkl - baseline
 
-    out["hkl"] = hkl
-    out["hkl_baseline"] = baseline
-    out["hkl_delta"] = delta
-
     context_mask = activity_labels.eq("TrippingOut")
     move_mask = (
         activity_features["pipe_moving_up"]
@@ -441,10 +466,22 @@ def build_overpull_agent(
         inclusive="both",
     )
 
+    raw_mask = context_mask & move_mask & velocity_ok & (delta > cfg.overpull_threshold)
+
     combined_mask = fill_short_false_gaps(
-        context_mask & move_mask & velocity_ok & (delta > cfg.overpull_threshold),
+        raw_mask,
         cfg.overpull_gap_fill_samples,
     )
+
+    out["hkl"] = hkl
+    out["hkl_baseline"] = baseline
+    out["hkl_delta"] = delta
+    out["context_mask"] = context_mask
+    out["move_mask"] = move_mask
+    out["hoisting_velocity"] = hoisting_velocity
+    out["velocity_ok"] = velocity_ok
+    out["raw_mask"] = raw_mask
+    out["combined_mask"] = combined_mask
 
     intervals = mask_to_intervals(
         mask=combined_mask,
@@ -469,10 +506,6 @@ def build_tookweight_agent(
     baseline = rolling_baseline(hkl, cfg.tookweight_baseline_window)
     delta = baseline - hkl
 
-    out["hkl"] = hkl
-    out["hkl_baseline"] = baseline
-    out["hkl_drop"] = delta
-
     context_mask = activity_labels.eq("TrippingIn")
     move_mask = (
         activity_features["pipe_moving_down"]
@@ -487,10 +520,22 @@ def build_tookweight_agent(
         inclusive="both",
     )
 
+    raw_mask = context_mask & move_mask & velocity_ok & (delta > cfg.tookweight_threshold)
+
     combined_mask = fill_short_false_gaps(
-        context_mask & move_mask & velocity_ok & (delta > cfg.tookweight_threshold),
+        raw_mask,
         cfg.tookweight_gap_fill_samples,
     )
+
+    out["hkl"] = hkl
+    out["hkl_baseline"] = baseline
+    out["hkl_drop"] = delta
+    out["context_mask"] = context_mask
+    out["move_mask"] = move_mask
+    out["hoisting_velocity"] = hoisting_velocity
+    out["velocity_ok"] = velocity_ok
+    out["raw_mask"] = raw_mask
+    out["combined_mask"] = combined_mask
 
     intervals = mask_to_intervals(
         mask=combined_mask,

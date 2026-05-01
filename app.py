@@ -215,16 +215,48 @@ def main():
     review_df=review_df,
     )
 
-    symptom_miss_reason_df = build_symptom_miss_reason_df(
-        tag_intervals=agent_cfg.get("tag_intervals", []),
-        symptom_cfg=symptom_cfg,
-        activity_cfg=activity_cfg,
+    # Show the miss-reason table only for a fresh Symptom Agent review.
+    # This prevents the table from carrying old agent results when the dashboard opens
+    # or when the user is using Manual interval / Activity agent.
+    show_symptom_miss_reason_table = (
+        agent_cfg.get("agent_source") == "Symptom agent"
+        and symptom_ui.get("enabled", False)
+        and bool(agent_cfg.get("tag_intervals", []))
     )
 
-    if not symptom_miss_reason_df.empty:
-        with st.expander("Why selected symptom agent did or did not hit manual tags", expanded=True):
-            st.dataframe(symptom_miss_reason_df, use_container_width=True)
+    if show_symptom_miss_reason_table:
+        symptom_miss_reason_df = build_symptom_miss_reason_df(
+            tag_intervals=agent_cfg.get("tag_intervals", []),
+            symptom_cfg=symptom_cfg,
+            activity_cfg=activity_cfg,
+        )
 
+        # This key changes whenever tags or symptom-agent results change.
+        # Streamlit will fully remount the dataframe instead of reusing old cells.
+        miss_reason_table_key = (
+            "symptom_miss_reason_"
+            f"{context_key}_"
+            f"{agent_cfg.get('agent_source')}_"
+            f"{symptom_cfg.get('selected_symptom', '')}_"
+            f"{len(agent_cfg.get('tag_intervals', []))}_"
+            f"{len(symptom_cfg.get('intervals', []))}_"
+            f"{hash(str(agent_cfg.get('tag_intervals', [])))}_"
+            f"{hash(str(symptom_cfg.get('intervals', [])))}"
+        )
+
+        if not symptom_miss_reason_df.empty:
+            with st.expander(
+                "Why selected symptom agent did or did not hit manual tags",
+                expanded=True,
+            ):
+                st.dataframe(
+                    symptom_miss_reason_df,
+                    use_container_width=True,
+                    key=miss_reason_table_key,
+                )    
+
+
+    
     if symptom_cfg and not symptom_cfg.get("features", pd.DataFrame()).empty:
         with st.expander("Selected symptom debug features", expanded=False):
             st.dataframe(

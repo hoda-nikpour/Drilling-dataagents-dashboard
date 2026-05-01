@@ -1165,11 +1165,15 @@ def build_symptom_miss_reason_df(
     """
     Explain why the selected symptom agent did or did not hit each manual tag.
 
-    This is especially useful because most symptom agents are gated by activity context.
-    Example:
-    TRQErratic can only happen during Drilling/Reaming. If Activity Agent says
-    Other/Circulating/MakingConnection, TRQErratic is blocked.
+    Covers:
+    - OpenHoleLength
+    - TRQSpike
+    - TRQErratic
+    - PSpike
+    - OverPull
+    - TookWeight
     """
+
     columns = [
         "Tag",
         "Tag Start",
@@ -1187,8 +1191,41 @@ def build_symptom_miss_reason_df(
     selected_symptom = symptom_cfg.get("selected_symptom", "")
     symptom_features = symptom_cfg.get("features", pd.DataFrame())
     symptom_intervals = symptom_cfg.get("intervals", [])
+    cfg = symptom_cfg.get("config", SymptomConfig())
 
     activity_labels = activity_cfg.get("labels", pd.Series(dtype="object"))
+
+    def _count_true(df: pd.DataFrame, col: str) -> int:
+        if col not in df.columns:
+            return 0
+        return int(df[col].fillna(False).astype(bool).sum())
+
+    def _max_value(df: pd.DataFrame, col: str):
+        if col not in df.columns:
+            return pd.NA
+        return df[col].max()
+
+    def _min_value(df: pd.DataFrame, col: str):
+        if col not in df.columns:
+            return pd.NA
+        return df[col].min()
+
+    def _fmt(value, decimals: int = 3) -> str:
+        if pd.isna(value):
+            return "NaN"
+        try:
+            return f"{float(value):.{decimals}f}"
+        except Exception:
+            return str(value)
+
+    def _activity_counts_text(activity_window: pd.Series) -> str:
+        if activity_window is None or activity_window.empty:
+            return "No activity samples inside tag"
+
+        activity_counts = activity_window.value_counts(dropna=False)
+        return ", ".join(
+            [f"{str(label)}={int(count)}" for label, count in activity_counts.items()]
+        )
 
     rows = []
 
@@ -1209,14 +1246,7 @@ def build_symptom_miss_reason_df(
 
         if activity_labels is not None and not activity_labels.empty:
             activity_window = activity_labels.loc[tag_start:tag_end]
-
-            if not activity_window.empty:
-                activity_counts = activity_window.value_counts(dropna=False)
-                activity_counts_text = ", ".join(
-                    [f"{str(label)}={int(count)}" for label, count in activity_counts.items()]
-                )
-            else:
-                activity_counts_text = "No activity samples inside tag"
+            activity_counts_text = _activity_counts_text(activity_window)
 
         if matched:
             rows.append(
@@ -1268,120 +1298,307 @@ def build_symptom_miss_reason_df(
             )
             continue
 
-        allowed_activity = pd.Series(False, index=feature_window.index)
+        details = []
+        main_reason = "Condition blocked"
 
-        if not activity_window.empty:
-            allowed_activity = activity_window.reindex(feature_window.index).isin(["Drilling", "Reaming"])
+        # ----------------------------------------------------
+        # OpenHoleLength
+        # ----------------------------------------------------
+        if selected_symptom == "OpenHoleLength":
+            max_ohl = _max_value(feature_window, "open_hole_length")
+            max_well_depth = _max_value(feature_window, "well_depth")
+            min_casing_depth = _min_value(feature_window, "casing_depth")
+            lvl1_count = _count_true(feature_window, "open_hole_lvl1_mask")
+            lvl2_count = _count_true(feature_window, "open_hole_lvl2_mask")
 
-        allowed_activity_count = int(allowed_activity.fillna(False).sum())
-
-        # -------------------------
-        # TRQErratic miss reasons
-        # -------------------------
-        if selected_symptom == "TRQErratic":
-            details = []
-
-            if allowed_activity_count == 0:
-                rows.append(
-                    {
-                        "Tag": tag_label,
-                        "Tag Start": tag_start,
-                        "Tag End": tag_end,
-                        "Selected Agent": selected_symptom,
-                        "Matched?": "No",
-                        "Activity In Tag": activity_counts_text,
-                        "Main Blocking Reason": "Activity context blocked",
-                        "Details": (
-                            "TRQErratic is only allowed during Drilling or Reaming. "
-                            "Inside this tag interval, Activity Agent did not classify any sample as Drilling/Reaming."
-                        ),
-                    }
+            if pd.isna(max_ohl):
+                main_reason = "Missing OpenHoleLength inputs"
+                details.append("Open-hole length could not be calculated. Check Well Depth and Casing Depth.")
+            elif max_ohl <= cfg.open_hole_length_threshold_1:
+                main_reason = "Open-hole length below threshold"
+                details.append(
+                    f"max open_hole_length={_fmt(max_ohl, 2)} m, "
+                    f"required > {cfg.open_hole_length_threshold_1:.2f} m for Low severity."
                 )
-                continue
+            else:
+                main_reason = "Crossing/interval logic blocked"
+                details.append(
+                    f"Open-hole length exceeded a threshold in the tag window "
+                    f"(Low samples={lvl1_count}, High samples={lvl2_count}), "
+                    "but no first-crossing interval overlapped this tag. "
+                    "This can happen if the first crossing happened before the tag start."
+                )
 
-            if "rpm_stable" in feature_window.columns:
-                rpm_stable_count = int(feature_window["rpm_stable"].fillna(False).sum())
-                if rpm_stable_count == 0:
-                    details.append("rpm_stable was never True.")
-
-            if "trq_ratio" in feature_window.columns:
-                max_ratio = feature_window["trq_ratio"].max()
-                if pd.isna(max_ratio) or max_ratio <= 1.10:
-                    details.append(
-                        f"max trq_ratio={max_ratio:.3f}, required > 1.10."
-                        if pd.notna(max_ratio)
-                        else "trq_ratio was NaN."
-                    )
-
-            if "trq_cycle_count" in feature_window.columns:
-                max_cycles = feature_window["trq_cycle_count"].max()
-                if pd.isna(max_cycles) or max_cycles < 3:
-                    details.append(
-                        f"max trq_cycle_count={max_cycles:.0f}, required >= 3."
-                        if pd.notna(max_cycles)
-                        else "trq_cycle_count was NaN."
-                    )
-
-            main_reason = "TRQErratic condition blocked" if details else "Mask continuity/min-samples blocked"
-            detail_text = " | ".join(details) if details else (
-                "The main conditions looked possible in the tag window, but the final mask did not form "
-                "a valid TRQErratic interval. Check exact timestamps, continuity, and min_samples."
+            details.append(
+                f"max well_depth={_fmt(max_well_depth, 2)} m; "
+                f"min casing_depth={_fmt(min_casing_depth, 2)} m."
             )
 
-        # -------------------------
-        # TRQSpike miss reasons
-        # -------------------------
+        # ----------------------------------------------------
+        # TRQSpike
+        # ----------------------------------------------------
         elif selected_symptom == "TRQSpike":
-            details = []
+            context_count = _count_true(feature_window, "context_mask")
+            rpm_on_count = _count_true(feature_window, "rpm_on")
+            rpm_stable_count = _count_true(feature_window, "rpm_stable")
+            started_low_count = _count_true(feature_window, "started_low")
+            spike_gate_count = _count_true(feature_window, "spike_gate")
+            lvl1_count = _count_true(feature_window, "lvl1_mask")
+            lvl2_count = _count_true(feature_window, "lvl2_mask")
 
-            if allowed_activity_count == 0:
-                rows.append(
-                    {
-                        "Tag": tag_label,
-                        "Tag Start": tag_start,
-                        "Tag End": tag_end,
-                        "Selected Agent": selected_symptom,
-                        "Matched?": "No",
-                        "Activity In Tag": activity_counts_text,
-                        "Main Blocking Reason": "Activity context blocked",
-                        "Details": (
-                            "TRQSpike is only allowed during Drilling or Reaming. "
-                            "Inside this tag interval, Activity Agent did not classify any sample as Drilling/Reaming."
-                        ),
-                    }
+            max_ratio = _max_value(feature_window, "trq_ratio")
+            max_z = _max_value(feature_window, "trq_zscore")
+
+            if context_count == 0:
+                main_reason = "Activity/RPM context blocked"
+                details.append(
+                    "TRQSpike is only allowed when RPM is on, RPM is stable, "
+                    "and Activity Agent says Drilling or Reaming."
                 )
-                continue
+                details.append(f"rpm_on samples={rpm_on_count}; rpm_stable samples={rpm_stable_count}.")
+            elif pd.isna(max_ratio) or max_ratio <= cfg.trq_spike_ratio_level_1:
+                main_reason = "Torque ratio below threshold"
+                details.append(
+                    f"max trq_ratio={_fmt(max_ratio)}, "
+                    f"required > {cfg.trq_spike_ratio_level_1:.2f}."
+                )
+            elif spike_gate_count == 0:
+                main_reason = "Spike shape blocked"
+                details.append(
+                    f"max trq_zscore={_fmt(max_z)}, required > {cfg.trq_spike_zscore_min:.2f}; "
+                    f"started_low samples={started_low_count}; "
+                    f"extreme ratio threshold={cfg.trq_spike_extreme_ratio:.2f}."
+                )
+            elif lvl1_count == 0 and lvl2_count == 0:
+                main_reason = "Severity mask blocked"
+                details.append(
+                    "Context and spike shape were possible, but no Low/High severity TRQSpike mask "
+                    "formed inside the tag window."
+                )
+            else:
+                main_reason = "Interval continuity/min-samples blocked"
+                details.append(
+                    f"TRQSpike mask samples existed in the tag window "
+                    f"(Low={lvl1_count}, High={lvl2_count}), but no final interval overlapped the tag."
+                )
 
-            if "trq_ratio" in feature_window.columns:
-                max_ratio = feature_window["trq_ratio"].max()
-                if pd.isna(max_ratio) or max_ratio <= 1.25:
-                    details.append(
-                        f"max trq_ratio={max_ratio:.3f}, required > 1.25."
-                        if pd.notna(max_ratio)
-                        else "trq_ratio was NaN."
-                    )
+            details.append(f"max trq_ratio={_fmt(max_ratio)}; max trq_zscore={_fmt(max_z)}.")
 
-            if "trq_zscore" in feature_window.columns:
-                max_z = feature_window["trq_zscore"].max()
-                if pd.isna(max_z) or max_z <= 2.9:
-                    details.append(
-                        f"max trq_zscore={max_z:.3f}, required > 2.9."
-                        if pd.notna(max_z)
-                        else "trq_zscore was NaN."
-                    )
+        # ----------------------------------------------------
+        # TRQErratic
+        # ----------------------------------------------------
+        elif selected_symptom == "TRQErratic":
+            context_count = _count_true(feature_window, "context_mask")
+            rpm_stable_count = _count_true(feature_window, "rpm_stable")
+            lvl1_count = _count_true(feature_window, "lvl1_mask")
+            lvl2_count = _count_true(feature_window, "lvl2_mask")
 
-            main_reason = "TRQSpike condition blocked" if details else "Spike shape/min-samples blocked"
-            detail_text = " | ".join(details) if details else (
-                "The main conditions looked possible in the tag window, but the final mask did not form "
-                "a valid TRQSpike interval. Check started-low logic, exact timing, and baseline window."
+            max_ratio = _max_value(feature_window, "trq_ratio")
+            max_cycles = _max_value(feature_window, "trq_cycle_count")
+
+            if context_count == 0:
+                main_reason = "Activity context blocked"
+                details.append("TRQErratic is only allowed during Drilling or Reaming.")
+            elif rpm_stable_count == 0:
+                main_reason = "RPM stability blocked"
+                details.append("rpm_stable was never True inside the tag window.")
+            elif pd.isna(max_ratio) or max_ratio <= cfg.trq_erratic_ratio_level_1:
+                main_reason = "Torque amplitude below threshold"
+                details.append(
+                    f"max trq_ratio={_fmt(max_ratio)}, "
+                    f"required > {cfg.trq_erratic_ratio_level_1:.2f}."
+                )
+            elif pd.isna(max_cycles) or max_cycles < cfg.trq_erratic_min_cycles:
+                main_reason = "Not enough torque cycles"
+                details.append(
+                    f"max trq_cycle_count={_fmt(max_cycles, 0)}, "
+                    f"required >= {cfg.trq_erratic_min_cycles}."
+                )
+            elif lvl1_count == 0 and lvl2_count == 0:
+                main_reason = "Severity mask blocked"
+                details.append(
+                    "The main TRQErratic conditions were close, but no Low/High mask formed."
+                )
+            else:
+                main_reason = "Interval continuity/min-samples blocked"
+                details.append(
+                    f"TRQErratic mask samples existed in the tag window "
+                    f"(Low={lvl1_count}, High={lvl2_count}), but no final interval overlapped the tag."
+                )
+
+            details.append(
+                f"max trq_ratio={_fmt(max_ratio)}; "
+                f"max trq_cycle_count={_fmt(max_cycles, 0)}."
             )
+
+        # ----------------------------------------------------
+        # PSpike
+        # ----------------------------------------------------
+        elif selected_symptom == "PSpike":
+            context_count = _count_true(feature_window, "context_mask")
+            stable_flow_count = _count_true(feature_window, "stable_flow_mask")
+            stable_rpm_count = _count_true(feature_window, "stable_rpm_mask")
+            stable_wob_count = _count_true(feature_window, "stable_wob_mask")
+            stable_count = _count_true(feature_window, "stable_mask")
+            spp_stable_count = _count_true(feature_window, "spp_stable_before_spike")
+            normal_count = _count_true(feature_window, "normal_mask")
+            motor_count = _count_true(feature_window, "motor_mask")
+            combined_count = _count_true(feature_window, "combined_mask")
+
+            max_spp_delta = _max_value(feature_window, "spp_delta")
+            motor_on_count = _count_true(feature_window, "mud_motor_on")
+
+            if context_count == 0:
+                main_reason = "Activity context blocked"
+                details.append("PSpike is only allowed during Drilling or Reaming.")
+            elif stable_count == 0:
+                main_reason = "Stable drilling conditions blocked"
+                details.append(
+                    "PSpike requires stable MFI, RPM, and WOB before the pressure spike."
+                )
+                details.append(
+                    f"stable_flow samples={stable_flow_count}; "
+                    f"stable_rpm samples={stable_rpm_count}; "
+                    f"stable_wob samples={stable_wob_count}."
+                )
+            elif spp_stable_count == 0:
+                main_reason = "SPP baseline stability blocked"
+                details.append(
+                    "SPP was not stable enough before the spike. "
+                    f"Required SPP stability band={cfg.pspike_spp_stability_band:.2f}."
+                )
+            elif pd.isna(max_spp_delta):
+                main_reason = "SPP delta unavailable"
+                details.append("spp_delta was NaN. Check SPP availability and baseline calculation.")
+            elif normal_count == 0 and motor_count == 0:
+                main_reason = "Pressure increase below threshold"
+                details.append(
+                    f"max spp_delta={_fmt(max_spp_delta, 2)}; "
+                    f"normal threshold>{cfg.pspike_threshold_normal:.2f}; "
+                    f"motor-on threshold>{cfg.pspike_threshold_motor_on:.2f}; "
+                    f"motor_on samples={motor_on_count}."
+                )
+            elif combined_count == 0:
+                main_reason = "Gap-fill/final mask blocked"
+                details.append(
+                    "Normal or motor-on PSpike condition appeared possible, but the combined final mask did not form."
+                )
+            else:
+                main_reason = "Interval continuity/min-samples blocked"
+                details.append(
+                    f"PSpike final mask samples existed in the tag window "
+                    f"(combined samples={combined_count}), but no final interval overlapped the tag."
+                )
+
+            details.append(f"max spp_delta={_fmt(max_spp_delta, 2)}.")
+
+        # ----------------------------------------------------
+        # OverPull
+        # ----------------------------------------------------
+        elif selected_symptom == "OverPull":
+            context_count = _count_true(feature_window, "context_mask")
+            move_count = _count_true(feature_window, "move_mask")
+            velocity_count = _count_true(feature_window, "velocity_ok")
+            raw_count = _count_true(feature_window, "raw_mask")
+            combined_count = _count_true(feature_window, "combined_mask")
+
+            max_hkl_delta = _max_value(feature_window, "hkl_delta")
+            min_velocity = _min_value(feature_window, "hoisting_velocity")
+            max_velocity = _max_value(feature_window, "hoisting_velocity")
+
+            if context_count == 0:
+                main_reason = "Activity context blocked"
+                details.append("OverPull is only allowed during TrippingOut.")
+            elif move_count == 0:
+                main_reason = "Pipe movement blocked"
+                details.append("OverPull requires pipe_moving_up=True.")
+            elif velocity_count == 0:
+                main_reason = "Hoisting velocity blocked"
+                details.append(
+                    f"Hoisting velocity must be between {cfg.hoisting_velocity_min:.2f} "
+                    f"and {cfg.hoisting_velocity_max:.2f}."
+                )
+                details.append(
+                    f"velocity range in tag={_fmt(min_velocity, 3)} to {_fmt(max_velocity, 3)}."
+                )
+            elif pd.isna(max_hkl_delta) or max_hkl_delta <= cfg.overpull_threshold:
+                main_reason = "HKL increase below threshold"
+                details.append(
+                    f"max hkl_delta={_fmt(max_hkl_delta, 2)}, "
+                    f"required > {cfg.overpull_threshold:.2f}."
+                )
+            elif raw_count == 0:
+                main_reason = "Raw OverPull mask blocked"
+                details.append(
+                    "The individual conditions were close, but they did not become True at the same timestamp."
+                )
+            elif combined_count == 0:
+                main_reason = "Gap-fill/final mask blocked"
+                details.append("Raw OverPull appeared possible, but final combined mask did not form.")
+            else:
+                main_reason = "Interval continuity/min-samples blocked"
+                details.append(
+                    f"OverPull final mask samples existed in the tag window "
+                    f"(combined samples={combined_count}), but no final interval overlapped the tag."
+                )
+
+            details.append(f"max hkl_delta={_fmt(max_hkl_delta, 2)}.")
+
+        # ----------------------------------------------------
+        # TookWeight
+        # ----------------------------------------------------
+        elif selected_symptom == "TookWeight":
+            context_count = _count_true(feature_window, "context_mask")
+            move_count = _count_true(feature_window, "move_mask")
+            velocity_count = _count_true(feature_window, "velocity_ok")
+            raw_count = _count_true(feature_window, "raw_mask")
+            combined_count = _count_true(feature_window, "combined_mask")
+
+            max_hkl_drop = _max_value(feature_window, "hkl_drop")
+            min_velocity = _min_value(feature_window, "hoisting_velocity")
+            max_velocity = _max_value(feature_window, "hoisting_velocity")
+
+            if context_count == 0:
+                main_reason = "Activity context blocked"
+                details.append("TookWeight is only allowed during TrippingIn.")
+            elif move_count == 0:
+                main_reason = "Pipe movement blocked"
+                details.append("TookWeight requires pipe_moving_down=True.")
+            elif velocity_count == 0:
+                main_reason = "Hoisting velocity blocked"
+                details.append(
+                    f"Hoisting velocity must be between {cfg.hoisting_velocity_min:.2f} "
+                    f"and {cfg.hoisting_velocity_max:.2f}."
+                )
+                details.append(
+                    f"velocity range in tag={_fmt(min_velocity, 3)} to {_fmt(max_velocity, 3)}."
+                )
+            elif pd.isna(max_hkl_drop) or max_hkl_drop <= cfg.tookweight_threshold:
+                main_reason = "HKL drop below threshold"
+                details.append(
+                    f"max hkl_drop={_fmt(max_hkl_drop, 2)}, "
+                    f"required > {cfg.tookweight_threshold:.2f}."
+                )
+            elif raw_count == 0:
+                main_reason = "Raw TookWeight mask blocked"
+                details.append(
+                    "The individual conditions were close, but they did not become True at the same timestamp."
+                )
+            elif combined_count == 0:
+                main_reason = "Gap-fill/final mask blocked"
+                details.append("Raw TookWeight appeared possible, but final combined mask did not form.")
+            else:
+                main_reason = "Interval continuity/min-samples blocked"
+                details.append(
+                    f"TookWeight final mask samples existed in the tag window "
+                    f"(combined samples={combined_count}), but no final interval overlapped the tag."
+                )
+
+            details.append(f"max hkl_drop={_fmt(max_hkl_drop, 2)}.")
 
         else:
-            main_reason = "No detailed rule explanation yet"
-            detail_text = (
-                f"Detailed miss-reason logic is currently written for TRQErratic and TRQSpike. "
-                f"Selected symptom is {selected_symptom}."
-            )
+            main_reason = "Unknown selected symptom"
+            details.append(f"No miss-reason rules exist for selected symptom: {selected_symptom}.")
 
         rows.append(
             {
@@ -1392,7 +1609,7 @@ def build_symptom_miss_reason_df(
                 "Matched?": "No",
                 "Activity In Tag": activity_counts_text,
                 "Main Blocking Reason": main_reason,
-                "Details": detail_text,
+                "Details": " | ".join(details),
             }
         )
 
