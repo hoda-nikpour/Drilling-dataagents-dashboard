@@ -29,6 +29,7 @@ from ui.sidebar import (
     build_activity_validation_df,
     build_agent_cfg_from_controls,
     build_manual_review_df,
+    build_symptom_miss_reason_df,
     render_agent_controls,
     render_agent_review_outputs,
     render_parameter_range_controls,
@@ -142,7 +143,11 @@ def main():
     # Create sidebar containers in the visual order we want.
     # Track 4 will appear before the agent settings, even though the
     # agent settings are read first internally.
-    df = df.loc[pd.Timestamp(time_range[0]) : pd.Timestamp(time_range[1])]
+    if time_range is None:
+        st.warning("No valid time range is available.")
+        st.stop()
+
+    df = df.loc[pd.Timestamp(time_range[0]) : pd.Timestamp(time_range[1])].copy()
     if df.empty:
         st.warning("No data available in the selected time range.")
         st.stop()
@@ -204,11 +209,28 @@ def main():
     review_df = build_manual_review_df(summary)
 
     render_result_tables(
-        activity_cfg=activity_cfg,
-        symptom_cfg=symptom_cfg,
-        activity_validation_df=activity_validation_df,
-        review_df=review_df,
+    activity_cfg=activity_cfg,
+    symptom_cfg=symptom_cfg,
+    activity_validation_df=activity_validation_df,
+    review_df=review_df,
     )
+
+    symptom_miss_reason_df = build_symptom_miss_reason_df(
+        tag_intervals=agent_cfg.get("tag_intervals", []),
+        symptom_cfg=symptom_cfg,
+        activity_cfg=activity_cfg,
+    )
+
+    if not symptom_miss_reason_df.empty:
+        with st.expander("Why selected symptom agent did or did not hit manual tags", expanded=True):
+            st.dataframe(symptom_miss_reason_df, use_container_width=True)
+
+    if symptom_cfg and not symptom_cfg.get("features", pd.DataFrame()).empty:
+        with st.expander("Selected symptom debug features", expanded=False):
+            st.dataframe(
+                symptom_cfg["features"].tail(1000),
+                use_container_width=True,
+            )
 
     section_ranges = compute_section_ranges(df, list(selected_sections))
 
@@ -237,10 +259,6 @@ def main():
     )
 
     chart_key = f"multi_track_chart_{context_key}"
-
-    top_chart_controls = st.container()
-    with top_chart_controls:
-        render_undo_controls(parent=st.container(), compact=True)
 
     render_chart(fig, chart_key)
 

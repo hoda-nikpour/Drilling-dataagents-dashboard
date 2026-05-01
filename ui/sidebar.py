@@ -351,74 +351,67 @@ def render_time_filter(df, context_key: str):
     Precise second-level time filter.
 
     Behavior:
-    - No old Streamlit time-range slider.
-    - User types exact start/end time with seconds.
-    - Pressing Enter in either text box reruns Streamlit automatically.
-    - The returned time_range is immediately used by app.py to filter df.
+    - Text boxes show full data range by default.
+    - User edits start/end time.
+    - Pressing Enter in either text box reruns Streamlit.
+    - The returned time_range immediately reflects the typed values.
+    - No Apply button is needed.
     """
 
     def _format_dt(value) -> str:
         return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
     def _parse_dt(text: str):
-        return pd.to_datetime(text, format="%Y-%m-%d %H:%M:%S", errors="raise")
+        return pd.to_datetime(
+            str(text).strip(),
+            format="%Y-%m-%d %H:%M:%S",
+            errors="raise",
+        )
 
     with st.sidebar:
         st.subheader("Time Filter")
 
-        t_min_all = df.index.min().to_pydatetime()
-        t_max_all = df.index.max().to_pydatetime()
+        if df.empty:
+            st.warning("No data available for time filtering.")
+            return None, 0.0
 
-        default_start = pd.Timestamp(t_min_all)
-        default_end = pd.Timestamp(t_max_all)
-        default_value = (default_start.to_pydatetime(), default_end.to_pydatetime())
+        default_start = pd.Timestamp(df.index.min())
+        default_end = pd.Timestamp(df.index.max())
 
-        range_store_key = f"time_range_store_{context_key}"
         exact_start_key = f"exact_time_start_{context_key}"
         exact_end_key = f"exact_time_end_{context_key}"
-        reset_counter_key = f"time_reset_counter_{context_key}"
+        data_signature_key = f"time_filter_data_signature_{context_key}"
 
-        if reset_counter_key not in st.session_state:
-            st.session_state[reset_counter_key] = 0
+        current_data_signature = (
+            _format_dt(default_start),
+            _format_dt(default_end),
+            len(df),
+        )
 
-        # Initialize stored range once.
-        if range_store_key not in st.session_state:
-            st.session_state[range_store_key] = default_value
+        previous_data_signature = st.session_state.get(data_signature_key)
 
-        # If selected well/section/data range changes, reset BEFORE widgets are created.
-        stored_start, stored_end = st.session_state[range_store_key]
-
-        if (
-            pd.Timestamp(stored_start) < default_start
-            or pd.Timestamp(stored_end) > default_end
-            or pd.Timestamp(stored_start) >= pd.Timestamp(stored_end)
-        ):
-            st.session_state[range_store_key] = default_value
-            st.session_state[reset_counter_key] += 1
-
-        stored_start, stored_end = st.session_state[range_store_key]
-
-        # Important:
-        # These keys must be set BEFORE st.text_input() is created.
-        # Do not modify these keys after the widgets are instantiated.
-        if exact_start_key not in st.session_state:
-            st.session_state[exact_start_key] = _format_dt(stored_start)
-
-        if exact_end_key not in st.session_state:
-            st.session_state[exact_end_key] = _format_dt(stored_end)
-
-        # Reset button is above the text inputs, so it is still safe to update
-        # the text-input session_state keys here.
-        if st.button("Reset time filter", key=f"reset_time_{context_key}"):
-            st.session_state[range_store_key] = default_value
+        # Reset default text values when well/section/data range changes.
+        # This must happen before the text_input widgets are created.
+        if previous_data_signature != current_data_signature:
+            st.session_state[data_signature_key] = current_data_signature
             st.session_state[exact_start_key] = _format_dt(default_start)
             st.session_state[exact_end_key] = _format_dt(default_end)
-            st.session_state[reset_counter_key] += 1
+
+        # Repair missing or empty widget state before creating widgets.
+        if not str(st.session_state.get(exact_start_key, "")).strip():
+            st.session_state[exact_start_key] = _format_dt(default_start)
+
+        if not str(st.session_state.get(exact_end_key, "")).strip():
+            st.session_state[exact_end_key] = _format_dt(default_end)
+
+        if st.button("Reset time filter", key=f"reset_time_{context_key}"):
+            st.session_state[exact_start_key] = _format_dt(default_start)
+            st.session_state[exact_end_key] = _format_dt(default_end)
             st.rerun()
 
         st.markdown("**Precise time window**")
         st.caption(
-            "Type exact start and end times. Press Enter after editing. "
+            "Type exact start and end times, then press Enter. "
             "Format: YYYY-MM-DD HH:mm:ss"
         )
 
@@ -434,14 +427,14 @@ def render_time_filter(df, context_key: str):
             help="Use format: YYYY-MM-DD HH:mm:ss, for example 2005-12-24 01:16:39",
         )
 
-        selected_start = pd.Timestamp(stored_start)
-        selected_end = pd.Timestamp(stored_end)
-
-        valid_time_window = True
+        selected_start = default_start
+        selected_end = default_end
 
         try:
             parsed_start = _parse_dt(start_text)
             parsed_end = _parse_dt(end_text)
+
+            valid_time_window = True
 
             if parsed_start < default_start:
                 st.warning(
@@ -462,12 +455,6 @@ def render_time_filter(df, context_key: str):
             if valid_time_window:
                 selected_start = parsed_start
                 selected_end = parsed_end
-
-                # This is safe because range_store_key is not a widget key.
-                st.session_state[range_store_key] = (
-                    selected_start.to_pydatetime(),
-                    selected_end.to_pydatetime(),
-                )
 
         except Exception:
             st.error(
@@ -493,6 +480,10 @@ def render_time_filter(df, context_key: str):
 
         st.caption(
             f"Available range: {_format_dt(default_start)} → {_format_dt(default_end)}"
+        )
+
+        st.caption(
+            f"Applied range: {_format_dt(selected_start)} → {_format_dt(selected_end)}"
         )
 
     return time_range, zoom_percent
@@ -730,14 +721,14 @@ def render_activity_agent_controls(context_key: str, df=None, parent=None):
                 "Short causal window (samples)",
                 min_value=3,
                 max_value=21,
-                value=5,
+                value=10,
                 key=f"act_short_window_{context_key}",
             )
             medium_window = st.number_input(
                 "Medium causal window (samples)",
                 min_value=6,
-                max_value=60,
-                value=15,
+                max_value=300,
+                value=100,
                 key=f"act_medium_window_{context_key}",
             )
             min_interval_samples = st.number_input(
@@ -783,7 +774,7 @@ def render_activity_agent_controls(context_key: str, df=None, parent=None):
             )
             wob_drilling_min = st.number_input(
                 "WOB drilling minimum",
-                value=0.1,
+                value=0.0,
                 key=f"act_wob_drill_{context_key}",
             )
 
@@ -916,7 +907,7 @@ def render_symptom_agent_controls(context_key: str, parent=None):
 
         selected_symptom = st.selectbox(
             "Symptom shown in Track 4 agent lane",
-            options=["OpenHoleLength", "TRQSpike", "PSpike", "OverPull", "TookWeight"],
+            options=["OpenHoleLength", "TRQSpike", "TRQErratic", "PSpike", "OverPull", "TookWeight"],
             index=0,
             key=f"selected_symptom_lane_{context_key}",
         )
@@ -955,6 +946,36 @@ def render_symptom_agent_controls(context_key: str, parent=None):
                 "TRQSpike level 2 ratio",
                 value=1.40,
                 key=f"sym_trq_l2_{context_key}",
+            )
+
+            trq_erratic_mean_long_window = st.number_input(
+                "TRQErratic mean-long window",
+                min_value=20,
+                max_value=300,
+                value=100,
+                key=f"sym_trqerr_window_{context_key}",
+            )
+
+            trq_erratic_ratio_level_1 = st.number_input(
+                "TRQErratic amplitude ratio",
+                value=1.10,
+                key=f"sym_trqerr_ratio_{context_key}",
+            )
+
+            trq_erratic_min_cycles = st.number_input(
+                "TRQErratic minimum cycles",
+                min_value=2,
+                max_value=20,
+                value=3,
+                key=f"sym_trqerr_min_cycles_{context_key}",
+            )
+
+            trq_erratic_high_cycles = st.number_input(
+                "TRQErratic high severity cycles",
+                min_value=5,
+                max_value=100,
+                value=20,
+                key=f"sym_trqerr_high_cycles_{context_key}",
             )
 
             pspike_baseline_window = st.number_input(
@@ -1052,10 +1073,12 @@ def render_symptom_agent_controls(context_key: str, parent=None):
             casing_depth=None if float(casing_depth_fallback) <= 0 else float(casing_depth_fallback),
             open_hole_length_threshold_1=float(open_hole_length_threshold_1),
             open_hole_length_threshold_2=float(open_hole_length_threshold_2),
+
             trq_baseline_window=int(trq_baseline_window),
+            trq_mean_long_window=int(trq_baseline_window),
+
             trq_spike_ratio_level_1=float(trq_spike_ratio_level_1),
-            trq_spike_ratio_level_2=float(trq_spike_ratio_level_2),
-            pspike_baseline_window=int(pspike_baseline_window),
+            trq_spike_ratio_level_2=float(trq_spike_ratio_level_2),            pspike_baseline_window=int(pspike_baseline_window),
             pspike_threshold_normal=float(pspike_threshold_normal),
             pspike_threshold_motor_on=float(pspike_threshold_motor_on),
             pspike_gap_fill_samples=int(pspike_gap_fill_samples),
@@ -1070,6 +1093,10 @@ def render_symptom_agent_controls(context_key: str, parent=None):
             tookweight_gap_fill_samples=int(tookweight_gap_fill_samples),
             hoisting_velocity_min=float(hoisting_velocity_min),
             hoisting_velocity_max=float(hoisting_velocity_max),
+            trq_erratic_mean_long_window=int(trq_erratic_mean_long_window),
+            trq_erratic_ratio_level_1=float(trq_erratic_ratio_level_1),
+            trq_erratic_min_cycles=int(trq_erratic_min_cycles),
+            trq_erratic_high_cycles=int(trq_erratic_high_cycles),
         )
 
     return {
@@ -1129,6 +1156,247 @@ def build_activity_validation_df(activity_validation_summary: dict) -> pd.DataFr
             for row in rows
         ]
     )
+
+def build_symptom_miss_reason_df(
+    tag_intervals: list[dict],
+    symptom_cfg: dict,
+    activity_cfg: dict,
+) -> pd.DataFrame:
+    """
+    Explain why the selected symptom agent did or did not hit each manual tag.
+
+    This is especially useful because most symptom agents are gated by activity context.
+    Example:
+    TRQErratic can only happen during Drilling/Reaming. If Activity Agent says
+    Other/Circulating/MakingConnection, TRQErratic is blocked.
+    """
+    columns = [
+        "Tag",
+        "Tag Start",
+        "Tag End",
+        "Selected Agent",
+        "Matched?",
+        "Activity In Tag",
+        "Main Blocking Reason",
+        "Details",
+    ]
+
+    if not tag_intervals:
+        return pd.DataFrame(columns=columns)
+
+    selected_symptom = symptom_cfg.get("selected_symptom", "")
+    symptom_features = symptom_cfg.get("features", pd.DataFrame())
+    symptom_intervals = symptom_cfg.get("intervals", [])
+
+    activity_labels = activity_cfg.get("labels", pd.Series(dtype="object"))
+
+    rows = []
+
+    for tag in tag_intervals:
+        tag_start = pd.Timestamp(tag["start"])
+        tag_end = pd.Timestamp(tag["end"])
+        tag_label = tag.get("label", "")
+
+        matched = False
+        for hit in symptom_intervals:
+            ov = interval_overlap(tag_start, tag_end, hit["start"], hit["end"])
+            if ov is not None:
+                matched = True
+                break
+
+        activity_window = pd.Series(dtype="object")
+        activity_counts_text = "No activity labels available"
+
+        if activity_labels is not None and not activity_labels.empty:
+            activity_window = activity_labels.loc[tag_start:tag_end]
+
+            if not activity_window.empty:
+                activity_counts = activity_window.value_counts(dropna=False)
+                activity_counts_text = ", ".join(
+                    [f"{str(label)}={int(count)}" for label, count in activity_counts.items()]
+                )
+            else:
+                activity_counts_text = "No activity samples inside tag"
+
+        if matched:
+            rows.append(
+                {
+                    "Tag": tag_label,
+                    "Tag Start": tag_start,
+                    "Tag End": tag_end,
+                    "Selected Agent": selected_symptom,
+                    "Matched?": "Yes",
+                    "Activity In Tag": activity_counts_text,
+                    "Main Blocking Reason": "Matched",
+                    "Details": "The selected symptom agent created at least one interval overlapping this tag.",
+                }
+            )
+            continue
+
+        if symptom_features is None or symptom_features.empty:
+            rows.append(
+                {
+                    "Tag": tag_label,
+                    "Tag Start": tag_start,
+                    "Tag End": tag_end,
+                    "Selected Agent": selected_symptom,
+                    "Matched?": "No",
+                    "Activity In Tag": activity_counts_text,
+                    "Main Blocking Reason": "No symptom features",
+                    "Details": (
+                        "The selected symptom agent did not produce debug features. "
+                        "Check that the symptom agent is enabled and the required columns are available."
+                    ),
+                }
+            )
+            continue
+
+        feature_window = symptom_features.loc[tag_start:tag_end]
+
+        if feature_window.empty:
+            rows.append(
+                {
+                    "Tag": tag_label,
+                    "Tag Start": tag_start,
+                    "Tag End": tag_end,
+                    "Selected Agent": selected_symptom,
+                    "Matched?": "No",
+                    "Activity In Tag": activity_counts_text,
+                    "Main Blocking Reason": "No data in tag window",
+                    "Details": "No rows exist inside this tag window after the current time filter.",
+                }
+            )
+            continue
+
+        allowed_activity = pd.Series(False, index=feature_window.index)
+
+        if not activity_window.empty:
+            allowed_activity = activity_window.reindex(feature_window.index).isin(["Drilling", "Reaming"])
+
+        allowed_activity_count = int(allowed_activity.fillna(False).sum())
+
+        # -------------------------
+        # TRQErratic miss reasons
+        # -------------------------
+        if selected_symptom == "TRQErratic":
+            details = []
+
+            if allowed_activity_count == 0:
+                rows.append(
+                    {
+                        "Tag": tag_label,
+                        "Tag Start": tag_start,
+                        "Tag End": tag_end,
+                        "Selected Agent": selected_symptom,
+                        "Matched?": "No",
+                        "Activity In Tag": activity_counts_text,
+                        "Main Blocking Reason": "Activity context blocked",
+                        "Details": (
+                            "TRQErratic is only allowed during Drilling or Reaming. "
+                            "Inside this tag interval, Activity Agent did not classify any sample as Drilling/Reaming."
+                        ),
+                    }
+                )
+                continue
+
+            if "rpm_stable" in feature_window.columns:
+                rpm_stable_count = int(feature_window["rpm_stable"].fillna(False).sum())
+                if rpm_stable_count == 0:
+                    details.append("rpm_stable was never True.")
+
+            if "trq_ratio" in feature_window.columns:
+                max_ratio = feature_window["trq_ratio"].max()
+                if pd.isna(max_ratio) or max_ratio <= 1.10:
+                    details.append(
+                        f"max trq_ratio={max_ratio:.3f}, required > 1.10."
+                        if pd.notna(max_ratio)
+                        else "trq_ratio was NaN."
+                    )
+
+            if "trq_cycle_count" in feature_window.columns:
+                max_cycles = feature_window["trq_cycle_count"].max()
+                if pd.isna(max_cycles) or max_cycles < 3:
+                    details.append(
+                        f"max trq_cycle_count={max_cycles:.0f}, required >= 3."
+                        if pd.notna(max_cycles)
+                        else "trq_cycle_count was NaN."
+                    )
+
+            main_reason = "TRQErratic condition blocked" if details else "Mask continuity/min-samples blocked"
+            detail_text = " | ".join(details) if details else (
+                "The main conditions looked possible in the tag window, but the final mask did not form "
+                "a valid TRQErratic interval. Check exact timestamps, continuity, and min_samples."
+            )
+
+        # -------------------------
+        # TRQSpike miss reasons
+        # -------------------------
+        elif selected_symptom == "TRQSpike":
+            details = []
+
+            if allowed_activity_count == 0:
+                rows.append(
+                    {
+                        "Tag": tag_label,
+                        "Tag Start": tag_start,
+                        "Tag End": tag_end,
+                        "Selected Agent": selected_symptom,
+                        "Matched?": "No",
+                        "Activity In Tag": activity_counts_text,
+                        "Main Blocking Reason": "Activity context blocked",
+                        "Details": (
+                            "TRQSpike is only allowed during Drilling or Reaming. "
+                            "Inside this tag interval, Activity Agent did not classify any sample as Drilling/Reaming."
+                        ),
+                    }
+                )
+                continue
+
+            if "trq_ratio" in feature_window.columns:
+                max_ratio = feature_window["trq_ratio"].max()
+                if pd.isna(max_ratio) or max_ratio <= 1.25:
+                    details.append(
+                        f"max trq_ratio={max_ratio:.3f}, required > 1.25."
+                        if pd.notna(max_ratio)
+                        else "trq_ratio was NaN."
+                    )
+
+            if "trq_zscore" in feature_window.columns:
+                max_z = feature_window["trq_zscore"].max()
+                if pd.isna(max_z) or max_z <= 2.9:
+                    details.append(
+                        f"max trq_zscore={max_z:.3f}, required > 2.9."
+                        if pd.notna(max_z)
+                        else "trq_zscore was NaN."
+                    )
+
+            main_reason = "TRQSpike condition blocked" if details else "Spike shape/min-samples blocked"
+            detail_text = " | ".join(details) if details else (
+                "The main conditions looked possible in the tag window, but the final mask did not form "
+                "a valid TRQSpike interval. Check started-low logic, exact timing, and baseline window."
+            )
+
+        else:
+            main_reason = "No detailed rule explanation yet"
+            detail_text = (
+                f"Detailed miss-reason logic is currently written for TRQErratic and TRQSpike. "
+                f"Selected symptom is {selected_symptom}."
+            )
+
+        rows.append(
+            {
+                "Tag": tag_label,
+                "Tag Start": tag_start,
+                "Tag End": tag_end,
+                "Selected Agent": selected_symptom,
+                "Matched?": "No",
+                "Activity In Tag": activity_counts_text,
+                "Main Blocking Reason": main_reason,
+                "Details": detail_text,
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
 
 def render_agent_controls(
     df,

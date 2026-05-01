@@ -113,3 +113,28 @@ def first_crossing_intervals(mask: pd.Series, label: str, severity: str | None =
             )
 
     return intervals
+
+def rolling_reference_mean(series: pd.Series, window: int) -> pd.Series:
+    """
+    Causal reference mean using previous values only.
+
+    The current point is excluded so the spike itself does not raise its own baseline.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    return s.rolling(window=window, min_periods=1, center=False).mean().shift(1)
+
+
+def rolling_reference_std(series: pd.Series, window: int) -> pd.Series:
+    """
+    Causal reference standard deviation using previous values only.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    return s.rolling(window=window, min_periods=2, center=False).std().shift(1)
+
+
+def rolling_reference_min(series: pd.Series, window: int) -> pd.Series:
+    """
+    Causal reference minimum using previous values only.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    return s.rolling(window=window, min_periods=1, center=False).min().shift(1)

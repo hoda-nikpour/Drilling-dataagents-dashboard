@@ -182,6 +182,7 @@ ACTIVITY_COLOR_MAP = {
 SYMPTOM_COLOR_MAP = {
     "OpenHoleLength": "rgba(142, 68, 173, 0.92)",
     "TRQSpike": "rgba(192, 57, 43, 0.92)",
+    "TRQErratic": "rgba(127, 0, 0, 0.92)",
     "PSpike": "rgba(41, 128, 185, 0.92)",
     "OverPull": "rgba(39, 174, 96, 0.92)",
     "TookWeight": "rgba(243, 156, 18, 0.92)",

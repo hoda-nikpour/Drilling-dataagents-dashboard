@@ -14,8 +14,8 @@ from agents.activity_support import (
 
 @dataclass(frozen=True)
 class ActivityConfig:
-    short_window: int = 5
-    medium_window: int = 15
+    short_window: int = 10
+    medium_window: int = 100
     min_interval_samples: int = 6
     gap_fill_samples: int = 2
 
@@ -25,7 +25,10 @@ class ActivityConfig:
     rpm_low_threshold: float = 30.0
 
     wob_zero_band: float = 0.5
-    wob_drilling_min: float = 0.1
+
+    # VT document says WOB > 0.1 ton, but also says this is not always necessary.
+    # Simplified VT drilling definition allows WOB >= 0.
+    wob_drilling_min: float = 0.0
 
     drilling_depth_step_min: float = 0.01
     drilling_depth_gap_max: float = 0.05
@@ -100,12 +103,12 @@ def build_activity_features(
     out["rpm"] = rpm
     out["wob"] = wob
 
-    out["mfi_med"] = rolling_median(mfi, cfg.short_window)
-    out["rpm_med"] = rolling_median(rpm, cfg.short_window)
-    out["wob_med"] = rolling_median(wob, cfg.short_window)
+    out["mfi_med"] = rolling_mean(mfi, cfg.short_window)
+    out["rpm_med"] = rolling_mean(rpm, cfg.short_window)
+    out["wob_med"] = rolling_mean(wob, cfg.short_window)
     out["bpos_smooth"] = rolling_mean(bpos, cfg.short_window)
-    out["hkl_med"] = rolling_median(hkl, cfg.short_window)
-
+    out["hkl_med"] = rolling_mean(hkl, cfg.short_window)
+    
     out["pump_on"] = out["mfi_med"] > cfg.pump_on_threshold
     out["rpm_on"] = out["rpm_med"] > cfg.rpm_on_threshold
     out["rpm_zero"] = out["rpm_med"] <= cfg.rpm_zero_threshold
