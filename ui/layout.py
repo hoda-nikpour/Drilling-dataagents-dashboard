@@ -1,6 +1,12 @@
 import pandas as pd
 import streamlit as st
 
+import json
+import uuid
+
+import streamlit as st
+import streamlit.components.v1 as components
+
 
 def render_dashboard_header(
     selected_well: str,
@@ -53,24 +59,437 @@ def render_result_tables(
             st.dataframe(review_df, use_container_width=True)
 
 
-def render_chart(fig, chart_key: str):
-    st.caption(
-        "Chart controls: use the toolbar above the chart or double-click inside the chart to reset zoom. "
-        "Use 'Reset time filter' in the sidebar to restore the full selected time window."
-    )
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        key=chart_key,
-        config={
-            "displaylogo": False,
-            "displayModeBar": True,
-            "scrollZoom": False,
-            "doubleClick": "reset+autosize",
-            "modeBarButtonsToRemove": [
+def render_chart(fig, chart_key: str):
+    """
+    Render Plotly chart with controlled zoom tools.
+
+    Zoom tools:
+    - X zoom: only horizontal zoom is allowed.
+    - Y zoom: only vertical/time zoom is allowed.
+    - XY zoom: normal rectangle zoom on both axes.
+
+    Removed from Plotly modebar:
+    - Default magnifier
+    - Plus zoom
+    - Minus zoom
+    - Lasso/select
+    """
+
+    div_id = f"plotly_chart_{uuid.uuid4().hex}"
+
+    config = {
+        "displaylogo": False,
+        "displayModeBar": True,
+        "scrollZoom": False,
+
+        # Disable Plotly default double-click reset.
+        # We handle double-click ourselves as Undo chart zoom.
+        "doubleClick": False,
+
+        "modeBarButtonsToRemove": [
+            # Remove default zoom/magnifier and plus/minus zoom.
+            "zoom2d",
+            "zoomIn2d",
+            "zoomOut2d",
+
+            # Keep the toolbar clean.
             "lasso2d",
             "select2d",
         ],
-        },
+    }
+
+    plot_html = fig.to_html(
+        full_html=False,
+        include_plotlyjs="cdn",
+        config=config,
+        div_id=div_id,
+    )
+
+    chart_height = int(fig.layout.height or 950)
+
+    html = f"""
+    <div style="font-family: Arial, sans-serif;">
+
+        <div style="
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 8px;
+            background: #f7f7f7;
+            border: 1px solid #d0d0d0;
+            padding: 6px 8px;
+        ">
+            <div style="
+                display: flex;
+                gap: 8px;
+                align-items: center;
+            ">
+                <button id="undo_zoom_btn_{div_id}" style="
+                    padding: 6px 10px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                ">
+                    Undo chart zoom
+                </button>
+
+                <button id="reset_zoom_btn_{div_id}" style="
+                    padding: 6px 10px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                ">
+                    Reset chart zoom
+                </button>
+
+                <span id="zoom_history_text_{div_id}" style="
+                    font-size: 12px;
+                    color: #555;
+                ">
+                    Chart zoom undo history: 0 / 10
+                </span>
+            </div>
+
+            <div style="
+                display: flex;
+                gap: 6px;
+                align-items: center;
+            ">
+                <span style="font-size: 12px; color: #555;">
+                    Zoom mode:
+                </span>
+
+                <button id="zoom_x_btn_{div_id}" style="
+                    padding: 6px 9px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                " title="Zoom only in X axis">
+                    🔍 X
+                </button>
+
+                <button id="zoom_y_btn_{div_id}" style="
+                    padding: 6px 9px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                " title="Zoom only in Y/time axis">
+                    🔍 Y
+                </button>
+
+                <button id="zoom_xy_btn_{div_id}" style="
+                    padding: 6px 9px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                " title="Zoom in both X and Y axes">
+                    🔍 XY
+                </button>
+            </div>
+        </div>
+
+        <div style="font-size: 12px; color: #555; margin-bottom: 6px;">
+            Choose a zoom mode, then drag a rectangle inside the chart.
+            Double-click inside the chart = Undo chart zoom.
+        </div>
+
+        {plot_html}
+    </div>
+
+    <script>
+    const gd_{div_id} = document.getElementById("{div_id}");
+
+    const undoBtn_{div_id} = document.getElementById("undo_zoom_btn_{div_id}");
+    const resetBtn_{div_id} = document.getElementById("reset_zoom_btn_{div_id}");
+    const historyText_{div_id} = document.getElementById("zoom_history_text_{div_id}");
+
+    const zoomXBtn_{div_id} = document.getElementById("zoom_x_btn_{div_id}");
+    const zoomYBtn_{div_id} = document.getElementById("zoom_y_btn_{div_id}");
+    const zoomXYBtn_{div_id} = document.getElementById("zoom_xy_btn_{div_id}");
+
+    let zoomHistory_{div_id} = [];
+    let lastRanges_{div_id} = null;
+    let initialRanges_{div_id} = null;
+
+    const maxHistory_{div_id} = 10;
+
+    let programmaticRelayout_{div_id} = false;
+    let doubleClickLock_{div_id} = false;
+
+    function deepCopy_{div_id}(obj) {{
+        return JSON.parse(JSON.stringify(obj));
+    }}
+
+    function updateHistoryText_{div_id}() {{
+        historyText_{div_id}.innerText =
+            "Chart zoom undo history: " + zoomHistory_{div_id}.length + " / " + maxHistory_{div_id};
+
+        undoBtn_{div_id}.disabled = zoomHistory_{div_id}.length === 0;
+        undoBtn_{div_id}.style.opacity = zoomHistory_{div_id}.length === 0 ? "0.5" : "1.0";
+        undoBtn_{div_id}.style.cursor = zoomHistory_{div_id}.length === 0 ? "not-allowed" : "pointer";
+    }}
+
+    function axisNames_{div_id}() {{
+        const names = [];
+        const fullLayout = gd_{div_id}._fullLayout || gd_{div_id}.layout || {{}};
+
+        Object.keys(fullLayout).forEach(function(key) {{
+            if (/^xaxis\\d*$/.test(key) || /^yaxis\\d*$/.test(key)) {{
+                names.push(key);
+            }}
+        }});
+
+        return names;
+    }}
+
+    function getCurrentRanges_{div_id}() {{
+        const ranges = {{}};
+        const fullLayout = gd_{div_id}._fullLayout || gd_{div_id}.layout || {{}};
+
+        axisNames_{div_id}().forEach(function(axisName) {{
+            const axis = fullLayout[axisName];
+
+            if (!axis) {{
+                return;
+            }}
+
+            ranges[axisName] = {{
+                range: axis.range ? [axis.range[0], axis.range[1]] : null,
+                autorange: axis.autorange === true
+            }};
+        }});
+
+        return ranges;
+    }}
+
+    function makeRelayoutUpdate_{div_id}(ranges) {{
+        const update = {{}};
+
+        Object.keys(ranges || {{}}).forEach(function(axisName) {{
+            const axisState = ranges[axisName];
+
+            if (axisState.range && axisState.range.length === 2) {{
+                update[axisName + ".range[0]"] = axisState.range[0];
+                update[axisName + ".range[1]"] = axisState.range[1];
+                update[axisName + ".autorange"] = false;
+            }} else {{
+                update[axisName + ".autorange"] = true;
+            }}
+        }});
+
+        return update;
+    }}
+
+    function isRealAxisRangeChange_{div_id}(eventData) {{
+        const keys = Object.keys(eventData || {{}});
+
+        return keys.some(function(key) {{
+            return (
+                key.includes(".range") ||
+                key.includes(".autorange") ||
+                key.includes("range[0]") ||
+                key.includes("range[1]")
+            );
+        }});
+    }}
+
+    function captureInitialRangesOnce_{div_id}() {{
+        if (initialRanges_{div_id} !== null) {{
+            return;
+        }}
+
+        const captured = getCurrentRanges_{div_id}();
+
+        if (Object.keys(captured).length === 0) {{
+            return;
+        }}
+
+        initialRanges_{div_id} = deepCopy_{div_id}(captured);
+        lastRanges_{div_id} = deepCopy_{div_id}(captured);
+        updateHistoryText_{div_id}();
+    }}
+
+    function savePreviousRange_{div_id}() {{
+        if (lastRanges_{div_id} === null) {{
+            return;
+        }}
+
+        zoomHistory_{div_id}.push(deepCopy_{div_id}(lastRanges_{div_id}));
+
+        if (zoomHistory_{div_id}.length > maxHistory_{div_id}) {{
+            zoomHistory_{div_id}.shift();
+        }}
+
+        updateHistoryText_{div_id}();
+    }}
+
+    function undoLastZoom_{div_id}() {{
+        if (zoomHistory_{div_id}.length === 0) {{
+            updateHistoryText_{div_id}();
+            return;
+        }}
+
+        const previousRanges = zoomHistory_{div_id}.pop();
+        updateHistoryText_{div_id}();
+
+        programmaticRelayout_{div_id} = true;
+
+        Plotly.relayout(gd_{div_id}, makeRelayoutUpdate_{div_id}(previousRanges))
+            .then(function() {{
+                return Plotly.redraw(gd_{div_id});
+            }})
+            .then(function() {{
+                setTimeout(function() {{
+                    lastRanges_{div_id} = getCurrentRanges_{div_id}();
+                    programmaticRelayout_{div_id} = false;
+                    updateHistoryText_{div_id}();
+                }}, 100);
+            }});
+    }}
+
+    function resetChartZoom_{div_id}() {{
+        if (initialRanges_{div_id} === null) {{
+            captureInitialRangesOnce_{div_id}();
+        }}
+
+        if (initialRanges_{div_id} === null) {{
+            return;
+        }}
+
+        zoomHistory_{div_id} = [];
+        updateHistoryText_{div_id}();
+
+        programmaticRelayout_{div_id} = true;
+
+        Plotly.relayout(gd_{div_id}, makeRelayoutUpdate_{div_id}(initialRanges_{div_id}))
+            .then(function() {{
+                return Plotly.redraw(gd_{div_id});
+            }})
+            .then(function() {{
+                setTimeout(function() {{
+                    lastRanges_{div_id} = deepCopy_{div_id}(initialRanges_{div_id});
+                    zoomHistory_{div_id} = [];
+                    programmaticRelayout_{div_id} = false;
+                    updateHistoryText_{div_id}();
+                }}, 100);
+            }});
+    }}
+
+    function setZoomButtonStyle_{div_id}(activeButton) {{
+        const buttons = [zoomXBtn_{div_id}, zoomYBtn_{div_id}, zoomXYBtn_{div_id}];
+
+        buttons.forEach(function(btn) {{
+            btn.style.background = "white";
+            btn.style.border = "1px solid #999";
+            btn.style.fontWeight = "400";
+        }});
+
+        activeButton.style.background = "#e8f0fe";
+        activeButton.style.border = "1px solid #4a76d1";
+        activeButton.style.fontWeight = "700";
+    }}
+
+    function setZoomMode_{div_id}(mode) {{
+        const update = {{
+            "dragmode": "zoom"
+        }};
+
+        axisNames_{div_id}().forEach(function(axisName) {{
+            if (axisName.startsWith("xaxis")) {{
+                update[axisName + ".fixedrange"] = mode === "y";
+            }}
+
+            if (axisName.startsWith("yaxis")) {{
+                update[axisName + ".fixedrange"] = mode === "x";
+            }}
+        }});
+
+        Plotly.relayout(gd_{div_id}, update);
+    }}
+
+    zoomXBtn_{div_id}.onclick = function() {{
+        setZoomMode_{div_id}("x");
+        setZoomButtonStyle_{div_id}(zoomXBtn_{div_id});
+    }};
+
+    zoomYBtn_{div_id}.onclick = function() {{
+        setZoomMode_{div_id}("y");
+        setZoomButtonStyle_{div_id}(zoomYBtn_{div_id});
+    }};
+
+    zoomXYBtn_{div_id}.onclick = function() {{
+        setZoomMode_{div_id}("xy");
+        setZoomButtonStyle_{div_id}(zoomXYBtn_{div_id});
+    }};
+
+    gd_{div_id}.on("plotly_afterplot", function() {{
+        setTimeout(function() {{
+            captureInitialRangesOnce_{div_id}();
+        }}, 250);
+    }});
+
+    setTimeout(function() {{
+        captureInitialRangesOnce_{div_id}();
+
+        // Default mode: vertical/time zoom, because this dashboard is mainly
+        // used to inspect short time intervals.
+        setZoomMode_{div_id}("y");
+        setZoomButtonStyle_{div_id}(zoomYBtn_{div_id});
+    }}, 500);
+
+    gd_{div_id}.on("plotly_relayout", function(eventData) {{
+        if (programmaticRelayout_{div_id}) {{
+            return;
+        }}
+
+        if (!isRealAxisRangeChange_{div_id}(eventData)) {{
+            return;
+        }}
+
+        savePreviousRange_{div_id}();
+
+        setTimeout(function() {{
+            lastRanges_{div_id} = getCurrentRanges_{div_id}();
+            updateHistoryText_{div_id}();
+        }}, 100);
+    }});
+
+    undoBtn_{div_id}.onclick = function() {{
+        undoLastZoom_{div_id}();
+    }};
+
+    resetBtn_{div_id}.onclick = function() {{
+        resetChartZoom_{div_id}();
+    }};
+
+    gd_{div_id}.on("plotly_doubleclick", function() {{
+        if (doubleClickLock_{div_id}) {{
+            return false;
+        }}
+
+        doubleClickLock_{div_id} = true;
+        undoLastZoom_{div_id}();
+
+        setTimeout(function() {{
+            doubleClickLock_{div_id} = false;
+        }}, 500);
+
+        return false;
+    }});
+
+    updateHistoryText_{div_id}();
+    </script>
+    """
+
+    components.html(
+        html,
+        height=chart_height + 120,
+        scrolling=True,
     )

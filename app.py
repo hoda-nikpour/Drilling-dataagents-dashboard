@@ -41,12 +41,21 @@ from ui.styles import apply_global_styles
 from utils.helpers import compute_section_ranges
 from visualization.chart_builder import create_multi_track_chart
 
+from services.undo_service import (
+    begin_undo_tracking,
+    commit_undo_tracking,
+    render_undo_controls,
+)
 
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
 apply_global_styles()
 
 
+
 def main():
+    begin_undo_tracking()
+    
+
     catalog = load_catalog()
     if not catalog["sections"]:
         st.error("data/catalog.json not found or empty.")
@@ -225,10 +234,17 @@ def main():
         chart_height=agent_cfg.get("chart_height", 950),
         parameter_ranges=parameter_ranges,
         marker_display=marker_display,
-)
+    )
 
     chart_key = f"multi_track_chart_{context_key}"
+
+    top_chart_controls = st.container()
+    with top_chart_controls:
+        render_undo_controls(parent=st.container(), compact=True)
+
     render_chart(fig, chart_key)
+
+    commit_undo_tracking()
 
 
 if __name__ == "__main__":

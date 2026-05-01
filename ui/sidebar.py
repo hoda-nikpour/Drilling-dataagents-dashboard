@@ -250,9 +250,12 @@ def _apply_loaded_review_to_state(uploaded_data: dict, context_key: str):
     for i, tag in enumerate(uploaded_data.get("tag_intervals", [])[:3], start=1):
         st.session_state[f"enable_tag_{i}_{context_key}"] = True
         st.session_state[f"tag_label_{i}_{context_key}"] = tag.get("label", f"Observation {i}")
-        st.session_state[f"tag_interval_{i}_{context_key}"] = (
-            pd.to_datetime(tag["start"]).to_pydatetime(),
-            pd.to_datetime(tag["end"]).to_pydatetime(),
+
+        st.session_state[f"tag_start_{i}_{context_key}"] = (
+            pd.to_datetime(tag["start"]).to_pydatetime()
+        )
+        st.session_state[f"tag_end_{i}_{context_key}"] = (
+            pd.to_datetime(tag["end"]).to_pydatetime()
         )
 
     for i, tag in enumerate(uploaded_data.get("manual_activity_tags", [])[:3], start=1):
@@ -344,63 +347,157 @@ def render_parameter_range_controls(selected_labels: list[str], context_key: str
 
 
 def render_time_filter(df, context_key: str):
+    """
+    Precise second-level time filter.
+
+    Behavior:
+    - No old Streamlit time-range slider.
+    - User types exact start/end time with seconds.
+    - Pressing Enter in either text box reruns Streamlit automatically.
+    - The returned time_range is immediately used by app.py to filter df.
+    """
+
+    def _format_dt(value) -> str:
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _parse_dt(text: str):
+        return pd.to_datetime(text, format="%Y-%m-%d %H:%M:%S", errors="raise")
+
     with st.sidebar:
         st.subheader("Time Filter")
 
         t_min_all = df.index.min().to_pydatetime()
         t_max_all = df.index.max().to_pydatetime()
 
-        default_value = (t_min_all, t_max_all)
+        default_start = pd.Timestamp(t_min_all)
+        default_end = pd.Timestamp(t_max_all)
+        default_value = (default_start.to_pydatetime(), default_end.to_pydatetime())
 
-        reset_counter_key = f"time_reset_counter_{context_key}"
         range_store_key = f"time_range_store_{context_key}"
+        exact_start_key = f"exact_time_start_{context_key}"
+        exact_end_key = f"exact_time_end_{context_key}"
+        reset_counter_key = f"time_reset_counter_{context_key}"
 
         if reset_counter_key not in st.session_state:
             st.session_state[reset_counter_key] = 0
 
+        # Initialize stored range once.
         if range_store_key not in st.session_state:
             st.session_state[range_store_key] = default_value
 
-        # Be strict if the selected well/section/data range changes.
+        # If selected well/section/data range changes, reset BEFORE widgets are created.
         stored_start, stored_end = st.session_state[range_store_key]
 
         if (
-            pd.Timestamp(stored_start) < pd.Timestamp(t_min_all)
-            or pd.Timestamp(stored_end) > pd.Timestamp(t_max_all)
+            pd.Timestamp(stored_start) < default_start
+            or pd.Timestamp(stored_end) > default_end
             or pd.Timestamp(stored_start) >= pd.Timestamp(stored_end)
         ):
             st.session_state[range_store_key] = default_value
             st.session_state[reset_counter_key] += 1
 
+        stored_start, stored_end = st.session_state[range_store_key]
+
+        # Important:
+        # These keys must be set BEFORE st.text_input() is created.
+        # Do not modify these keys after the widgets are instantiated.
+        if exact_start_key not in st.session_state:
+            st.session_state[exact_start_key] = _format_dt(stored_start)
+
+        if exact_end_key not in st.session_state:
+            st.session_state[exact_end_key] = _format_dt(stored_end)
+
+        # Reset button is above the text inputs, so it is still safe to update
+        # the text-input session_state keys here.
         if st.button("Reset time filter", key=f"reset_time_{context_key}"):
             st.session_state[range_store_key] = default_value
+            st.session_state[exact_start_key] = _format_dt(default_start)
+            st.session_state[exact_end_key] = _format_dt(default_end)
             st.session_state[reset_counter_key] += 1
             st.rerun()
 
-        slider_key = f"time_range_{context_key}_{st.session_state[reset_counter_key]}"
-
-        time_range = st.slider(
-            "Select Time Range",
-            min_value=t_min_all,
-            max_value=t_max_all,
-            value=st.session_state[range_store_key],
-            format="YYYY-MM-DD HH:mm",
-            key=slider_key,
+        st.markdown("**Precise time window**")
+        st.caption(
+            "Type exact start and end times. Press Enter after editing. "
+            "Format: YYYY-MM-DD HH:mm:ss"
         )
 
-        st.session_state[range_store_key] = time_range
+        start_text = st.text_input(
+            "Precise time window start",
+            key=exact_start_key,
+            help="Use format: YYYY-MM-DD HH:mm:ss, for example 2005-12-24 01:11:47",
+        )
 
-        total_sec = (t_max_all - t_min_all).total_seconds()
-        sel_sec = (time_range[1] - time_range[0]).total_seconds()
+        end_text = st.text_input(
+            "Precise time window end",
+            key=exact_end_key,
+            help="Use format: YYYY-MM-DD HH:mm:ss, for example 2005-12-24 01:16:39",
+        )
 
-        zoom_percent = 100.0 - (sel_sec / total_sec * 100.0) if total_sec > 0 else 0.0
+        selected_start = pd.Timestamp(stored_start)
+        selected_end = pd.Timestamp(stored_end)
+
+        valid_time_window = True
+
+        try:
+            parsed_start = _parse_dt(start_text)
+            parsed_end = _parse_dt(end_text)
+
+            if parsed_start < default_start:
+                st.warning(
+                    f"Start time is before available data. Minimum is {_format_dt(default_start)}."
+                )
+                valid_time_window = False
+
+            if parsed_end > default_end:
+                st.warning(
+                    f"End time is after available data. Maximum is {_format_dt(default_end)}."
+                )
+                valid_time_window = False
+
+            if parsed_end <= parsed_start:
+                st.warning("End time must be after start time.")
+                valid_time_window = False
+
+            if valid_time_window:
+                selected_start = parsed_start
+                selected_end = parsed_end
+
+                # This is safe because range_store_key is not a widget key.
+                st.session_state[range_store_key] = (
+                    selected_start.to_pydatetime(),
+                    selected_end.to_pydatetime(),
+                )
+
+        except Exception:
+            st.error(
+                "Invalid time format. Use exactly: YYYY-MM-DD HH:mm:ss "
+                "for example 2005-12-24 01:11:47"
+            )
+
+        time_range = (
+            selected_start.to_pydatetime(),
+            selected_end.to_pydatetime(),
+        )
+
+        total_sec = (default_end - default_start).total_seconds()
+        selected_sec = (selected_end - selected_start).total_seconds()
+
+        zoom_percent = 100.0 - (selected_sec / total_sec * 100.0) if total_sec > 0 else 0.0
         zoom_percent = max(0.0, min(100.0, zoom_percent))
 
-        st.metric("Records", f"{len(df):,}")
+        filtered_records = len(df.loc[selected_start:selected_end])
+
+        st.metric("Records in selected window", f"{filtered_records:,}")
         st.metric("Zoom", f"{zoom_percent:.0f}%")
-        st.caption("To reduce magnification, click 'Reset time filter' or widen the time range.")
+
+        st.caption(
+            f"Available range: {_format_dt(default_start)} → {_format_dt(default_end)}"
+        )
 
     return time_range, zoom_percent
+
+    
 
 def render_plot_marker_controls(context_key: str) -> str:
     with st.sidebar:
@@ -449,32 +546,53 @@ def _safe_datetime_input(
     max_value,
 ):
     """
-    Calendar-style datetime selector with bounds protection.
+    Text-based datetime input with seconds.
 
-    This avoids crashes when the selected well/section/time range changes
-    and an old stored center time is outside the new available range.
+    Expected format:
+    YYYY-MM-DD HH:mm:ss
+
+    Example:
+    2005-12-24 01:11:39
     """
     current_value = st.session_state.get(key, default_value)
 
     try:
-        current_value = pd.Timestamp(current_value).to_pydatetime()
+        current_value = pd.Timestamp(current_value)
     except Exception:
-        current_value = default_value
+        current_value = pd.Timestamp(default_value)
 
     if (
-        pd.Timestamp(current_value) < pd.Timestamp(min_value)
-        or pd.Timestamp(current_value) > pd.Timestamp(max_value)
+        current_value < pd.Timestamp(min_value)
+        or current_value > pd.Timestamp(max_value)
     ):
-        current_value = default_value
-        st.session_state[key] = current_value
+        current_value = pd.Timestamp(default_value)
 
-    return st.datetime_input(
+    default_text = current_value.strftime("%Y-%m-%d %H:%M:%S")
+
+    text_value = st.text_input(
         label,
-        value=current_value,
-        min_value=min_value,
-        max_value=max_value,
+        value=default_text,
         key=key,
+        help="Use format: YYYY-MM-DD HH:mm:ss, for example 2005-12-24 01:11:39",
     )
+
+    try:
+        parsed_value = pd.to_datetime(text_value, format="%Y-%m-%d %H:%M:%S")
+    except Exception:
+        st.error(
+            f"Invalid datetime for '{label}'. Please use format YYYY-MM-DD HH:mm:ss."
+        )
+        return current_value.to_pydatetime()
+
+    if parsed_value < pd.Timestamp(min_value):
+        st.warning(f"{label} is before the available data range. Using minimum time.")
+        return pd.Timestamp(min_value).to_pydatetime()
+
+    if parsed_value > pd.Timestamp(max_value):
+        st.warning(f"{label} is after the available data range. Using maximum time.")
+        return pd.Timestamp(max_value).to_pydatetime()
+
+    return parsed_value.to_pydatetime()
 
 def render_manual_activity_validation_tags(
     context_key: str,
@@ -1062,21 +1180,14 @@ def render_agent_controls(
                 format="YYYY-MM-DD HH:mm",
                 key=f"reference_time_{context_key}",
             )
-
-        duration_options = {
-            "5 min": timedelta(minutes=5),
-            "15 min": timedelta(minutes=15),
-            "30 min": timedelta(minutes=30),
-            "1 hour": timedelta(hours=1),
-            "3 hours": timedelta(hours=3),
-            "Custom": None,
-        }
-
         tag_intervals = []
         manual_agent_intervals = []
 
         st.markdown("**Tagger lane**")
-        st.caption("Use short or long time segments to mark deviation tags.")
+        st.caption(
+            "Use these fields to manually mark an observation interval. "
+            "Choose the start and end time directly."
+        )
 
         for i in range(1, 4):
             enabled = st.checkbox(
@@ -1092,46 +1203,40 @@ def render_agent_controls(
                     key=f"tag_label_{i}_{context_key}",
                 )
 
-                duration_choice = st.selectbox(
-                    f"Tag {i} segment length",
-                    options=list(duration_options.keys()),
-                    index=2,
-                    key=f"tag_duration_choice_{i}_{context_key}",
+                tag_start = _safe_datetime_input(
+                    label=f"Tag {i} start time — day / hour / minute",
+                    key=f"tag_start_{i}_{context_key}",
+                    default_value=t_min,
+                    min_value=t_min,
+                    max_value=t_max,
                 )
 
-                if duration_choice == "Custom":
-                    interval = st.slider(
-                        f"Tag {i} interval",
-                        min_value=t_min,
-                        max_value=t_max,
-                        value=(t_min, t_max),
-                        format="YYYY-MM-DD HH:mm",
-                        key=f"tag_interval_{i}_{context_key}",
-                    )
-                else:
-                    center_time = _safe_datetime_input(
-                        label=f"Tag {i} center time",
-                        key=f"tag_center_{i}_{context_key}",
-                        default_value=t_min,
-                        min_value=t_min,
-                        max_value=t_max,
-                    )
+                tag_end = _safe_datetime_input(
+                    label=f"Tag {i} end time — day / hour / minute",
+                    key=f"tag_end_{i}_{context_key}",
+                    default_value=min(t_max, t_min + timedelta(minutes=30)),
+                    min_value=t_min,
+                    max_value=t_max,
+                )
 
-                    duration = duration_options[duration_choice]
-                    half_duration = duration / 2
-                    start = max(t_min, center_time - half_duration)
-                    end = min(t_max, center_time + half_duration)
-                    interval = (start, end)
+                if pd.Timestamp(tag_end) <= pd.Timestamp(tag_start):
+                    st.warning(
+                        f"Tag {i}: end time must be after start time. "
+                        "This tag is not added to Track 4."
+                    )
+                    continue
 
-                    st.caption(f"Segment: {start} → {end}")
+                st.caption(f"Tag interval: {tag_start} → {tag_end}")
 
                 tag_intervals.append(
                     {
                         "label": label.strip() or f"Observation {i}",
-                        "start": interval[0],
-                        "end": interval[1],
+                        "start": tag_start,
+                        "end": tag_end,
                     }
                 )
+
+        
 
         st.markdown("**Agent lane**")
 
