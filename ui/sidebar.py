@@ -589,8 +589,19 @@ def render_manual_activity_validation_tags(
     context_key: str,
     t_min,
     t_max,
-    duration_options: dict,
+    duration_options: dict | None = None,
 ) -> list[dict]:
+    """
+    Manual activity validation tags.
+
+    These use the same start/end datetime style as the normal Tagger lane:
+    YYYY-MM-DD HH:mm:ss
+
+    Removed:
+    - Activity Tag x segment length
+    - Activity Tag x center time
+    """
+
     st.markdown("**Manual activity validation tags**")
     st.caption("Use these to validate the automatic Activity Agent intervals.")
 
@@ -614,54 +625,48 @@ def render_manual_activity_validation_tags(
             key=f"enable_activity_tag_{i}_{context_key}",
         )
 
-        if enabled:
-            activity_label = st.selectbox(
-                f"Activity Tag {i} label",
-                options=activity_options,
-                index=1,
-                key=f"activity_tag_label_{i}_{context_key}",
+        if not enabled:
+            continue
+
+        activity_label = st.selectbox(
+            f"Activity Tag {i} label",
+            options=activity_options,
+            index=1,
+            key=f"activity_tag_label_{i}_{context_key}",
+        )
+
+        activity_tag_start = _safe_datetime_input(
+            label=f"Activity Tag {i} start time — year / month / day / hour / minute / second",
+            key=f"activity_tag_start_{i}_{context_key}",
+            default_value=t_min,
+            min_value=t_min,
+            max_value=t_max,
+        )
+
+        activity_tag_end = _safe_datetime_input(
+            label=f"Activity Tag {i} end time — year / month / day / hour / minute / second",
+            key=f"activity_tag_end_{i}_{context_key}",
+            default_value=min(t_max, t_min + timedelta(minutes=30)),
+            min_value=t_min,
+            max_value=t_max,
+        )
+
+        if pd.Timestamp(activity_tag_end) <= pd.Timestamp(activity_tag_start):
+            st.warning(
+                f"Activity Tag {i}: end time must be after start time. "
+                "This activity validation tag is not added."
             )
+            continue
 
-            duration_choice = st.selectbox(
-                f"Activity Tag {i} segment length",
-                options=list(duration_options.keys()),
-                index=2,
-                key=f"activity_tag_duration_choice_{i}_{context_key}",
-            )
+        st.caption(f"Activity tag interval: {activity_tag_start} → {activity_tag_end}")
 
-            if duration_choice == "Custom":
-                interval = st.slider(
-                    f"Activity Tag {i} interval",
-                    min_value=t_min,
-                    max_value=t_max,
-                    value=(t_min, t_max),
-                    format="YYYY-MM-DD HH:mm",
-                    key=f"activity_tag_interval_{i}_{context_key}",
-                )
-            else:
-                center_time = _safe_datetime_input(
-                    label=f"Activity Tag {i} center time",
-                    key=f"activity_tag_center_{i}_{context_key}",
-                    default_value=t_min,
-                    min_value=t_min,
-                    max_value=t_max,
-                )
-
-                duration = duration_options[duration_choice]
-                half_duration = duration / 2
-                start = max(t_min, center_time - half_duration)
-                end = min(t_max, center_time + half_duration)
-                interval = (start, end)
-
-                st.caption(f"Activity segment: {start} → {end}")
-
-            manual_activity_tags.append(
-                {
-                    "label": activity_label,
-                    "start": interval[0],
-                    "end": interval[1],
-                }
-            )
+        manual_activity_tags.append(
+            {
+                "label": activity_label,
+                "start": activity_tag_start,
+                "end": activity_tag_end,
+            }
+        )
 
     return manual_activity_tags
 
@@ -700,21 +705,13 @@ def render_activity_agent_controls(context_key: str, df=None, parent=None):
             t_min = df.index.min().to_pydatetime()
             t_max = df.index.max().to_pydatetime()
 
-            duration_options = {
-                "5 min": timedelta(minutes=5),
-                "15 min": timedelta(minutes=15),
-                "30 min": timedelta(minutes=30),
-                "1 hour": timedelta(hours=1),
-                "3 hours": timedelta(hours=3),
-                "Custom": None,
-            }
+        manual_activity_tags = render_manual_activity_validation_tags(
+            context_key=context_key,
+            t_min=t_min,
+            t_max=t_max,
+        )
 
-            manual_activity_tags = render_manual_activity_validation_tags(
-                context_key=context_key,
-                t_min=t_min,
-                t_max=t_max,
-                duration_options=duration_options,
-            )
+
 
         with st.expander("Activity thresholds — VT document definitions", expanded=False):
             short_window = st.number_input(
@@ -774,7 +771,7 @@ def render_activity_agent_controls(context_key: str, df=None, parent=None):
             )
             wob_drilling_min = st.number_input(
                 "WOB drilling minimum",
-                value=0.0,
+                value=0.1,
                 key=f"act_wob_drill_{context_key}",
             )
 

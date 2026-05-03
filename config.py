@@ -34,9 +34,21 @@ TRACK_COLOR_PALETTE = [
     "#E74C3C",
 ]
 
-PARAMETER_ALIASES = {
-    "Bit Depth": ["BDTI", "BITD", "BIT_DEPTH"],
-    "Well Depth": ["GS_DMEA", "DMEA", "DEPT", "GS_DVER", "DVER", "DBTV", "GS_DBTM", "DBTM"],
+# ------------------------------------------------------------
+# Parameter aliases
+# ------------------------------------------------------------
+# Important:
+# Do NOT use BDTI as Bit Depth in these datasets.
+# In the catalog, BDTI appears with unit "h" in several wells/sections.
+# The bit-depth/depth-of-bit curve is DBTM / GS_DBTM.
+#
+# Well Depth / Hole Depth is DMEA / GS_DMEA / DEPT.
+# Bit Depth is DBTM / GS_DBTM.
+# ------------------------------------------------------------
+
+GLOBAL_PARAMETER_ALIASES = {
+    "Bit Depth": ["GS_DBTM", "DBTM", "BITD", "BIT_DEPTH"],
+    "Well Depth": ["GS_DMEA", "DMEA", "DEPT", "GS_DVER", "DVER"],
     "Casing Depth": [
         "DepthCsg",
         "DEPTH_CSG",
@@ -54,15 +66,84 @@ PARAMETER_ALIASES = {
         "GS_MUD_MOTOR_ON",
     ],
     "BPOS": ["GS_BPOS", "BPOS"],
-    "HKL": ["GS_HKLD", "HKL", "HKLD"],
-    "MFI": ["GS_MFI", "MFI"],
-    "SPP": ["GS_SPPA", "SPP", "SPPA"],
-    "RPMB": ["RPMB", "GS_RPM", "RPM"],
-    "TRQ": ["GS_TQA", "TRQ", "TQA"],
-    "ROP": ["ROP", "GS_ROP", "DRILL_RATE", "RATE_OF_PENETRATION"],
+    "HKL": ["GS_HKLD", "HKLD", "HKLD30s", "HKL"],
+    "MFI": ["GS_TFLO", "TFLO", "TFLO30s", "GS_CFIA", "MFI"],
+    "SPP": ["GS_SPPA", "SPPA", "SIG_SPP5s", "SPP"],
+    "RPMB": ["GS_RPM", "RPM", "RPMB", "RPM30s"],
+    "TRQ": ["GS_TQA", "TQA", "SIG_TQ30s", "TRQ"],
+    "ROP": ["GS_ROP", "ROP", "ROP5", "ROP30s", "DRILL_RATE", "RATE_OF_PENETRATION"],
     "Pit Level": ["GS_PITLV", "GS_PITLVL", "GS_PIT", "PITLV", "PITLVL", "PIT"],
-    "WOB": ["WOB", "GS_WOB", "SWOB", "GS_SWOB", "SWOB30s"],
+    "WOB": ["GS_SWOB", "SWOB", "SWOB30s", "WOB"],
 }
+
+
+WELL_PARAMETER_ALIASES = {
+    # --------------------------------------------------------
+    # 34-10-C47
+    # Older compact mnemonic format.
+    # --------------------------------------------------------
+    "34-10-C47": {
+        "Bit Depth": ["DBTM", "DBTV"],
+        "Well Depth": ["DMEA", "DVER", "DEPT"],
+        "BPOS": ["BPOS"],
+        "HKL": ["HKL"],
+        "MFI": ["MFI"],
+        "SPP": ["SPP"],
+        "RPMB": ["RPMB", "RPMA"],
+        "TRQ": ["TRQ"],
+        "ROP": ["ROP"],
+        "WOB": ["WOB"],
+    },
+
+    # --------------------------------------------------------
+    # F-10
+    # WITSML-style mixed format.
+    # Prefer GS_* curves where they are the cleaned surface channels.
+    # --------------------------------------------------------
+    "F-10": {
+        "Bit Depth": ["GS_DBTM", "DBTM"],
+        "Well Depth": ["GS_DMEA", "DMEA", "DEPT", "GS_DVER", "DVER"],
+        "BPOS": ["GS_BPOS", "BPOS"],
+        "HKL": ["GS_HKLD", "HKLD", "HKLD30s", "HKLX", "HKLI", "HKLO", "HKLN"],
+        "MFI": ["GS_TFLO", "TFLO", "TFLO30s", "GS_CFIA"],
+        "SPP": ["GS_SPPA", "SPPA", "SIG_SPP5s", "APRS_RT", "APRS_P", "GS_CHKP"],
+        "RPMB": ["GS_RPM", "RPM", "RPM30s", "DRPM", "DRPM30s", "CRPM_RT"],
+        "TRQ": ["GS_TQA", "TQA", "SIG_TQ30s"],
+        "ROP": ["GS_ROP", "ROP", "ROP5", "ROP30s", "QROP"],
+        "WOB": ["GS_SWOB", "SWOB", "SWOB30s"],
+    },
+
+    # --------------------------------------------------------
+    # F-15
+    # Similar WITSML-style mixed format.
+    # --------------------------------------------------------
+    "F-15": {
+        "Bit Depth": ["GS_DBTM", "DBTM"],
+        "Well Depth": ["GS_DMEA", "DMEA", "DEPT", "GS_DVER", "DVER"],
+        "BPOS": ["GS_BPOS", "BPOS"],
+        "HKL": ["GS_HKLD", "HKLD", "HKLD30s", "HKLX", "HKLI", "HKLO", "HKLN"],
+        "MFI": ["GS_TFLO", "TFLO", "TFLO30s", "GS_CFIA"],
+        "SPP": ["GS_SPPA", "SPPA", "SIG_SPP5s", "APRS_RT", "APRS_P", "GS_CHKP"],
+        "RPMB": ["GS_RPM", "RPM", "RPM30s", "DRPM", "DRPM30s", "CRPM_RT"],
+        "TRQ": ["GS_TQA", "TQA", "SIG_TQ30s"],
+        "ROP": ["GS_ROP", "ROP", "ROP5", "ROP30s", "QROP"],
+        "WOB": ["GS_SWOB", "SWOB", "SWOB30s"],
+    },
+}
+
+
+# Optional section-specific overrides.
+# Use this only when one section is known to need a different priority.
+SECTION_PARAMETER_ALIASES = {
+    # Example structure:
+    # ("F-10", "8.5"): {
+    #     "Well Depth": ["DMEA", "GS_DMEA", "DEPT"],
+    # }
+}
+
+
+# Backward-compatible name used by existing imports.
+PARAMETER_ALIASES = GLOBAL_PARAMETER_ALIASES
 
 PARAMETER_DISPLAY_NAMES = {
     "Bit Depth": "Bit Depth — current bit depth",
@@ -156,9 +237,183 @@ PARAMETER_CATALOG = {
     "WOB": {
         "meaning": "Weight on bit",
         "unit": "ton",
-        "logical_min": -5.0,
+        "logical_min": 0.0,
         "logical_max": 60.0,
     },
+}
+
+# ------------------------------------------------------------
+# Data cleaning rules
+# ------------------------------------------------------------
+# PARAMETER_CATALOG is for display ranges.
+# CLEANING_RULES is for impossible values, zero drift, and agent trust.
+#
+# Raw columns are never overwritten.
+# The dashboard creates extra columns:
+#   <raw_col>__clean
+#   <raw_col>__quality
+# ------------------------------------------------------------
+
+CLEANING_RULES = {
+    "Bit Depth": {
+        "hard_min": 0.0,
+        "hard_max": 50000.0,
+    },
+    "Well Depth": {
+        "hard_min": 0.0,
+        "hard_max": 50000.0,
+    },
+    "Casing Depth": {
+        "hard_min": 0.0,
+        "hard_max": 50000.0,
+    },
+    "BPOS": {
+        "hard_min": 0.0,
+        "hard_max": 500.0,
+    },
+    "HKL": {
+        "hard_min": -5.0,
+        "hard_max": 500.0,
+        "zero_drift_min": -5.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "MFI": {
+        "hard_min": -10.0,
+        "hard_max": 20000.0,
+        "zero_drift_min": -10.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "SPP": {
+        "hard_min": -10.0,
+        "hard_max": 10000.0,
+        "zero_drift_min": -10.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "RPMB": {
+        "hard_min": -2.0,
+        "hard_max": 500.0,
+        "zero_drift_min": -2.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "TRQ": {
+        "hard_min": -2.0,
+        "hard_max": 200.0,
+        "zero_drift_min": -2.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "ROP": {
+        "hard_min": -5.0,
+        "hard_max": 2000.0,
+        "zero_drift_min": -5.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "Pit Level": {
+        "hard_min": 0.0,
+        "hard_max": 1000.0,
+    },
+    "WOB": {
+        "hard_min": -1.0,
+        "hard_max": 120.0,
+        "zero_drift_min": -1.0,
+        "clip_small_negative_to_zero": True,
+    },
+    "Mud Motor On": {
+        "hard_min": 0.0,
+        "hard_max": 1.0,
+    },
+}
+
+
+# Well-specific cleaning overrides.
+# These are intentionally more tolerant than PARAMETER_CATALOG display ranges.
+WELL_CLEANING_RULES = {
+    "34-10-C47": {
+        "BPOS": {
+            "hard_min": 0.0,
+            "hard_max": 60.0,
+        },
+        "HKL": {
+            "hard_min": -5.0,
+            "hard_max": 400.0,
+            "zero_drift_min": -5.0,
+            "clip_small_negative_to_zero": True,
+        },
+        "MFI": {
+            "hard_min": -10.0,
+            "hard_max": 6000.0,
+            "zero_drift_min": -10.0,
+            "clip_small_negative_to_zero": True,
+        },
+        "SPP": {
+            "hard_min": -10.0,
+            "hard_max": 10000.0,
+            "zero_drift_min": -10.0,
+            "clip_small_negative_to_zero": True,
+        },
+        "TRQ": {
+            "hard_min": -2.0,
+            "hard_max": 150.0,
+            "zero_drift_min": -2.0,
+            "clip_small_negative_to_zero": True,
+        },
+        "WOB": {
+            "hard_min": -1.0,
+            "hard_max": 120.0,
+            "zero_drift_min": -1.0,
+            "clip_small_negative_to_zero": True,
+        },
+    },
+
+    "F-10": {
+        "BPOS": {
+            "hard_min": 0.0,
+            "hard_max": 500.0,
+        },
+        "HKL": {
+            "hard_min": -5.0,
+            "hard_max": 500.0,
+            "zero_drift_min": -5.0,
+            "clip_small_negative_to_zero": True,
+        },
+        "MFI": {
+            "hard_min": -10.0,
+            "hard_max": 20000.0,
+            "zero_drift_min": -10.0,
+            "clip_small_negative_to_zero": True,
+        },
+    },
+
+    "F-15": {
+        "BPOS": {
+            "hard_min": 0.0,
+            "hard_max": 500.0,
+        },
+        "HKL": {
+            "hard_min": -5.0,
+            "hard_max": 500.0,
+            "zero_drift_min": -5.0,
+            "clip_small_negative_to_zero": True,
+        },
+        "MFI": {
+            "hard_min": -10.0,
+            "hard_max": 20000.0,
+            "zero_drift_min": -10.0,
+            "clip_small_negative_to_zero": True,
+        },
+    },
+}
+
+
+# Optional section-specific overrides.
+# These are applied after well-specific rules.
+SECTION_CLEANING_RULES = {
+    # Example:
+    # ("34-10-C47", "8.5"): {
+    #     "BPOS": {
+    #         "hard_min": 0.0,
+    #         "hard_max": 60.0,
+    #     },
+    # }
 }
 
 LOGICAL_PARAMETER_RANGES = {

@@ -10,10 +10,14 @@ def rolling_median(series: pd.Series, window: int) -> pd.Series:
     Causal rolling median.
 
     Important:
-    This intentionally uses center=False so the agent only uses current and past values.
+    This uses center=False so the agent only uses current and past values.
     The VT procedure says agents should not see future values.
     """
-    return coerce_numeric(series).rolling(window=window, min_periods=1, center=False).median()
+    return coerce_numeric(series).rolling(
+        window=window,
+        min_periods=1,
+        center=False,
+    ).median()
 
 
 def rolling_mean(series: pd.Series, window: int) -> pd.Series:
@@ -21,38 +25,61 @@ def rolling_mean(series: pd.Series, window: int) -> pd.Series:
     Causal rolling mean.
 
     Important:
-    This intentionally uses center=False so the agent only uses current and past values.
+    This uses center=False so the agent only uses current and past values.
     The VT procedure says agents should not see future values.
     """
-    return coerce_numeric(series).rolling(window=window, min_periods=1, center=False).mean()
+    return coerce_numeric(series).rolling(
+        window=window,
+        min_periods=1,
+        center=False,
+    ).mean()
 
 
 def rolling_abs_change(series: pd.Series, window: int) -> pd.Series:
     s = coerce_numeric(series)
-    return s.diff().abs().rolling(window=window, min_periods=1, center=False).mean()
+    return s.diff().abs().rolling(
+        window=window,
+        min_periods=1,
+        center=False,
+    ).mean()
 
 
 def stable_within_band(series: pd.Series, window: int, band: float) -> pd.Series:
     s = coerce_numeric(series)
-    rolling_max = s.rolling(window=window, min_periods=1, center=False).max()
-    rolling_min = s.rolling(window=window, min_periods=1, center=False).min()
+
+    rolling_max = s.rolling(
+        window=window,
+        min_periods=1,
+        center=False,
+    ).max()
+
+    rolling_min = s.rolling(
+        window=window,
+        min_periods=1,
+        center=False,
+    ).min()
+
     return (rolling_max - rolling_min) <= band
 
 
 def directional_movement(series: pd.Series, window: int, threshold: float) -> pd.Series:
     s = coerce_numeric(series)
     delta = s - s.shift(window)
+
     direction = pd.Series("still", index=s.index, dtype="object")
     direction.loc[delta > threshold] = "up"
     direction.loc[delta < -threshold] = "down"
+
     return direction
 
 
 def interval_overlap(a_start, a_end, b_start, b_end):
     start = max(pd.Timestamp(a_start), pd.Timestamp(b_start))
     end = min(pd.Timestamp(a_end), pd.Timestamp(b_end))
+
     if start < end:
         return start, end
+
     return None
 
 
@@ -66,10 +93,17 @@ def overlap_ratio(reference_start, reference_end, candidate_start, candidate_end
     Returns a value between 0.0 and 1.0.
     """
     reference_duration = interval_duration_seconds(reference_start, reference_end)
+
     if reference_duration <= 0:
         return 0.0
 
-    ov = interval_overlap(reference_start, reference_end, candidate_start, candidate_end)
+    ov = interval_overlap(
+        reference_start,
+        reference_end,
+        candidate_start,
+        candidate_end,
+    )
+
     if ov is None:
         return 0.0
 
@@ -77,11 +111,17 @@ def overlap_ratio(reference_start, reference_end, candidate_start, candidate_end
     return overlap_duration / reference_duration
 
 
-def bool_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severity: str | None = None) -> list[dict]:
+def bool_to_intervals(
+    mask: pd.Series,
+    label: str,
+    min_samples: int = 1,
+    severity: str | None = None,
+) -> list[dict]:
     if mask.empty:
         return []
 
     mask = mask.fillna(False).astype(bool)
+
     intervals: list[dict] = []
     start = None
     count = 0
@@ -90,8 +130,10 @@ def bool_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severit
         if flag and start is None:
             start = ts
             count = 1
+
         elif flag and start is not None:
             count += 1
+
         elif not flag and start is not None:
             if count >= min_samples:
                 prev_ts = mask.index[mask.index.get_loc(ts) - 1]
@@ -104,6 +146,7 @@ def bool_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severit
                         "source": "activity_agent",
                     }
                 )
+
             start = None
             count = 0
 
@@ -122,7 +165,18 @@ def bool_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severit
 
 
 def fill_short_false_gaps(mask: pd.Series, max_gap: int) -> pd.Series:
+    """
+    Fill short False gaps between two True regions.
+
+    Example:
+    True True False True True
+
+    with max_gap >= 1 becomes:
+
+    True True True True True
+    """
     mask = mask.fillna(False).astype(bool).copy()
+
     if max_gap <= 0 or mask.empty:
         return mask
 
@@ -136,8 +190,10 @@ def fill_short_false_gaps(mask: pd.Series, max_gap: int) -> pd.Series:
             continue
 
         start = i
+
         while i < n and not values[i]:
             i += 1
+
         end = i - 1
         gap_len = end - start + 1
 
@@ -151,6 +207,13 @@ def fill_short_false_gaps(mask: pd.Series, max_gap: int) -> pd.Series:
 
 
 def enforce_min_duration(labels: pd.Series, min_samples: int) -> pd.Series:
+    """
+    Remove very short label runs.
+
+    Short runs are replaced by the previous label when possible.
+    If the previous label is unavailable or Other, the next label is used.
+    If no good replacement exists, the run becomes Other.
+    """
     if labels.empty or min_samples <= 1:
         return labels
 
@@ -162,16 +225,21 @@ def enforce_min_duration(labels: pd.Series, min_samples: int) -> pd.Series:
     while i < n:
         current = values[i]
         j = i + 1
+
         while j < n and values[j] == current:
             j += 1
 
         run_len = j - i
+
         if run_len < min_samples:
             prev_label = values[i - 1] if i > 0 else None
             next_label = values[j] if j < n else None
+
             replacement = prev_label if prev_label not in (None, "Other") else next_label
+
             if replacement is None:
                 replacement = "Other"
+
             for k in range(i, j):
                 values[k] = replacement
 
@@ -185,6 +253,7 @@ def intervals_from_label_series(labels: pd.Series, min_samples: int = 1) -> list
         return []
 
     labels = labels.fillna("Other").astype("object")
+
     intervals: list[dict] = []
     start_idx = 0
 
@@ -200,6 +269,7 @@ def intervals_from_label_series(labels: pd.Series, min_samples: int = 1) -> list
                         "source": "activity_agent",
                     }
                 )
+
             start_idx = i
 
     if (len(labels) - start_idx) >= min_samples:

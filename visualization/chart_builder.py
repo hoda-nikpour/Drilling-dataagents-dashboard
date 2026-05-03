@@ -27,7 +27,9 @@ def create_multi_track_chart(
     chart_height: int = 950,
     parameter_ranges: dict[str, tuple[float, float]] | None = None,
     marker_display: str = "Lines only",
+    curve_source: str = "Raw values",
 ) -> go.Figure:
+    
     subplot_titles = ["Track 1", "Track 2", "Track 3", "Track 4"]
 
     fig = make_subplots(
@@ -85,6 +87,7 @@ def create_multi_track_chart(
 
             hovertemplate = (
                 f"<b>{label}</b><br>"
+                + f"Curve source: {curve_source}<br>"
                 + (f"Unit: {unit}<br>" if unit else "")
                 + "Value: %{customdata[0]:.1f}<br>"
                 + "Date: %{y|%Y-%m-%d}<br>"

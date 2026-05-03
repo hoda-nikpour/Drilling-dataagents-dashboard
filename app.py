@@ -3,14 +3,34 @@ import streamlit as st
 
 from agents.activity_agents import REQUIRED_ACTIVITY_INPUTS
 from agents.symptom_agents import REQUIRED_SYMPTOM_INPUTS
-from config import DEFAULT_MARKER_DISPLAY, PARAMETER_ALIASES, PARAMETER_CATALOG, TRACK_COLOR_PALETTE
+
+from config import (
+    CLEANING_RULES,
+    DEFAULT_MARKER_DISPLAY,
+    GLOBAL_PARAMETER_ALIASES,
+    PARAMETER_CATALOG,
+    SECTION_CLEANING_RULES,
+    SECTION_PARAMETER_ALIASES,
+    TRACK_COLOR_PALETTE,
+    WELL_CLEANING_RULES,
+    WELL_PARAMETER_ALIASES,
+)
+
+from services.data_cleaning import (
+    apply_cleaning_layer,
+    build_context_cleaning_rules,
+)
+
+
 from data_access.data_loader import (
     get_available_numeric_columns,
     load_catalog,
     load_sections_for_columns,
 )
 from services.dashboard_service import (
+    build_context_parameter_aliases,
     build_label_to_column_map,
+    build_mapping_diagnostic_df,
     build_parameter_catalog_df,
     build_requested_columns,
     build_sections_by_well,
@@ -73,10 +93,21 @@ def main():
     context_key = make_context_key(selected_well, selected_sections)
 
     discovered_params = get_available_numeric_columns(selected_well, selected_sections)
+
+    context_parameter_aliases = build_context_parameter_aliases(
+        selected_well=selected_well,
+        selected_sections=selected_sections,
+        global_aliases=GLOBAL_PARAMETER_ALIASES,
+        well_aliases=WELL_PARAMETER_ALIASES,
+        section_aliases=SECTION_PARAMETER_ALIASES,
+    )
+
     label_to_column = build_label_to_column_map(
         discovered_params=discovered_params,
-        parameter_aliases=PARAMETER_ALIASES,
+        parameter_aliases=context_parameter_aliases,
     )
+
+
 
     required_activity_labels = [
         label for label in REQUIRED_ACTIVITY_INPUTS if label in label_to_column
@@ -117,11 +148,34 @@ def main():
         context_key=context_key,
     )
 
+    with st.sidebar:
+        st.subheader("Curve Source")
+        curve_source = st.radio(
+            "Values shown in Tracks 1–3",
+            options=["Raw values", "Cleaned values"],
+            index=0,
+            key=f"curve_source_{context_key}",
+            help=(
+                "Raw values preserve the original sensor data. "
+                "Cleaned values apply the dashboard cleaning rules. "
+                "Agents always use cleaned values."
+            ),
+        )
+
     requested_columns = build_requested_columns(
         selected_labels=selected_labels,
         required_activity_labels=required_activity_labels,
         required_symptom_labels=required_symptom_labels,
         label_to_column=label_to_column,
+    )
+
+    # Also load all mapped columns so the diagnostic table can check them.
+    # Without this, parameters like ROP may appear as "Missing raw column"
+    # simply because they were not selected for plotting and not required by agents.
+    diagnostic_columns = list(label_to_column.values())
+
+    requested_columns = list(
+        dict.fromkeys(requested_columns + diagnostic_columns)
     )
 
     df = load_sections_for_columns(
@@ -134,6 +188,81 @@ def main():
         st.error("No data loaded. Check the parquet files in the data folder.")
         st.stop()
 
+    context_cleaning_rules = build_context_cleaning_rules(
+        selected_well=selected_well,
+        selected_sections=selected_sections,
+        global_rules=CLEANING_RULES,
+        well_rules=WELL_CLEANING_RULES,
+        section_rules=SECTION_CLEANING_RULES,
+    )
+
+    df, clean_label_to_column, cleaning_summary_df = apply_cleaning_layer(
+        df=df,
+        label_to_column=label_to_column,
+        cleaning_rules=context_cleaning_rules,
+        required_activity_labels=required_activity_labels,
+        required_symptom_labels=required_symptom_labels,
+    )
+
+    with st.expander("Parameter mapping diagnostics", expanded=True):
+        st.caption(
+            "This table checks whether each logical dashboard parameter is connected "
+            "to the expected raw mnemonic and whether its values look physically reasonable."
+        )
+
+        mapping_diagnostic_df = build_mapping_diagnostic_df(
+            df=df,
+            label_to_column=label_to_column,
+            parameter_catalog=PARAMETER_CATALOG,
+        )
+
+        st.dataframe(mapping_diagnostic_df, use_container_width=True)
+
+        bad_rows = mapping_diagnostic_df[
+            mapping_diagnostic_df["Status"].astype(str).ne("OK")
+        ]
+
+        if not bad_rows.empty:
+            st.warning(
+                "Some curves contain values outside the expected display/diagnostic range. "
+                "This does not automatically mean wrong mapping. It may indicate sensor zero drift, "
+                "unit mismatch, outliers, or valid high-range operation. Check both this table "
+                "and the Data cleaning diagnostics table."
+            )
+
+        with st.expander("Data cleaning diagnostics", expanded=True):
+            st.caption(
+                "Raw data is preserved. The dashboard creates cleaned columns for agent logic. "
+                "Small negative zero-drift values can be corrected to 0. Extreme impossible values become NaN."
+            )
+
+            if cleaning_summary_df.empty:
+                st.info("No cleaning summary is available.")
+            else:
+                st.dataframe(cleaning_summary_df, use_container_width=True)
+
+                changed_rows = cleaning_summary_df[
+                    (
+                        cleaning_summary_df["Zero drift corrected"].fillna(0).astype(int) > 0
+                    )
+                    | (
+                        cleaning_summary_df["Below hard min invalid"].fillna(0).astype(int) > 0
+                    )
+                    | (
+                        cleaning_summary_df["Above hard max invalid"].fillna(0).astype(int) > 0
+                    )
+                    | (
+                        cleaning_summary_df["Infinite invalid"].fillna(0).astype(int) > 0
+                    )
+                ]
+
+                if not changed_rows.empty:
+                    st.warning(
+                        "Some raw values were corrected or marked invalid for agent use. "
+                        "The original raw columns are still preserved for visual review."
+                    )
+    
+    
     time_range, zoom_percent = render_time_filter(df, context_key)
 
     # Keep the initial chart style fixed.
@@ -165,7 +294,7 @@ def main():
 
     activity_cfg = run_activity_agent(
         df=df,
-        label_to_column=label_to_column,
+        label_to_column=clean_label_to_column,
         activity_ui=activity_ui,
     )
 
@@ -174,7 +303,7 @@ def main():
 
     symptom_cfg = run_symptom_agent(
         df=df,
-        label_to_column=label_to_column,
+        label_to_column=clean_label_to_column,
         symptom_ui=symptom_ui,
         activity_ui=activity_ui,
         activity_cfg=activity_cfg,
@@ -268,8 +397,14 @@ def main():
 
     track_colors = [TRACK_COLOR_PALETTE[: len(params)] for params in track_param_labels]
 
+    plot_label_to_column = (
+        clean_label_to_column
+        if curve_source == "Cleaned values"
+        else label_to_column
+    )
+
     track_params_real = [
-        [label_to_column[label] for label in track if label in label_to_column]
+        [plot_label_to_column[label] for label in track if label in plot_label_to_column]
         for track in track_param_labels
     ]
 
@@ -288,6 +423,7 @@ def main():
         chart_height=agent_cfg.get("chart_height", 950),
         parameter_ranges=parameter_ranges,
         marker_display=marker_display,
+        curve_source=curve_source,
     )
 
     chart_key = f"multi_track_chart_{context_key}"

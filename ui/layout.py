@@ -54,9 +54,8 @@ def render_result_tables(
         with st.expander("Activity validation against manual tags", expanded=False):
             st.dataframe(activity_validation_df, use_container_width=True)
 
-    if not review_df.empty:
-        with st.expander("Manual hit review", expanded=False):
-            st.dataframe(review_df, use_container_width=True)
+    # Manual hit review table intentionally hidden from UI.
+    # The underlying review_df logic is still preserved in app.py.
 
 
 

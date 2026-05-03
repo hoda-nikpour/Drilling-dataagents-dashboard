@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 from agents.activity_agents import build_activity_summary, classify_activities
 from agents.symptom_agents import build_selected_symptom_agent
@@ -186,3 +187,207 @@ def run_symptom_agent(
         "selected_symptom": symptom_ui["selected_symptom"],
         "features": symptom_features,
     }
+
+def _merge_alias_dicts(*alias_dicts: dict[str, list[str]]) -> dict[str, list[str]]:
+    """
+    Merge alias dictionaries while preserving priority order.
+
+    Later dictionaries are added after earlier dictionaries unless the same
+    alias already exists.
+    """
+    merged: dict[str, list[str]] = {}
+
+    for alias_dict in alias_dicts:
+        if not alias_dict:
+            continue
+
+        for label, aliases in alias_dict.items():
+            merged.setdefault(label, [])
+
+            for alias in aliases:
+                if alias not in merged[label]:
+                    merged[label].append(alias)
+
+    return merged
+
+
+def build_context_parameter_aliases(
+    selected_well: str,
+    selected_sections: tuple[str, ...],
+    global_aliases: dict[str, list[str]],
+    well_aliases: dict[str, dict[str, list[str]]] | None = None,
+    section_aliases: dict[tuple[str, str], dict[str, list[str]]] | None = None,
+) -> dict[str, list[str]]:
+    """
+    Build aliases for the selected well/sections.
+
+    Priority:
+    1. Section-specific aliases, if defined.
+    2. Well-specific aliases, if defined.
+    3. Global aliases as fallback.
+
+    This lets F-10, F-15, and 34-10-C47 use different raw mnemonics while the
+    rest of the dashboard continues to use logical names such as Bit Depth,
+    Well Depth, MFI, SPP, etc.
+    """
+    well_aliases = well_aliases or {}
+    section_aliases = section_aliases or {}
+
+    section_specific: dict[str, list[str]] = {}
+
+    for sec in selected_sections:
+        key = (selected_well, str(sec))
+        overrides = section_aliases.get(key, {})
+
+        for label, aliases in overrides.items():
+            section_specific.setdefault(label, [])
+
+            for alias in aliases:
+                if alias not in section_specific[label]:
+                    section_specific[label].append(alias)
+
+    return _merge_alias_dicts(
+        section_specific,
+        well_aliases.get(selected_well, {}),
+        global_aliases,
+    )
+
+
+def build_label_to_column_map(
+    discovered_params: list[str],
+    parameter_aliases: dict[str, list[str]],
+) -> dict[str, str]:
+    """
+    Map logical dashboard parameter names to raw dataframe columns.
+
+    This version is schema-based: it chooses the first alias that exists in the
+    selected parquet files. The diagnostic table below checks whether the chosen
+    column also has valid and physically reasonable values.
+    """
+    discovered_set = set(discovered_params)
+    label_to_column = {}
+
+    for label, aliases in parameter_aliases.items():
+        for alias in aliases:
+            if alias in discovered_set:
+                label_to_column[label] = alias
+                break
+
+    return label_to_column
+
+
+def build_mapping_diagnostic_df(
+    df: pd.DataFrame,
+    label_to_column: dict[str, str],
+    parameter_catalog: dict,
+) -> pd.DataFrame:
+    """
+    Diagnostic table to confirm that each logical parameter is really connected
+    to a sensible raw curve.
+
+    This is very important for well-log data because different wells can use
+    different mnemonic conventions.
+    """
+    rows = []
+
+    n_rows = len(df)
+
+    for label, raw_col in label_to_column.items():
+        meta = parameter_catalog.get(label, {})
+        logical_min = meta.get("logical_min", np.nan)
+        logical_max = meta.get("logical_max", np.nan)
+
+        if raw_col not in df.columns:
+            rows.append(
+                {
+                    "Parameter": label,
+                    "Raw mnemonic": raw_col,
+                    "Valid %": 0.0,
+                    "Min": np.nan,
+                    "P50": np.nan,
+                    "Max": np.nan,
+                    "Logical min": logical_min,
+                    "Logical max": logical_max,
+                    "Status": "Missing raw column",
+                }
+            )
+            continue
+
+        s = pd.to_numeric(df[raw_col], errors="coerce")
+        valid = s.dropna()
+        valid_pct = (len(valid) / n_rows * 100.0) if n_rows > 0 else 0.0
+
+        status_flags = []
+
+        if valid.empty:
+            status_flags.append("All NaN")
+
+        if valid_pct < 10.0:
+            status_flags.append("Very sparse")
+
+        if not valid.empty:
+            s_min = float(valid.min())
+            s_med = float(valid.median())
+            s_max = float(valid.max())
+
+        if pd.notna(logical_min) and s_min < float(logical_min):
+            status_flags.append("Has values below logical min")
+
+        if pd.notna(logical_max) and s_max > float(logical_max):
+            status_flags.append("Has values above logical max")
+
+            # Important special checks.
+            if label in {"Bit Depth", "Well Depth"}:
+                if s_max < 100.0:
+                    status_flags.append("Suspicious depth: too small")
+                if s_max > 10000.0:
+                    status_flags.append("Suspicious depth: too large / unit issue")
+
+            if label == "BPOS":
+                if s_max > 200.0:
+                    status_flags.append("Suspicious BPOS: too large")
+
+            if label == "RPMB":
+                if s_max > 500.0:
+                    status_flags.append("Suspicious RPM: too large")
+
+            if label == "WOB":
+                if s_min < -50.0 or s_max > 500.0:
+                    status_flags.append("Suspicious WOB range")
+
+            if label == "MFI":
+                if s_max > 20000.0:
+                    status_flags.append("Suspicious flow range / unit issue")
+
+        else:
+            s_min = np.nan
+            s_med = np.nan
+            s_max = np.nan
+
+        rows.append(
+            {
+                "Parameter": label,
+                "Raw mnemonic": raw_col,
+                "Valid %": round(valid_pct, 1),
+                "Min": s_min,
+                "P50": s_med,
+                "Max": s_max,
+                "Logical min": logical_min,
+                "Logical max": logical_max,
+                "Status": "OK" if not status_flags else "; ".join(status_flags),
+            }
+        )
+
+    columns = [
+        "Parameter",
+        "Raw mnemonic",
+        "Valid %",
+        "Min",
+        "P50",
+        "Max",
+        "Logical min",
+        "Logical max",
+        "Status",
+    ]
+
+    return pd.DataFrame(rows, columns=columns).sort_values("Parameter").reset_index(drop=True)
