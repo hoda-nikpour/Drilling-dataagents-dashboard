@@ -50,6 +50,7 @@ from ui.sidebar import (
     build_agent_cfg_from_controls,
     build_manual_review_df,
     build_symptom_miss_reason_df,
+    build_trq_spike_evaluation_df,
     render_agent_controls,
     render_agent_review_outputs,
     render_parameter_range_controls,
@@ -373,18 +374,39 @@ def main():
             f"{hash(str(symptom_cfg.get('intervals', [])))}"
         )
 
-        if not symptom_miss_reason_df.empty:
-            with st.expander(
-                "Why selected symptom agent did or did not hit manual tags",
-                expanded=True,
-            ):
-                st.dataframe(
-                    symptom_miss_reason_df,
-                    use_container_width=True,
-                    key=miss_reason_table_key,
-                )    
+    if not symptom_miss_reason_df.empty:
+        with st.expander(
+            "Why selected symptom agent did or did not hit manual tags",
+            expanded=True,
+        ):
+            st.dataframe(
+                symptom_miss_reason_df,
+                use_container_width=True,
+                key=miss_reason_table_key,
+            )    
 
+    if (
+        agent_cfg.get("agent_source") == "Symptom agent"
+        and symptom_cfg.get("selected_symptom") == "TRQSpike"
+        and not symptom_cfg.get("features", pd.DataFrame()).empty
+    ):
+        trq_spike_eval_df = build_trq_spike_evaluation_df(symptom_cfg)
 
+        with st.expander(
+            "TRQSpike agent result for evaluation — Ratio and z-value",
+            expanded=True,
+        ):
+            st.caption(
+                "This table prints the TRQ Ratio and TRQ z-value used by the TRQSpike agent. "
+                "Use it to evaluate whether the ratio and z-score thresholds should be adjusted. "
+                "Prev. TRQ Std Dev means previous torque standard deviation."
+            )
+
+            st.dataframe(
+                trq_spike_eval_df,
+                use_container_width=True,
+                key=f"trq_spike_eval_{context_key}_{len(trq_spike_eval_df)}",
+            )
     
     if symptom_cfg and not symptom_cfg.get("features", pd.DataFrame()).empty:
         with st.expander("Selected symptom debug features", expanded=False):

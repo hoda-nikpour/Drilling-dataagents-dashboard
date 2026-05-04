@@ -228,6 +228,17 @@ def build_trq_spike_agent(
     out["spike_gate"] = spike_gate
     out["lvl1_mask"] = lvl1_mask
     out["lvl2_mask"] = lvl2_mask
+        # Clear user-facing names for dashboard evaluation.
+    # These directly answer the boss's request to print Ratio and z-value.
+    out["Current TRQ"] = trq
+    out["Prev. TRQ Mean"] = trq_mean_long
+    out["Prev. TRQ Std Dev"] = trq_std_long
+    out["TRQ Ratio"] = trq_ratio
+    out["TRQ z-value"] = trq_zscore
+    out["TRQ Started Low"] = started_low
+    out["TRQ Spike Gate"] = spike_gate
+    out["TRQSpike Low Mask"] = lvl1_mask
+    out["TRQSpike High Mask"] = lvl2_mask
 
     lvl1_intervals = mask_to_intervals(
         mask=lvl1_mask,

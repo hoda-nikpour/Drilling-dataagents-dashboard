@@ -945,6 +945,20 @@ def render_symptom_agent_controls(context_key: str, parent=None):
                 key=f"sym_trq_l2_{context_key}",
             )
 
+            trq_spike_zscore_min = st.number_input(
+                "TRQSpike minimum z-value",
+                value=2.9,
+                key=f"sym_trq_zscore_min_{context_key}",
+                help="Minimum TRQ z-value required for normal TRQSpike detection.",
+            )
+
+            trq_spike_extreme_ratio = st.number_input(
+                "TRQSpike extreme ratio",
+                value=1.80,
+                key=f"sym_trq_extreme_ratio_{context_key}",
+                help="If TRQ ratio exceeds this value, the spike can pass even without the normal z-shape rule.",
+            )
+
             trq_erratic_mean_long_window = st.number_input(
                 "TRQErratic mean-long window",
                 min_value=20,
@@ -1073,23 +1087,30 @@ def render_symptom_agent_controls(context_key: str, parent=None):
 
             trq_baseline_window=int(trq_baseline_window),
             trq_mean_long_window=int(trq_baseline_window),
-
             trq_spike_ratio_level_1=float(trq_spike_ratio_level_1),
-            trq_spike_ratio_level_2=float(trq_spike_ratio_level_2),            pspike_baseline_window=int(pspike_baseline_window),
+            trq_spike_ratio_level_2=float(trq_spike_ratio_level_2),
+            trq_spike_zscore_min=float(trq_spike_zscore_min),
+            trq_spike_extreme_ratio=float(trq_spike_extreme_ratio),
+
+            pspike_baseline_window=int(pspike_baseline_window),
             pspike_threshold_normal=float(pspike_threshold_normal),
             pspike_threshold_motor_on=float(pspike_threshold_motor_on),
             pspike_gap_fill_samples=int(pspike_gap_fill_samples),
             pspike_flow_delta_max=float(pspike_flow_delta_max),
             pspike_rpm_delta_max=float(pspike_rpm_delta_max),
             pspike_wob_delta_max=float(pspike_wob_delta_max),
+
             overpull_baseline_window=int(overpull_baseline_window),
             overpull_threshold=float(overpull_threshold),
             overpull_gap_fill_samples=int(overpull_gap_fill_samples),
+
             tookweight_baseline_window=int(tookweight_baseline_window),
             tookweight_threshold=float(tookweight_threshold),
             tookweight_gap_fill_samples=int(tookweight_gap_fill_samples),
+
             hoisting_velocity_min=float(hoisting_velocity_min),
             hoisting_velocity_max=float(hoisting_velocity_max),
+
             trq_erratic_mean_long_window=int(trq_erratic_mean_long_window),
             trq_erratic_ratio_level_1=float(trq_erratic_ratio_level_1),
             trq_erratic_min_cycles=int(trq_erratic_min_cycles),
@@ -1858,6 +1879,122 @@ def build_agent_cfg_from_controls(
         "manual_activity_tags": manual_activity_tags,
         "activity_validation_summary": activity_validation_summary,
     }
+
+def build_trq_spike_evaluation_df(symptom_cfg: dict) -> pd.DataFrame:
+    """
+    Build a readable TRQSpike evaluation table.
+
+    This table is mainly for checking whether the TRQSpike thresholds are too
+    strict or too loose. It prints the TRQ ratio and z-value requested for
+    agent evaluation.
+    """
+
+    selected_symptom = symptom_cfg.get("selected_symptom", "")
+    features = symptom_cfg.get("features", pd.DataFrame())
+    cfg = symptom_cfg.get("config", SymptomConfig())
+
+    columns = [
+        "Time",
+        "Current TRQ",
+        "Prev. TRQ Mean",
+        "Prev. TRQ Std Dev",
+        "TRQ Ratio",
+        "TRQ z-value",
+        "RPM On",
+        "RPM Stable",
+        "Activity/RPM Context OK",
+        "Started Low",
+        "Normal Spike Shape",
+        "Extreme Spike",
+        "Spike Gate",
+        "Low Mask",
+        "High Mask",
+        "Decision",
+    ]
+
+    if selected_symptom != "TRQSpike" or features is None or features.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = features.copy()
+
+    required_cols = [
+        "trq",
+        "trq_mean_long",
+        "trq_std_long",
+        "trq_ratio",
+        "trq_zscore",
+        "rpm_on",
+        "rpm_stable",
+        "context_mask",
+        "started_low",
+        "normal_spike_shape",
+        "extreme_spike",
+        "spike_gate",
+        "lvl1_mask",
+        "lvl2_mask",
+    ]
+
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Keep rows that are useful for evaluation:
+    # 1. agent hit rows,
+    # 2. rows that passed context,
+    # 3. rows where ratio is close to the level-1 threshold.
+    near_threshold = pd.to_numeric(df["trq_ratio"], errors="coerce") >= (
+        float(cfg.trq_spike_ratio_level_1) * 0.90
+    )
+
+    useful_rows = (
+        df["lvl1_mask"].fillna(False).astype(bool)
+        | df["lvl2_mask"].fillna(False).astype(bool)
+        | df["context_mask"].fillna(False).astype(bool)
+        | near_threshold.fillna(False)
+    )
+
+    eval_df = df.loc[useful_rows].copy()
+
+    if eval_df.empty:
+        eval_df = df.tail(200).copy()
+    else:
+        eval_df = eval_df.tail(1000).copy()
+
+    def _decision(row):
+        if bool(row.get("lvl2_mask", False)):
+            return "High TRQSpike"
+        if bool(row.get("lvl1_mask", False)):
+            return "Low TRQSpike"
+        if not bool(row.get("context_mask", False)):
+            return "No hit: context blocked"
+        if pd.isna(row.get("trq_ratio")) or row.get("trq_ratio") <= cfg.trq_spike_ratio_level_1:
+            return "No hit: ratio below threshold"
+        if not bool(row.get("spike_gate", False)):
+            return "No hit: z-value / spike shape blocked"
+        return "No hit"
+
+    out = pd.DataFrame(
+        {
+            "Time": eval_df.index,
+            "Current TRQ": pd.to_numeric(eval_df["trq"], errors="coerce").round(3),
+            "Prev. TRQ Mean": pd.to_numeric(eval_df["trq_mean_long"], errors="coerce").round(3),
+            "Prev. TRQ Std Dev": pd.to_numeric(eval_df["trq_std_long"], errors="coerce").round(3),
+            "TRQ Ratio": pd.to_numeric(eval_df["trq_ratio"], errors="coerce").round(3),
+            "TRQ z-value": pd.to_numeric(eval_df["trq_zscore"], errors="coerce").round(3),
+            "RPM On": eval_df["rpm_on"],
+            "RPM Stable": eval_df["rpm_stable"],
+            "Activity/RPM Context OK": eval_df["context_mask"],
+            "Started Low": eval_df["started_low"],
+            "Normal Spike Shape": eval_df["normal_spike_shape"],
+            "Extreme Spike": eval_df["extreme_spike"],
+            "Spike Gate": eval_df["spike_gate"],
+            "Low Mask": eval_df["lvl1_mask"],
+            "High Mask": eval_df["lvl2_mask"],
+            "Decision": eval_df.apply(_decision, axis=1),
+        }
+    )
+
+    return out[columns].reset_index(drop=True)
 
 def render_agent_review_outputs(
     agent_cfg: dict,
