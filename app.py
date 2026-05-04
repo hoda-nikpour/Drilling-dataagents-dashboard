@@ -21,12 +21,12 @@ from services.data_cleaning import (
     build_context_cleaning_rules,
 )
 
-
 from data_access.data_loader import (
     get_available_numeric_columns,
     load_catalog,
     load_sections_for_columns,
 )
+
 from services.dashboard_service import (
     build_context_parameter_aliases,
     build_label_to_column_map,
@@ -39,12 +39,14 @@ from services.dashboard_service import (
     run_activity_agent,
     run_symptom_agent,
 )
+
 from ui.layout import (
     render_chart,
     render_dashboard_header,
     render_result_tables,
     render_review_caption,
 )
+
 from ui.sidebar import (
     build_activity_validation_df,
     build_agent_cfg_from_controls,
@@ -69,14 +71,13 @@ from services.undo_service import (
     render_undo_controls,
 )
 
+
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
 apply_global_styles()
 
 
-
 def main():
     begin_undo_tracking()
-    
 
     catalog = load_catalog()
     if not catalog["sections"]:
@@ -108,14 +109,14 @@ def main():
         parameter_aliases=context_parameter_aliases,
     )
 
-
-
     required_activity_labels = [
         label for label in REQUIRED_ACTIVITY_INPUTS if label in label_to_column
     ]
+
     required_symptom_labels = [
         label for label in REQUIRED_SYMPTOM_INPUTS if label in label_to_column
     ]
+
     available_param_labels = list(dict.fromkeys(list(label_to_column.keys())))
 
     if not available_param_labels:
@@ -138,6 +139,7 @@ def main():
         available_param_labels=available_param_labels,
         context_key=context_key,
     )
+
     selected_labels = flatten_selected_params(track_param_labels)
 
     if not selected_labels:
@@ -244,16 +246,28 @@ def main():
 
                 changed_rows = cleaning_summary_df[
                     (
-                        cleaning_summary_df["Zero drift corrected"].fillna(0).astype(int) > 0
+                        cleaning_summary_df["Zero drift corrected"]
+                        .fillna(0)
+                        .astype(int)
+                        > 0
                     )
                     | (
-                        cleaning_summary_df["Below hard min invalid"].fillna(0).astype(int) > 0
+                        cleaning_summary_df["Below hard min invalid"]
+                        .fillna(0)
+                        .astype(int)
+                        > 0
                     )
                     | (
-                        cleaning_summary_df["Above hard max invalid"].fillna(0).astype(int) > 0
+                        cleaning_summary_df["Above hard max invalid"]
+                        .fillna(0)
+                        .astype(int)
+                        > 0
                     )
                     | (
-                        cleaning_summary_df["Infinite invalid"].fillna(0).astype(int) > 0
+                        cleaning_summary_df["Infinite invalid"]
+                        .fillna(0)
+                        .astype(int)
+                        > 0
                     )
                 ]
 
@@ -262,26 +276,26 @@ def main():
                         "Some raw values were corrected or marked invalid for agent use. "
                         "The original raw columns are still preserved for visual review."
                     )
-    
-    
+
     time_range, zoom_percent = render_time_filter(df, context_key)
 
     # Keep the initial chart style fixed.
     # Users can still switch style using the Plotly buttons above the chart.
     marker_display = DEFAULT_MARKER_DISPLAY
-        
-    # Create sidebar containers in the visual order we want.
-    # Track 4 will appear before the agent settings, even though the
-    # agent settings are read first internally.
+
     if time_range is None:
         st.warning("No valid time range is available.")
         st.stop()
 
     df = df.loc[pd.Timestamp(time_range[0]) : pd.Timestamp(time_range[1])].copy()
+
     if df.empty:
         st.warning("No data available in the selected time range.")
         st.stop()
-        
+
+    # Create sidebar containers in the visual order we want.
+    # Track 4 will appear before the agent settings, even though the
+    # agent settings are read first internally.
     review_controls_container = st.sidebar.container()
 
     agent_controls = render_agent_controls(
@@ -313,9 +327,9 @@ def main():
     # This is visually placed above the agent settings because it is rendered
     # into review_controls_container, which was created first.
     agent_cfg = build_agent_cfg_from_controls(
-    controls=agent_controls,
-    activity_cfg=activity_cfg,
-    symptom_cfg=symptom_cfg,
+        controls=agent_controls,
+        activity_cfg=activity_cfg,
+        symptom_cfg=symptom_cfg,
     )
 
     render_agent_review_outputs(
@@ -336,13 +350,14 @@ def main():
     activity_validation_df = build_activity_validation_df(
         agent_cfg.get("activity_validation_summary", {})
     )
+
     review_df = build_manual_review_df(summary)
 
     render_result_tables(
-    activity_cfg=activity_cfg,
-    symptom_cfg=symptom_cfg,
-    activity_validation_df=activity_validation_df,
-    review_df=review_df,
+        activity_cfg=activity_cfg,
+        symptom_cfg=symptom_cfg,
+        activity_validation_df=activity_validation_df,
+        review_df=review_df,
     )
 
     # Show the miss-reason table only for a fresh Symptom Agent review.
@@ -374,16 +389,16 @@ def main():
             f"{hash(str(symptom_cfg.get('intervals', [])))}"
         )
 
-    if not symptom_miss_reason_df.empty:
-        with st.expander(
-            "Why selected symptom agent did or did not hit manual tags",
-            expanded=True,
-        ):
-            st.dataframe(
-                symptom_miss_reason_df,
-                use_container_width=True,
-                key=miss_reason_table_key,
-            )    
+        if not symptom_miss_reason_df.empty:
+            with st.expander(
+                "Why selected symptom agent did or did not hit manual tags",
+                expanded=True,
+            ):
+                st.dataframe(
+                    symptom_miss_reason_df,
+                    use_container_width=True,
+                    key=miss_reason_table_key,
+                )
 
     if (
         agent_cfg.get("agent_source") == "Symptom agent"
@@ -407,7 +422,7 @@ def main():
                 use_container_width=True,
                 key=f"trq_spike_eval_{context_key}_{len(trq_spike_eval_df)}",
             )
-    
+
     if symptom_cfg and not symptom_cfg.get("features", pd.DataFrame()).empty:
         with st.expander("Selected symptom debug features", expanded=False):
             st.dataframe(
@@ -417,7 +432,10 @@ def main():
 
     section_ranges = compute_section_ranges(df, list(selected_sections))
 
-    track_colors = [TRACK_COLOR_PALETTE[: len(params)] for params in track_param_labels]
+    track_colors = [
+        TRACK_COLOR_PALETTE[: len(params)]
+        for params in track_param_labels
+    ]
 
     plot_label_to_column = (
         clean_label_to_column
@@ -426,7 +444,11 @@ def main():
     )
 
     track_params_real = [
-        [plot_label_to_column[label] for label in track if label in plot_label_to_column]
+        [
+            plot_label_to_column[label]
+            for label in track
+            if label in plot_label_to_column
+        ]
         for track in track_param_labels
     ]
 
