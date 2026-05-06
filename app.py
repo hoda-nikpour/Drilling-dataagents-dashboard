@@ -3,6 +3,7 @@ import streamlit as st
 
 from agents.activity_agents import REQUIRED_ACTIVITY_INPUTS
 from agents.symptom_agents import REQUIRED_SYMPTOM_INPUTS
+from services.data_quality import build_time_cadence_df
 
 from config import (
     CLEANING_RULES,
@@ -48,6 +49,7 @@ from ui.layout import (
 )
 
 from ui.sidebar import (
+    apply_loaded_dashboard_state_early,
     build_activity_validation_df,
     build_agent_cfg_from_controls,
     build_manual_review_df,
@@ -56,13 +58,14 @@ from ui.sidebar import (
     render_agent_controls,
     render_agent_review_outputs,
     render_parameter_range_controls,
+    render_review_loader_before_well_selector,
     render_time_filter,
     render_track_parameter_selector,
     render_well_section_selector,
 )
 
 from ui.styles import apply_global_styles
-from utils.helpers import compute_section_ranges
+from utils.helpers import compute_section_ranges, get_target_points
 from visualization.chart_builder import create_multi_track_chart
 
 from services.undo_service import (
@@ -85,8 +88,11 @@ def main():
         st.stop()
 
     sections_by_well = build_sections_by_well(catalog)
-    selected_well, selected_sections = render_well_section_selector(sections_by_well)
 
+    loaded_review_payload = render_review_loader_before_well_selector()
+
+    selected_well, selected_sections = render_well_section_selector(sections_by_well)
+    
     if not selected_sections:
         st.warning("Please select at least one section from the sidebar.")
         st.stop()
@@ -94,6 +100,18 @@ def main():
     selected_sections = tuple(sorted(selected_sections, key=float))
     context_key = make_context_key(selected_well, selected_sections)
 
+    if loaded_review_payload is not None:
+        restore_done_key = f"_loaded_review_restored_done_{context_key}"
+        pending_payload_key = f"_pending_loaded_review_payload_{context_key}"
+
+        if not st.session_state.get(restore_done_key, False):
+            st.session_state[pending_payload_key] = loaded_review_payload
+
+            apply_loaded_dashboard_state_early(
+                uploaded_data=loaded_review_payload,
+                context_key=context_key,
+            )
+    
     discovered_params = get_available_numeric_columns(selected_well, selected_sections)
 
     context_parameter_aliases = build_context_parameter_aliases(
@@ -190,6 +208,30 @@ def main():
     if df.empty:
         st.error("No data loaded. Check the parquet files in the data folder.")
         st.stop()
+
+    with st.expander("Time sampling diagnostics — raw loaded data", expanded=True):
+        st.caption(
+            "This table shows the real timestamp spacing in the loaded data. "
+            "Use it to check whether the source data is seconds-sampled or minute-sampled."
+        )
+
+        cadence_df = build_time_cadence_df(df)
+        st.dataframe(cadence_df, width="stretch")
+
+        if not cadence_df.empty:
+            median_steps = pd.to_numeric(cadence_df["Median step sec"], errors="coerce")
+            worst_median_step = median_steps.max()
+
+            if pd.notna(worst_median_step) and worst_median_step > 30.0:
+                st.warning(
+                    "The selected data appears to be low-frequency or minute-range sampled. "
+                    "Fast symptoms such as TRQErratic may not be detectable from this data."
+                )
+            else:
+                st.success(
+                    "The selected data is not minute-range sampled based on the median timestamp step. "
+                    "If the chart still looks sparse, it is probably a plotting scale/downsampling issue."
+                )
 
     context_cleaning_rules = build_context_cleaning_rules(
         selected_well=selected_well,
@@ -293,6 +335,26 @@ def main():
         st.warning("No data available in the selected time range.")
         st.stop()
 
+    with st.expander("Time sampling diagnostics — selected time window", expanded=True):
+        selected_cadence_df = build_time_cadence_df(df)
+        st.dataframe(selected_cadence_df, width="stretch")
+
+        chart_point_limit = get_target_points(zoom_percent)
+
+        st.caption(
+            f"Selected window contains {len(df):,} raw rows. "
+            f"Current chart target is about {chart_point_limit:,} points per curve."
+        )
+
+        if len(df) > chart_point_limit:
+            approx_step = max(1, len(df) // chart_point_limit)
+            st.warning(
+                f"The chart is visually downsampled because the selected window has more rows "
+                f"than the plotting target. Roughly every {approx_step}th row may be shown per curve. "
+                "Use a shorter precise time window to inspect second-by-second drilling behavior. "
+                "The activity/symptom agents still run on the filtered dataframe, not on the displayed points."
+            )
+
     # Create sidebar containers in the visual order we want.
     # Track 4 will appear before the agent settings, even though the
     # agent settings are read first internally.
@@ -336,6 +398,8 @@ def main():
         agent_cfg=agent_cfg,
         context_key=context_key,
         parent=review_controls_container,
+        selected_well=selected_well,
+        selected_sections=selected_sections,
     )
 
     render_dashboard_header(

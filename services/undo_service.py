@@ -56,7 +56,9 @@ def _should_track_key(key: str) -> bool:
     Track dashboard/sidebar choices, but ignore undo internals,
     one-click buttons, downloads, uploads, and chart reset controls.
     """
-    if key.startswith("_undo_"):
+    # Do not track internal app/session machinery.
+    # Only user-facing widget state should be undoable.
+    if key.startswith("_"):
         return False
 
     ignored_fragments = [

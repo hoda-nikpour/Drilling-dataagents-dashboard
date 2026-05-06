@@ -29,7 +29,16 @@ def create_multi_track_chart(
     marker_display: str = "Lines only",
     curve_source: str = "Raw values",
 ) -> go.Figure:
-    
+    """
+    Build the four-track mud logging chart.
+
+    Important UI decision:
+    - Plotly spike lines are disabled.
+    - The single continuous cross-track hover/reference line is handled by
+      ui/layout.py as one HTML overlay line.
+    - This prevents the ugly separated spike lines inside each individual track.
+    """
+
     subplot_titles = ["Track 1", "Track 2", "Track 3", "Track 4"]
 
     fig = make_subplots(
@@ -42,15 +51,18 @@ def create_multi_track_chart(
 
     mode, marker_size = get_display_mode(marker_display)
     target_points = get_target_points(zoom_percent)
-    parameter_trace_indices = []
+    parameter_trace_indices: list[int] = []
 
     t_min_view = df.index.min() if not df.empty else None
     t_max_view = df.index.max() if not df.empty else None
 
+    # ------------------------------------------------------------
+    # Tracks 1–3: drilling curves
+    # ------------------------------------------------------------
     for track_idx in range(3):
-        params = track_params[track_idx]
-        labels = track_param_labels[track_idx]
-        colors = track_colors[track_idx]
+        params = track_params[track_idx] if track_idx < len(track_params) else []
+        labels = track_param_labels[track_idx] if track_idx < len(track_param_labels) else []
+        colors = track_colors[track_idx] if track_idx < len(track_colors) else []
 
         _add_track_scale_guides(fig, track_idx)
 
@@ -90,7 +102,7 @@ def create_multi_track_chart(
                 + "Value: %{customdata[0]:.1f}"
                 + (f" {unit}" if unit else "")
                 + "<br>"
-                + "Time: %{y|%H:%M:%S}"
+                + "Time: %{y|%Y-%m-%d %H:%M:%S}"
                 + "<extra></extra>"
             )
 
@@ -101,7 +113,10 @@ def create_multi_track_chart(
                     mode=mode,
                     name=f"Track {track_idx + 1} - {label}",
                     showlegend=False,
-                    line=dict(color=color, width=1.25),
+                    line=dict(
+                        color=color,
+                        width=1.25,
+                    ),
                     marker=dict(
                         size=marker_size,
                         color=color,
@@ -146,19 +161,39 @@ def create_multi_track_chart(
             side="top",
             tickmode="array",
             tickvals=[i / 20 for i in range(21)],
+            fixedrange=False,
         )
 
+    # ------------------------------------------------------------
+    # Track 4: tagger / overlap / agent lane
+    # ------------------------------------------------------------
     if agent_cfg:
         _add_agent_track(fig, agent_cfg, row=1, col=4)
+    else:
+        fig.update_xaxes(
+            row=1,
+            col=4,
+            range=[0, 1],
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            side="top",
+            title_text="",
+            fixedrange=False,
+        )
 
+    # ------------------------------------------------------------
+    # Section boundary overlays
+    # ------------------------------------------------------------
     if section_ranges and t_min_view is not None and t_max_view is not None:
         _add_section_boundaries(fig, section_ranges, t_min_view, t_max_view)
 
-    if agent_cfg and agent_cfg.get("show_reference_line") and agent_cfg.get("reference_time") is not None:
-        _add_reference_line(fig, agent_cfg["reference_time"])
-
+    # ------------------------------------------------------------
+    # Shared time axis
+    # ------------------------------------------------------------
     y_range = None
     if t_min_view is not None and t_max_view is not None:
+        # Newest time at the top, oldest at the bottom.
         y_range = [t_max_view, t_min_view]
 
     tickvals, ticktext = _build_dual_time_ticks(
@@ -177,16 +212,17 @@ def create_multi_track_chart(
         tickvals=tickvals,
         ticktext=ticktext,
         tickfont=dict(size=10, family="Courier New"),
+        fixedrange=False,
 
-        # Cursor-attached horizontal reference line.
-        # This lets the reviewer see the same timestamp across all 4 tracks.
-        showspikes=True,
-        spikemode="across",
-        spikesnap="cursor",
-        spikecolor="rgba(60,60,60,0.55)",
-        spikethickness=1,
-        spikedash="solid",
+        # Critical:
+        # Do NOT use Plotly spikes.
+        # Plotly creates one spike per subplot, which is exactly the separated-line
+        # problem you are seeing.
+        showspikes=False,
     )
+
+    # Force all four subplot y-axes to stay synchronized.
+    fig.update_yaxes(matches="y")
 
     fig.add_annotation(
         xref="paper",
@@ -203,18 +239,22 @@ def create_multi_track_chart(
         height=chart_height,
         margin=dict(l=120, r=20, t=145, b=320),
 
-        # Keeps normal point hover, but also allows the horizontal spike line.
+        # Keep normal point hover. The continuous horizontal line is not Plotly;
+        # it is drawn once in layout.py as an HTML overlay.
         hovermode="closest",
 
-        # Helps Plotly keep spike lines responsive near the cursor.
-        spikedistance=-1,
-        hoverdistance=30,
+        # Do not set spikedistance here.
+        # Do not set hoverdistance here.
+        # They are only useful for Plotly spikes, which are intentionally disabled.
 
         plot_bgcolor="white",
         paper_bgcolor="white",
         uirevision="keep_zoom_state",
     )
 
+    # ------------------------------------------------------------
+    # Curve display buttons
+    # ------------------------------------------------------------
     if parameter_trace_indices:
         fig.update_layout(
             updatemenus=[
@@ -272,6 +312,20 @@ def create_multi_track_chart(
                     ],
                 )
             ]
+        )
+
+    # ------------------------------------------------------------
+    # Optional fixed manual reference line
+    # This is different from the hover line. It is user-controlled from sidebar.
+    # ------------------------------------------------------------
+    if (
+        agent_cfg
+        and agent_cfg.get("show_reference_line")
+        and agent_cfg.get("reference_time") is not None
+    ):
+        _add_reference_line(
+            fig=fig,
+            reference_time=agent_cfg["reference_time"],
         )
 
     return fig

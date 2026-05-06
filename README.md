@@ -9,8 +9,10 @@
 
 3. After installing all libraries type below command in Terminal(cmd):
     `streamlit run app.py`
+    `python -m compileall .`
 
     you should se something like this (which is showing that the project is running in local host):
+    
    
     `You can now view your Streamlit app in your browser.`
     `Local URL: http://localhost:8501`

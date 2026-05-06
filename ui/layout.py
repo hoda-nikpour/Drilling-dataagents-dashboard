@@ -1,9 +1,6 @@
-import pandas as pd
-import streamlit as st
-
-import json
 import uuid
 
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -58,24 +55,20 @@ def render_result_tables(
     # The underlying review_df logic is still preserved in app.py.
 
 
-
 def render_chart(fig, chart_key: str):
     """
-    Render Plotly chart with controlled zoom tools.
+    Render Plotly chart with controlled zoom tools and one custom cross-track
+    horizontal hover line.
 
-    Zoom tools:
-    - X zoom: only horizontal zoom is allowed.
-    - Y zoom: only vertical/time zoom is allowed.
-    - XY zoom: normal rectangle zoom on both axes.
-
-    Removed from Plotly modebar:
-    - Default magnifier
-    - Plus zoom
-    - Minus zoom
-    - Lasso/select
+    Important:
+    - The Plotly chart is rendered exactly once.
+    - The horizontal hover line is a single HTML overlay, not one Plotly spike
+      line per subplot/track.
     """
 
     div_id = f"plotly_chart_{uuid.uuid4().hex}"
+    wrapper_id = f"plot_wrapper_{div_id}"
+    hover_line_id = f"single_hover_line_{div_id}"
 
     config = {
         "displaylogo": False,
@@ -87,12 +80,9 @@ def render_chart(fig, chart_key: str):
         "doubleClick": False,
 
         "modeBarButtonsToRemove": [
-            # Remove default zoom/magnifier and plus/minus zoom.
             "zoom2d",
             "zoomIn2d",
             "zoomOut2d",
-
-            # Keep the toolbar clean.
             "lasso2d",
             "select2d",
         ],
@@ -199,11 +189,27 @@ def render_chart(fig, chart_key: str):
             Double-click inside the chart = Undo chart zoom.
         </div>
 
-        {plot_html}
+        <div id="{wrapper_id}" style="position: relative;">
+            {plot_html}
+
+            <div id="{hover_line_id}" style="
+                position: absolute;
+                display: none;
+                height: 2px;
+                background: rgba(40, 40, 40, 0.75);
+                pointer-events: none;
+                z-index: 9999;
+                left: 0;
+                top: 0;
+                width: 100%;
+            "></div>
+        </div>
     </div>
 
     <script>
     const gd_{div_id} = document.getElementById("{div_id}");
+    const wrapper_{div_id} = document.getElementById("{wrapper_id}");
+    const singleHoverLine_{div_id} = document.getElementById("{hover_line_id}");
 
     const undoBtn_{div_id} = document.getElementById("undo_zoom_btn_{div_id}");
     const resetBtn_{div_id} = document.getElementById("reset_zoom_btn_{div_id}");
@@ -437,8 +443,7 @@ def render_chart(fig, chart_key: str):
     setTimeout(function() {{
         captureInitialRangesOnce_{div_id}();
 
-        // Default mode: vertical/time zoom, because this dashboard is mainly
-        // used to inspect short time intervals.
+        // Default mode: vertical/time zoom.
         setZoomMode_{div_id}("y");
         setZoomButtonStyle_{div_id}(zoomYBtn_{div_id});
     }}, 500);
@@ -483,12 +488,74 @@ def render_chart(fig, chart_key: str):
         return false;
     }});
 
+    function showSingleHoverLine_{div_id}(yValue) {{
+        const fullLayout = gd_{div_id}._fullLayout;
+
+        if (!fullLayout || !fullLayout.yaxis || !fullLayout._size) {{
+            return;
+        }}
+
+        const yAxis = fullLayout.yaxis;
+        const size = fullLayout._size;
+
+        let yPixel = null;
+
+        try {{
+            yPixel = yAxis.d2p(yValue);
+        }} catch (e) {{
+            try {{
+                yPixel = yAxis.d2p(new Date(yValue));
+            }} catch (e2) {{
+                yPixel = null;
+            }}
+        }}
+
+        if (yPixel === null || isNaN(yPixel)) {{
+            return;
+        }}
+
+        const top = size.t + yPixel;
+
+        singleHoverLine_{div_id}.style.left = size.l + "px";
+        singleHoverLine_{div_id}.style.width = size.w + "px";
+        singleHoverLine_{div_id}.style.top = top + "px";
+        singleHoverLine_{div_id}.style.display = "block";
+    }}
+
+    function hideSingleHoverLine_{div_id}() {{
+        singleHoverLine_{div_id}.style.display = "none";
+    }}
+
+    gd_{div_id}.on("plotly_hover", function(eventData) {{
+        if (!eventData || !eventData.points || eventData.points.length === 0) {{
+            return;
+        }}
+
+        const point = eventData.points[0];
+
+        if (point && point.y !== undefined && point.y !== null) {{
+            showSingleHoverLine_{div_id}(point.y);
+        }}
+    }});
+
+    gd_{div_id}.on("plotly_unhover", function() {{
+        hideSingleHoverLine_{div_id}();
+    }});
+
+    gd_{div_id}.addEventListener("mouseleave", function() {{
+        hideSingleHoverLine_{div_id}();
+    }});
+
+    wrapper_{div_id}.addEventListener("mouseleave", function() {{
+        hideSingleHoverLine_{div_id}();
+    }});
+
     updateHistoryText_{div_id}();
     </script>
     """
 
     components.html(
         html,
-        height=chart_height + 120,
+        height=chart_height + 140,
         scrolling=True,
     )

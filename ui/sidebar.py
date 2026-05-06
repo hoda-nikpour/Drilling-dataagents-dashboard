@@ -150,30 +150,268 @@ def _build_activity_validation_summary(
     }
 
 
+def _json_safe_text(value):
+    """
+    Convert values to JSON-safe text.
+    Handles datetime/Timestamp/NaT/None safely.
+    """
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    try:
+        if isinstance(value, (pd.Timestamp,)):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    try:
+        ts = pd.Timestamp(value)
+        if not pd.isna(ts):
+            return ts.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    return str(value)
+
+def _json_safe_value(value):
+    """
+    Convert Streamlit session_state values into JSON-safe values.
+    Handles datetime, Timestamp, tuples, lists, dicts, and simple scalars.
+    """
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        if hasattr(value, "strftime"):
+            return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    if isinstance(value, tuple):
+        return [_json_safe_value(x) for x in value]
+
+    if isinstance(value, list):
+        return [_json_safe_value(x) for x in value]
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)
+
+
+def _build_full_dashboard_state(context_key: str) -> dict:
+    """
+    Save all small dashboard/session values for this selected well/section context.
+
+    This intentionally saves the widget keys themselves. That makes restore robust:
+    when the JSON is loaded, the exact same Streamlit widget keys are put back into
+    st.session_state before the widgets are created.
+
+    Important:
+    Internal keys beginning with "_" are never saved. Those keys are app-control
+    flags, not dashboard settings, and saving them can cause restore/rerun loops.
+    """
+    ignored_fragments = [
+        "download_",
+        "upload",
+        "FormSubmitter",
+        "_undo_",
+    ]
+
+    state = {}
+
+    for key, value in st.session_state.items():
+        key = str(key)
+
+        if key.startswith("_"):
+            continue
+
+        if any(fragment in key for fragment in ignored_fragments):
+            continue
+
+        keep = (
+            key == "selected_well"
+            or key.startswith("selected_sections_")
+            or key.endswith(f"_{context_key}")
+            or f"_{context_key}_" in key
+        )
+
+        if not keep:
+            continue
+
+        try:
+            state[key] = _json_safe_value(value)
+        except Exception:
+            pass
+
+    return state
+
+def _is_early_dashboard_key(key: str, context_key: str) -> bool:
+    """
+    These widgets are created before render_agent_controls().
+    They must only be restored by apply_loaded_dashboard_state_early(),
+    not later inside _apply_loaded_review_to_state().
+    """
+    early_prefixes = [
+        "track_params_",
+        "max_override_",
+        "curve_source_",
+        "exact_time_start_",
+        "exact_time_end_",
+        "time_filter_data_signature_",
+    ]
+
+    if not key.endswith(f"_{context_key}") and f"_{context_key}_" not in key:
+        return False
+
+    return any(key.startswith(prefix) for prefix in early_prefixes)
+
+def _restore_full_dashboard_state(uploaded_data: dict, context_key: str, t_min=None, t_max=None):
+    """
+    Restore saved widget/session values from JSON.
+
+    Important:
+    Early widgets such as track_params, curve_source, and exact_time fields
+    are restored before those widgets are created by apply_loaded_dashboard_state_early().
+    This function runs later, so it must skip those early keys.
+    """
+    dashboard_state = uploaded_data.get("dashboard_state", {}) or {}
+    widget_state = dashboard_state.get("widget_state", {}) or {}
+
+    min_ts = pd.Timestamp(t_min) if t_min is not None else None
+    max_ts = pd.Timestamp(t_max) if t_max is not None else None
+
+    def _maybe_datetime(value):
+        try:
+            ts = pd.Timestamp(value)
+            if pd.isna(ts):
+                return value
+
+            if min_ts is not None and max_ts is not None:
+                ts = _clamp_timestamp(ts, min_ts, max_ts)
+
+            return ts.to_pydatetime()
+        except Exception:
+            return value
+
+    def _safe_set(key: str, value):
+        """
+        Streamlit raises if a widget key is modified after the widget exists.
+        If that happens, skip it instead of crashing the dashboard.
+        """
+        try:
+            st.session_state[key] = value
+        except Exception:
+            pass
+
+    for key, value in widget_state.items():
+        key = str(key)
+
+        # Critical:
+        # Old saved JSON files may contain internal restore flags/pending payloads.
+        # Restoring those causes an infinite rerun loop.
+        if key.startswith("_"):
+            continue
+
+        if "upload" in key or "download_" in key or "FormSubmitter" in key:
+            continue
+
+        # Critical fix:
+        # These keys have already been handled before their widgets were created.
+        # Do not restore them again here.
+        if _is_early_dashboard_key(key, context_key):
+            continue
+
+        if key.startswith("agent_interval_") and isinstance(value, list) and len(value) == 2:
+            start_ts = _maybe_datetime(value[0])
+            end_ts = _maybe_datetime(value[1])
+
+            try:
+                if pd.Timestamp(end_ts) > pd.Timestamp(start_ts):
+                    _safe_set(key, (start_ts, end_ts))
+            except Exception:
+                pass
+
+            continue
+
+        if key.startswith("reference_time_"):
+            _safe_set(key, _maybe_datetime(value))
+            continue
+
+        if (
+            key.startswith("tag_start_")
+            or key.startswith("tag_end_")
+            or key.startswith("activity_tag_start_")
+            or key.startswith("activity_tag_end_")
+        ):
+            parsed = _parse_uploaded_datetime(value)
+            if not pd.isna(parsed):
+                if min_ts is not None and max_ts is not None:
+                    parsed = _clamp_timestamp(parsed, min_ts, max_ts)
+                _safe_set(key, _format_datetime_text(parsed))
+            else:
+                _safe_set(key, str(value))
+            continue
+
+        _safe_set(key, value)
+
 def _build_export_payload(
     tag_intervals: list[dict],
     agent_intervals: list[dict],
     summary: dict,
     manual_activity_tags: list[dict] | None = None,
     activity_validation_summary: dict | None = None,
+    selected_well: str | None = None,
+    selected_sections: tuple[str, ...] | list[str] | None = None,
+    context_key: str | None = None,
 ) -> tuple[str, str]:
     manual_activity_tags = manual_activity_tags or []
     activity_validation_summary = activity_validation_summary or {}
 
+    dashboard_state = {
+        "schema_version": 2,
+        "save_type": "full_dashboard_restore",
+        "widget_state": _build_full_dashboard_state(context_key=context_key),
+    }
+
     payload = {
+        "dashboard_context": {
+            "selected_well": selected_well,
+            "selected_sections": [str(x) for x in (selected_sections or [])],
+            "context_key": context_key,
+        },
+        "dashboard_state": dashboard_state,
         "tag_intervals": [
             {
-                "label": x["label"],
-                "start": str(x["start"]),
-                "end": str(x["end"]),
+                "label": str(x.get("label", "")),
+                "start": _json_safe_text(x.get("start")),
+                "end": _json_safe_text(x.get("end")),
             }
             for x in tag_intervals
         ],
         "agent_intervals": [
             {
-                "label": x["label"],
-                "start": str(x["start"]),
-                "end": str(x["end"]),
+                "label": str(x.get("label", "")),
+                "start": _json_safe_text(x.get("start")),
+                "end": _json_safe_text(x.get("end")),
                 "severity": x.get("severity"),
                 "source": x.get("source"),
             }
@@ -181,27 +419,34 @@ def _build_export_payload(
         ],
         "manual_activity_tags": [
             {
-                "label": x["label"],
-                "start": str(x["start"]),
-                "end": str(x["end"]),
+                "label": str(x.get("label", "")),
+                "start": _json_safe_text(x.get("start")),
+                "end": _json_safe_text(x.get("end")),
             }
             for x in manual_activity_tags
         ],
         "summary": {
-            "tag_count": summary["tag_count"],
-            "agent_count": summary["agent_count"],
-            "overlap_count": summary["overlap_count"],
-            "score_percent": round(summary["score_percent"], 1),
-            "acceptance_threshold_percent": summary["acceptance_threshold_percent"],
-            "accepted": summary["accepted"],
+            "tag_count": int(summary.get("tag_count", 0)),
+            "agent_count": int(summary.get("agent_count", 0)),
+            "overlap_count": int(summary.get("overlap_count", 0)),
+            "score_percent": round(float(summary.get("score_percent", 0.0)), 1),
+            "acceptance_threshold_percent": float(
+                summary.get("acceptance_threshold_percent", ACCEPTANCE_THRESHOLD_PERCENT)
+            ),
+            "accepted": bool(summary.get("accepted", False)),
         },
         "activity_validation_summary": {
-            "tag_count": activity_validation_summary.get("tag_count", 0),
-            "matched_count": activity_validation_summary.get("matched_count", 0),
-            "score_percent": round(activity_validation_summary.get("score_percent", 0.0), 1),
-            "min_overlap_percent": activity_validation_summary.get(
-                "min_overlap_percent",
-                ACTIVITY_VALIDATION_MIN_OVERLAP_PERCENT,
+            "tag_count": int(activity_validation_summary.get("tag_count", 0)),
+            "matched_count": int(activity_validation_summary.get("matched_count", 0)),
+            "score_percent": round(
+                float(activity_validation_summary.get("score_percent", 0.0)),
+                1,
+            ),
+            "min_overlap_percent": float(
+                activity_validation_summary.get(
+                    "min_overlap_percent",
+                    ACTIVITY_VALIDATION_MIN_OVERLAP_PERCENT,
+                )
             ),
         },
     }
@@ -213,15 +458,24 @@ def _build_export_payload(
     writer.writerow(["type", "label", "start", "end", "severity", "source"])
 
     for item in tag_intervals:
-        writer.writerow(["tag", item["label"], item["start"], item["end"], "", "manual"])
+        writer.writerow(
+            [
+                "tag",
+                item.get("label", ""),
+                _json_safe_text(item.get("start")),
+                _json_safe_text(item.get("end")),
+                "",
+                "manual",
+            ]
+        )
 
     for item in agent_intervals:
         writer.writerow(
             [
                 "agent",
-                item["label"],
-                item["start"],
-                item["end"],
+                item.get("label", ""),
+                _json_safe_text(item.get("start")),
+                _json_safe_text(item.get("end")),
                 item.get("severity", ""),
                 item.get("source", ""),
             ]
@@ -231,9 +485,9 @@ def _build_export_payload(
         writer.writerow(
             [
                 "activity_tag",
-                item["label"],
-                item["start"],
-                item["end"],
+                item.get("label", ""),
+                _json_safe_text(item.get("start")),
+                _json_safe_text(item.get("end")),
                 "",
                 "manual_activity_validation",
             ]
@@ -241,64 +495,332 @@ def _build_export_payload(
 
     return json_text, output.getvalue()
 
+def _format_datetime_text(value) -> str:
+    """
+    Convert datetime-like values to the exact string format used by text_input.
+    """
+    return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
-def _apply_loaded_review_to_state(uploaded_data: dict, context_key: str):
+
+def _clamp_timestamp(value, min_value, max_value):
+    """
+    Clamp datetime-like value into the available dataframe time range.
+    """
+    ts = pd.Timestamp(value)
+    min_ts = pd.Timestamp(min_value)
+    max_ts = pd.Timestamp(max_value)
+
+    if pd.isna(ts):
+        return min_ts
+
+    if ts < min_ts:
+        return min_ts
+
+    if ts > max_ts:
+        return max_ts
+
+    return ts
+
+
+def _safe_slider_interval_state(
+    key: str,
+    min_value,
+    max_value,
+    default_start=None,
+    default_end=None,
+):
+    """
+    Repair a datetime range slider session_state value before creating st.slider.
+
+    Streamlit crashes if an existing slider state is outside min_value/max_value.
+    This function clamps stale uploaded/restored values before the widget is created.
+    """
+    min_ts = pd.Timestamp(min_value)
+    max_ts = pd.Timestamp(max_value)
+
+    if default_start is None:
+        default_start = min_ts
+
+    if default_end is None:
+        default_end = max_ts
+
+    default_start = _clamp_timestamp(default_start, min_ts, max_ts)
+    default_end = _clamp_timestamp(default_end, min_ts, max_ts)
+
+    if default_end <= default_start:
+        default_start = min_ts
+        default_end = max_ts
+
+    current = st.session_state.get(key, (default_start.to_pydatetime(), default_end.to_pydatetime()))
+
+    try:
+        if isinstance(current, (list, tuple)) and len(current) == 2:
+            start_ts = _clamp_timestamp(current[0], min_ts, max_ts)
+            end_ts = _clamp_timestamp(current[1], min_ts, max_ts)
+        else:
+            start_ts = default_start
+            end_ts = default_end
+    except Exception:
+        start_ts = default_start
+        end_ts = default_end
+
+    if end_ts <= start_ts:
+        start_ts = min_ts
+        end_ts = max_ts
+
+    st.session_state[key] = (
+        start_ts.to_pydatetime(),
+        end_ts.to_pydatetime(),
+    )
+
+    return st.session_state[key]
+
+def _parse_uploaded_datetime(value, fallback=None):
+    """
+    Safely parse datetime values from uploaded JSON.
+    """
+    try:
+        parsed = pd.to_datetime(value, errors="raise")
+        if pd.isna(parsed):
+            raise ValueError("Parsed datetime is NaT")
+        return parsed
+    except Exception:
+        if fallback is not None:
+            return pd.Timestamp(fallback)
+        return pd.NaT
+
+
+def _safe_uploaded_label(value, fallback: str) -> str:
+    """
+    Make sure labels restored into text_input are always strings.
+    """
+    if value is None:
+        return fallback
+
+    text = str(value).strip()
+    return text if text else fallback
+
+def _apply_loaded_review_to_state(
+    uploaded_data: dict,
+    context_key: str,
+    t_min=None,
+    t_max=None,
+):
+    """
+    Load saved review JSON into Streamlit widget state.
+
+    Rules:
+    - text_input datetime keys receive strings.
+    - slider interval keys receive tuple(datetime, datetime).
+    - uploaded times are clamped to the current available data range when t_min/t_max are supplied.
+    """
+
+    min_ts = pd.Timestamp(t_min) if t_min is not None else None
+    max_ts = pd.Timestamp(t_max) if t_max is not None else None
+
+    # First restore the full dashboard widget state if this is a new full-save JSON.
+    # Then the older tag/agent restore code below acts as backward compatibility.
+    _restore_full_dashboard_state(
+        uploaded_data=uploaded_data,
+        context_key=context_key,
+        t_min=t_min,
+        t_max=t_max,
+    )
+
+    def _maybe_clamp(ts):
+        if pd.isna(ts):
+            return ts
+        if min_ts is not None and max_ts is not None:
+            return _clamp_timestamp(ts, min_ts, max_ts)
+        return pd.Timestamp(ts)
+
+    def _valid_order(start_ts, end_ts):
+        return not pd.isna(start_ts) and not pd.isna(end_ts) and pd.Timestamp(end_ts) > pd.Timestamp(start_ts)
+
     for i in range(1, 4):
         st.session_state[f"enable_tag_{i}_{context_key}"] = False
         st.session_state[f"enable_activity_tag_{i}_{context_key}"] = False
 
     st.session_state[f"enable_agent_1_{context_key}"] = False
 
+    # ------------------------------------------------------------
+    # Normal tagger lane: text_input start/end keys need strings.
+    # ------------------------------------------------------------
     for i, tag in enumerate(uploaded_data.get("tag_intervals", [])[:3], start=1):
+        start_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("start")))
+        end_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("end")))
+
+        if not _valid_order(start_ts, end_ts):
+            continue
+
         st.session_state[f"enable_tag_{i}_{context_key}"] = True
-        st.session_state[f"tag_label_{i}_{context_key}"] = tag.get("label", f"Observation {i}")
-
-        st.session_state[f"tag_start_{i}_{context_key}"] = (
-            pd.to_datetime(tag["start"]).to_pydatetime()
-        )
-        st.session_state[f"tag_end_{i}_{context_key}"] = (
-            pd.to_datetime(tag["end"]).to_pydatetime()
+        st.session_state[f"tag_label_{i}_{context_key}"] = _safe_uploaded_label(
+            tag.get("label"),
+            f"Observation {i}",
         )
 
+        st.session_state[f"tag_start_{i}_{context_key}"] = _format_datetime_text(start_ts)
+        st.session_state[f"tag_end_{i}_{context_key}"] = _format_datetime_text(end_ts)
+
+    # ------------------------------------------------------------
+    # Manual activity validation tags: text_input start/end keys need strings.
+    # ------------------------------------------------------------
     for i, tag in enumerate(uploaded_data.get("manual_activity_tags", [])[:3], start=1):
+        start_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("start")))
+        end_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("end")))
+
+        if not _valid_order(start_ts, end_ts):
+            continue
+
         st.session_state[f"enable_activity_tag_{i}_{context_key}"] = True
-        st.session_state[f"activity_tag_label_{i}_{context_key}"] = tag.get("label", "Drilling")
-        st.session_state[f"activity_tag_interval_{i}_{context_key}"] = (
-            pd.to_datetime(tag["start"]).to_pydatetime(),
-            pd.to_datetime(tag["end"]).to_pydatetime(),
+        st.session_state[f"activity_tag_label_{i}_{context_key}"] = _safe_uploaded_label(
+            tag.get("label"),
+            "Drilling",
         )
 
+        st.session_state[f"activity_tag_start_{i}_{context_key}"] = _format_datetime_text(start_ts)
+        st.session_state[f"activity_tag_end_{i}_{context_key}"] = _format_datetime_text(end_ts)
+
+        old_interval_key = f"activity_tag_interval_{i}_{context_key}"
+        if old_interval_key in st.session_state:
+            try:
+                del st.session_state[old_interval_key]
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------
+    # Manual agent interval: slider interval key needs tuple(datetime, datetime).
+    # Clamp it so Streamlit slider cannot crash.
+    # ------------------------------------------------------------
     loaded_agents = uploaded_data.get("agent_intervals", [])
+
     if loaded_agents:
         agent = loaded_agents[0]
-        st.session_state[f"enable_agent_1_{context_key}"] = True
-        st.session_state[f"agent_label_1_{context_key}"] = agent.get("label", "Hit 1")
-        st.session_state[f"agent_interval_1_{context_key}"] = (
-            pd.to_datetime(agent["start"]).to_pydatetime(),
-            pd.to_datetime(agent["end"]).to_pydatetime(),
+
+        start_ts = _maybe_clamp(_parse_uploaded_datetime(agent.get("start")))
+        end_ts = _maybe_clamp(_parse_uploaded_datetime(agent.get("end")))
+
+        if _valid_order(start_ts, end_ts):
+            st.session_state[f"enable_agent_1_{context_key}"] = True
+            st.session_state[f"agent_label_1_{context_key}"] = _safe_uploaded_label(
+                agent.get("label"),
+                "Hit 1",
+            )
+            st.session_state[f"agent_interval_1_{context_key}"] = (
+                start_ts.to_pydatetime(),
+                end_ts.to_pydatetime(),
+            )
+
+            severity = agent.get("severity", "Medium")
+            if severity not in ["Low", "Medium", "High"]:
+                severity = "Medium"
+
+            st.session_state[f"agent_severity_1_{context_key}"] = severity
+
+def render_review_loader_before_well_selector() -> dict | None:
+    """
+    Load a saved review JSON before well/section selection.
+
+    This lets the app restore selected_well and selected_sections if the JSON
+    contains dashboard_context.
+
+    Important:
+    The uploaded payload is returned only once after the forced rerun.
+    Returning it on every rerun can repeatedly re-arm restore logic and create
+    a Streamlit rerun loop.
+    """
+    with st.sidebar:
+        st.subheader("Load Previous Review")
+
+        uploaded_review = st.file_uploader(
+            "Drag/drop saved review JSON here",
+            type=["json"],
+            key="review_upload_global_before_well",
         )
-        st.session_state[f"agent_severity_1_{context_key}"] = agent.get("severity", "Medium")
+
+        if uploaded_review is None:
+            return None
+
+        loaded_review_flag_key = f"_loaded_global_review_once_{uploaded_review.name}"
+        consumed_key = f"_loaded_global_review_consumed_{uploaded_review.name}"
+
+        # After the initial upload-triggered rerun, return the payload exactly once.
+        if st.session_state.get(loaded_review_flag_key, False):
+            if not st.session_state.get(consumed_key, False):
+                st.session_state[consumed_key] = True
+                return st.session_state.get("_loaded_review_payload_global")
+
+            return None
+
+        try:
+            uploaded_data = json.load(uploaded_review)
+
+            st.session_state["_loaded_review_payload_global"] = uploaded_data
+            st.session_state[loaded_review_flag_key] = True
+            st.session_state[consumed_key] = False
+
+            context = uploaded_data.get("dashboard_context", {})
+            selected_well = context.get("selected_well")
+            selected_sections = context.get("selected_sections", [])
+
+            if selected_well:
+                st.session_state["selected_well"] = selected_well
+
+            if selected_well and selected_sections:
+                st.session_state[f"selected_sections_{selected_well}"] = [
+                    str(x) for x in selected_sections
+                ]
+
+            st.success("Saved review JSON loaded.")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not read saved review JSON: {e}")
+            return None
+
+        return None
+    
 
 
 def render_well_section_selector(sections_by_well: dict):
     with st.sidebar:
         st.subheader("Well")
+
+        wells = sorted(sections_by_well.keys())
+
+        saved_well = st.session_state.get("selected_well")
+        if saved_well not in wells:
+            saved_well = wells[0] if wells else None
+            st.session_state["selected_well"] = saved_well
+
         selected_well = st.selectbox(
             "Select Well",
-            options=sorted(sections_by_well.keys()),
-            index=0,
+            options=wells,
+            index=wells.index(saved_well) if saved_well in wells else 0,
             key="selected_well",
         )
 
         available_sections = sorted(sections_by_well.get(selected_well, []), key=float)
 
+        section_key = f"selected_sections_{selected_well}"
+
+        existing_sections = st.session_state.get(section_key, [])
+        existing_sections = [
+            str(sec)
+            for sec in existing_sections
+            if str(sec) in available_sections
+        ]
+
+        if existing_sections:
+            st.session_state[section_key] = existing_sections
+
         st.subheader("Section")
         selected_sections = st.multiselect(
             "Select Section(s)",
             options=available_sections,
-            default=[],
+            default=existing_sections,
             format_func=lambda s: f'{s}"',
-            key=f"selected_sections_{selected_well}",
+            key=section_key,
         )
 
     return selected_well, selected_sections
@@ -396,9 +918,13 @@ def render_time_filter(df, context_key: str):
         # This must happen before the text_input widgets are created.
         if previous_data_signature != current_data_signature:
             st.session_state[data_signature_key] = current_data_signature
-            st.session_state[exact_start_key] = _format_dt(default_start)
-            st.session_state[exact_end_key] = _format_dt(default_end)
 
+            # Do not overwrite a restored JSON time filter.
+            if exact_start_key not in st.session_state:
+                st.session_state[exact_start_key] = _format_dt(default_start)
+
+            if exact_end_key not in st.session_state:
+                st.session_state[exact_end_key] = _format_dt(default_end)
         # Repair missing or empty widget state before creating widgets.
         if not str(st.session_state.get(exact_start_key, "")).strip():
             st.session_state[exact_start_key] = _format_dt(default_start)
@@ -544,23 +1070,42 @@ def _safe_datetime_input(
     Expected format:
     YYYY-MM-DD HH:mm:ss
 
-    Example:
-    2005-12-24 01:11:39
+    This version protects Streamlit text_input from bad session-state types.
+    text_input requires its widget state to be a string.
     """
-    current_value = st.session_state.get(key, default_value)
+
+    def _format_dt(value) -> str:
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+    default_ts = pd.Timestamp(default_value)
+    min_ts = pd.Timestamp(min_value)
+    max_ts = pd.Timestamp(max_value)
+
+    current_value = st.session_state.get(key, default_ts)
 
     try:
-        current_value = pd.Timestamp(current_value)
+        current_ts = pd.Timestamp(current_value)
     except Exception:
-        current_value = pd.Timestamp(default_value)
+        current_ts = default_ts
 
-    if (
-        current_value < pd.Timestamp(min_value)
-        or current_value > pd.Timestamp(max_value)
-    ):
-        current_value = pd.Timestamp(default_value)
+    if current_ts < min_ts or current_ts > max_ts or pd.isna(current_ts):
+        current_ts = default_ts
 
-    default_text = current_value.strftime("%Y-%m-%d %H:%M:%S")
+    default_text = _format_dt(current_ts)
+
+    # Critical repair:
+    # If this key already exists from old uploaded JSON logic as a datetime,
+    # convert it to string before creating st.text_input.
+    existing_value = st.session_state.get(key, default_text)
+
+    if not isinstance(existing_value, str):
+        try:
+            st.session_state[key] = _format_dt(existing_value)
+        except Exception:
+            st.session_state[key] = default_text
+
+    elif not existing_value.strip():
+        st.session_state[key] = default_text
 
     text_value = st.text_input(
         label,
@@ -570,20 +1115,24 @@ def _safe_datetime_input(
     )
 
     try:
-        parsed_value = pd.to_datetime(text_value, format="%Y-%m-%d %H:%M:%S")
+        parsed_value = pd.to_datetime(
+            str(text_value).strip(),
+            format="%Y-%m-%d %H:%M:%S",
+            errors="raise",
+        )
     except Exception:
         st.error(
             f"Invalid datetime for '{label}'. Please use format YYYY-MM-DD HH:mm:ss."
         )
-        return current_value.to_pydatetime()
+        return current_ts.to_pydatetime()
 
-    if parsed_value < pd.Timestamp(min_value):
+    if parsed_value < min_ts:
         st.warning(f"{label} is before the available data range. Using minimum time.")
-        return pd.Timestamp(min_value).to_pydatetime()
+        return min_ts.to_pydatetime()
 
-    if parsed_value > pd.Timestamp(max_value):
+    if parsed_value > max_ts:
         st.warning(f"{label} is after the available data range. Using maximum time.")
-        return pd.Timestamp(max_value).to_pydatetime()
+        return max_ts.to_pydatetime()
 
     return parsed_value.to_pydatetime()
 
@@ -1648,6 +2197,22 @@ def render_agent_controls(
         t_min = df.index.min().to_pydatetime()
         t_max = df.index.max().to_pydatetime()
 
+        pending_payload_key = f"_pending_loaded_review_payload_{context_key}"
+
+        if pending_payload_key in st.session_state:
+            uploaded_data = st.session_state.pop(pending_payload_key)
+
+            _apply_loaded_review_to_state(
+                uploaded_data=uploaded_data,
+                context_key=context_key,
+                t_min=t_min,
+                t_max=t_max,
+            )
+
+            st.session_state[f"_loaded_review_restored_done_{context_key}"] = True
+
+            st.success("Saved review restored for this well/section.")
+
         review_mode = st.selectbox(
             "Review mode",
             options=["Standard review", "Stretched inspection"],
@@ -1656,23 +2221,17 @@ def render_agent_controls(
         )
         chart_height = 950 if review_mode == "Standard review" else 1400
 
-        uploaded_review = st.file_uploader(
-            "Load saved review JSON",
-            type=["json"],
-            key=f"review_upload_{context_key}",
-        )
-        if uploaded_review is not None:
-            try:
-                uploaded_data = json.load(uploaded_review)
-                _apply_loaded_review_to_state(uploaded_data, context_key)
-                st.success("Saved review loaded into the controls.")
-            except Exception:
-                st.error("Could not read the uploaded review JSON.")
 
         show_reference_line = st.checkbox(
             "Show cross-track reference line",
             value=False,
             key=f"show_reference_line_{context_key}",
+        )
+
+        st.caption(
+            "This adds a fixed horizontal line at one timestamp across Track 1, "
+            "Track 2, Track 3, and Track 4. Use it to compare all curves and agent "
+            "events at the same time."
         )
 
         reference_time = None
@@ -1682,7 +2241,7 @@ def render_agent_controls(
                 min_value=t_min,
                 max_value=t_max,
                 value=t_min,
-                format="YYYY-MM-DD HH:mm",
+                format="YYYY-MM-DD HH:mm:ss",
                 key=f"reference_time_{context_key}",
             )
         tag_intervals = []
@@ -1769,14 +2328,26 @@ def render_agent_controls(
                     key=f"agent_label_1_{context_key}",
                 )
 
+                agent_interval_key = f"agent_interval_1_{context_key}"
+
+                safe_agent_interval = _safe_slider_interval_state(
+                    key=agent_interval_key,
+                    min_value=t_min,
+                    max_value=t_max,
+                    default_start=t_min,
+                    default_end=t_max,
+                )
+
                 interval = st.slider(
                     "Agent Hit interval",
                     min_value=t_min,
                     max_value=t_max,
-                    value=(t_min, t_max),
-                    format="YYYY-MM-DD HH:mm",
-                    key=f"agent_interval_1_{context_key}",
+                    value=safe_agent_interval,
+                    format="YYYY-MM-DD HH:mm:ss",
+                    key=agent_interval_key,
                 )
+
+                
 
                 severity = st.selectbox(
                     "Agent Hit severity",
@@ -1998,10 +2569,63 @@ def build_trq_spike_evaluation_df(symptom_cfg: dict) -> pd.DataFrame:
 
     return out[columns].reset_index(drop=True)
 
+def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: str):
+    """
+    Restore widget state that must exist before early sidebar widgets render:
+    - track parameter selections
+    - parameter max overrides
+    - curve source
+    - time filter text fields
+
+    This prevents the app from stopping at 'Select parameters' after loading JSON.
+    """
+    if not uploaded_data:
+        return
+
+    dashboard_state = uploaded_data.get("dashboard_state", {}) or {}
+    widget_state = dashboard_state.get("widget_state", {}) or {}
+
+    if not widget_state:
+        return
+
+    early_prefixes = [
+        "track_params_",
+        "max_override_",
+        "curve_source_",
+        "exact_time_start_",
+        "exact_time_end_",
+        "time_filter_data_signature_",
+    ]
+
+    for key, value in widget_state.items():
+        key = str(key)
+
+        # Important:
+        # Never restore internal app/session keys from saved JSON.
+        # Old JSON files may contain _pending_loaded_review_payload_* or
+        # _loaded_review_restored_done_* keys, which can cause rerun loops.
+        if key.startswith("_"):
+            continue
+
+        if not key.endswith(f"_{context_key}") and f"_{context_key}_" not in key:
+            continue
+
+        if not any(key.startswith(prefix) for prefix in early_prefixes):
+            continue
+
+        # Text inputs need strings.
+        if key.startswith("exact_time_start_") or key.startswith("exact_time_end_"):
+            st.session_state[key] = str(value)
+        else:
+            st.session_state[key] = value
+
+
 def render_agent_review_outputs(
     agent_cfg: dict,
     context_key: str,
     parent=None,
+    selected_well: str | None = None,
+    selected_sections: tuple[str, ...] | list[str] | None = None,
 ):
     container = parent if parent is not None else st.sidebar
 
@@ -2045,10 +2669,13 @@ def render_agent_review_outputs(
             summary=summary,
             manual_activity_tags=manual_activity_tags,
             activity_validation_summary=activity_validation_summary,
+            selected_well=selected_well,
+            selected_sections=selected_sections,
+            context_key=context_key,
         )
 
         st.download_button(
-            "Export tags/hits as JSON",
+            "Save full dashboard as JSON",
             data=json_text,
             file_name=f"tag_review_{context_key}.json",
             mime="application/json",
