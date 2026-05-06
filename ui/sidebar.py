@@ -10,6 +10,8 @@ from agents.activity_agents import ActivityConfig
 from agents.activity_support import interval_overlap, overlap_ratio
 from agents.symptom_agents import SymptomConfig
 from config import (
+    DEFAULT_MARKER_DISPLAY,
+    MARKER_DISPLAY_OPTIONS,
     MAX_PARAMS_PER_TRACK,
     PARAMETER_CATALOG,
     PARAMETER_DISPLAY_NAMES,
