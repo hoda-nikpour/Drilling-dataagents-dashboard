@@ -87,11 +87,11 @@ def create_multi_track_chart(
 
             hovertemplate = (
                 f"<b>{label}</b><br>"
-                + f"Curve source: {curve_source}<br>"
-                + (f"Unit: {unit}<br>" if unit else "")
-                + "Value: %{customdata[0]:.1f}<br>"
-                + "Date: %{y|%Y-%m-%d}<br>"
-                + "Time: %{y|%H:%M:%S}<extra></extra>"
+                + "Value: %{customdata[0]:.1f}"
+                + (f" {unit}" if unit else "")
+                + "<br>"
+                + "Time: %{y|%H:%M:%S}"
+                + "<extra></extra>"
             )
 
             fig.add_trace(

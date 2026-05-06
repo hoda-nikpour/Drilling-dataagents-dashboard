@@ -282,20 +282,24 @@ def build_mapping_diagnostic_df(
     parameter_catalog: dict,
 ) -> pd.DataFrame:
     """
-    Diagnostic table to confirm that each logical parameter is really connected
+    Diagnostic table to confirm that each logical parameter is connected
     to a sensible raw curve.
 
-    This is very important for well-log data because different wells can use
-    different mnemonic conventions.
+    This version is safe when a mapped column exists but contains only NaN.
     """
     rows = []
-
     n_rows = len(df)
 
     for label, raw_col in label_to_column.items():
         meta = parameter_catalog.get(label, {})
         logical_min = meta.get("logical_min", np.nan)
         logical_max = meta.get("logical_max", np.nan)
+
+        s_min = np.nan
+        s_med = np.nan
+        s_max = np.nan
+        valid_pct = 0.0
+        status_flags = []
 
         if raw_col not in df.columns:
             rows.append(
@@ -317,24 +321,18 @@ def build_mapping_diagnostic_df(
         valid = s.dropna()
         valid_pct = (len(valid) / n_rows * 100.0) if n_rows > 0 else 0.0
 
-        status_flags = []
-
         if valid.empty:
             status_flags.append("All NaN")
-
-        if valid_pct < 10.0:
-            status_flags.append("Very sparse")
-
-        if not valid.empty:
+        else:
             s_min = float(valid.min())
             s_med = float(valid.median())
             s_max = float(valid.max())
 
-        if pd.notna(logical_min) and s_min < float(logical_min):
-            status_flags.append("Has values below logical min")
+            if pd.notna(logical_min) and s_min < float(logical_min):
+                status_flags.append("Has values below logical min")
 
-        if pd.notna(logical_max) and s_max > float(logical_max):
-            status_flags.append("Has values above logical max")
+            if pd.notna(logical_max) and s_max > float(logical_max):
+                status_flags.append("Has values above logical max")
 
             # Important special checks.
             if label in {"Bit Depth", "Well Depth"}:
@@ -359,10 +357,8 @@ def build_mapping_diagnostic_df(
                 if s_max > 20000.0:
                     status_flags.append("Suspicious flow range / unit issue")
 
-        else:
-            s_min = np.nan
-            s_med = np.nan
-            s_max = np.nan
+        if valid_pct < 10.0:
+            status_flags.append("Very sparse")
 
         rows.append(
             {
