@@ -132,7 +132,7 @@ def main():
                 label_to_column=label_to_column,
                 parameter_catalog=PARAMETER_CATALOG,
             ),
-            use_container_width=True,
+            width="stretch",
         )
 
     track_param_labels = render_track_parameter_selector(
@@ -219,7 +219,7 @@ def main():
             parameter_catalog=PARAMETER_CATALOG,
         )
 
-        st.dataframe(mapping_diagnostic_df, use_container_width=True)
+        st.dataframe(mapping_diagnostic_df, width="stretch")
 
         bad_rows = mapping_diagnostic_df[
             mapping_diagnostic_df["Status"].astype(str).ne("OK")
@@ -242,7 +242,7 @@ def main():
             if cleaning_summary_df.empty:
                 st.info("No cleaning summary is available.")
             else:
-                st.dataframe(cleaning_summary_df, use_container_width=True)
+                st.dataframe(cleaning_summary_df, width="stretch")
 
                 changed_rows = cleaning_summary_df[
                     (
@@ -396,7 +396,7 @@ def main():
             ):
                 st.dataframe(
                     symptom_miss_reason_df,
-                    use_container_width=True,
+                    width="stretch",
                     key=miss_reason_table_key,
                 )
 
@@ -419,7 +419,7 @@ def main():
 
             st.dataframe(
                 trq_spike_eval_df,
-                use_container_width=True,
+                width="stretch",
                 key=f"trq_spike_eval_{context_key}_{len(trq_spike_eval_df)}",
             )
 
@@ -427,7 +427,7 @@ def main():
         with st.expander("Selected symptom debug features", expanded=False):
             st.dataframe(
                 symptom_cfg["features"].tail(1000),
-                use_container_width=True,
+                width="stretch",
             )
 
     section_ranges = compute_section_ranges(df, list(selected_sections))
@@ -478,4 +478,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+
+        st.error("Dashboard crashed. Full Python traceback is shown below.")
+        st.exception(e)
+
+        print("\n\n========== DASHBOARD CRASH TRACEBACK ==========")
+        print(traceback.format_exc())
+        print("========== END DASHBOARD CRASH TRACEBACK ==========\n\n")
+
+        raise

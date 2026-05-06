@@ -43,16 +43,16 @@ def render_result_tables(
 ):
     if not activity_cfg["summary_df"].empty:
         with st.expander("Activity summary", expanded=False):
-            st.dataframe(activity_cfg["summary_df"], use_container_width=True)
+            st.dataframe(activity_cfg["summary_df"], width="stretch")
 
     if symptom_cfg["intervals"]:
         symptom_rows = pd.DataFrame(symptom_cfg["intervals"])
         with st.expander("Symptom intervals", expanded=False):
-            st.dataframe(symptom_rows, use_container_width=True)
+            st.dataframe(symptom_rows, width="stretch")
 
     if not activity_validation_df.empty:
         with st.expander("Activity validation against manual tags", expanded=False):
-            st.dataframe(activity_validation_df, use_container_width=True)
+            st.dataframe(activity_validation_df, width="stretch")
 
     # Manual hit review table intentionally hidden from UI.
     # The underlying review_df logic is still preserved in app.py.
