@@ -99,6 +99,11 @@ def render_chart(fig, chart_key: str):
 
     html = f"""
     <div style="font-family: Arial, sans-serif;">
+        <style>
+            #{div_id} .hoverlayer {{
+                display: none !important;
+            }}
+        </style>
 
         <div style="
             display: flex;
@@ -203,6 +208,22 @@ def render_chart(fig, chart_key: str):
                 top: 0;
                 width: 100%;
             "></div>
+
+            <div id="custom_hover_box_{div_id}" style="
+                position: absolute;
+                display: none;
+                pointer-events: none;
+                z-index: 10000;
+                background: rgba(255, 255, 255, 0.96);
+                border: 1px solid rgba(80, 80, 80, 0.35);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+                padding: 6px 8px;
+                font-size: 12px;
+                line-height: 1.25;
+                color: #222;
+                max-width: 190px;
+                white-space: nowrap;
+            "></div>
         </div>
     </div>
 
@@ -210,7 +231,8 @@ def render_chart(fig, chart_key: str):
     const gd_{div_id} = document.getElementById("{div_id}");
     const wrapper_{div_id} = document.getElementById("{wrapper_id}");
     const singleHoverLine_{div_id} = document.getElementById("{hover_line_id}");
-
+    const customHoverBox_{div_id} = document.getElementById("custom_hover_box_{div_id}");
+    
     const undoBtn_{div_id} = document.getElementById("undo_zoom_btn_{div_id}");
     const resetBtn_{div_id} = document.getElementById("reset_zoom_btn_{div_id}");
     const historyText_{div_id} = document.getElementById("zoom_history_text_{div_id}");
@@ -488,6 +510,112 @@ def render_chart(fig, chart_key: str):
         return false;
     }});
 
+    function escapeHtml_{div_id}(value) {{
+        return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }}
+
+    function formatTimeOnly_{div_id}(value) {{
+        const d = new Date(value);
+
+        if (isNaN(d.getTime())) {{
+            return String(value);
+        }}
+
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mm = String(d.getMinutes()).padStart(2, "0");
+        const ss = String(d.getSeconds()).padStart(2, "0");
+
+        return hh + ":" + mm + ":" + ss;
+    }}
+
+    function formatValue_{div_id}(value) {{
+        const num = Number(value);
+
+        if (!Number.isFinite(num)) {{
+            return String(value ?? "");
+        }}
+
+        return num.toFixed(1);
+    }}
+
+    function showCustomHoverBox_{div_id}(eventData) {{
+        if (!eventData || !eventData.points || eventData.points.length === 0) {{
+            return;
+        }}
+
+        const point = eventData.points[0];
+        const mouseEvent = eventData.event;
+
+        if (!mouseEvent) {{
+            return;
+        }}
+
+        const meta = point.data && point.data.meta ? point.data.meta : {{}};
+
+        let parameterName = meta.label || "";
+
+        if (!parameterName && point.data && point.data.name) {{
+            parameterName = String(point.data.name).replace(/^Track \\d+ - /, "");
+        }}
+
+        if (!parameterName) {{
+            parameterName = "Value";
+        }}
+
+        let value = "";
+
+        if (point.customdata && point.customdata.length > 0) {{
+            value = formatValue_{div_id}(point.customdata[0]);
+        }} else if (point.x !== undefined && point.x !== null) {{
+            value = formatValue_{div_id}(point.x);
+        }}
+
+        const unit = meta.unit ? " " + meta.unit : "";
+        const timeText = formatTimeOnly_{div_id}(point.y);
+
+        customHoverBox_{div_id}.innerHTML =
+            "<b>" + escapeHtml_{div_id}(parameterName) + "</b><br>" +
+            escapeHtml_{div_id}(value + unit) + "<br>" +
+            "Time: " + escapeHtml_{div_id}(timeText);
+
+        const wrapperRect = wrapper_{div_id}.getBoundingClientRect();
+
+        // Put the hover box about 2 cm above the cursor.
+        // 2 cm is roughly 75 px on normal screens.
+        let left = mouseEvent.clientX - wrapperRect.left + 12;
+        let top = mouseEvent.clientY - wrapperRect.top - 78;
+
+        customHoverBox_{div_id}.style.display = "block";
+
+        const boxRect = customHoverBox_{div_id}.getBoundingClientRect();
+        const maxLeft = wrapperRect.width - boxRect.width - 8;
+
+        if (left > maxLeft) {{
+            left = maxLeft;
+        }}
+
+        if (left < 8) {{
+            left = 8;
+        }}
+
+        if (top < 8) {{
+            top = mouseEvent.clientY - wrapperRect.top + 18;
+        }}
+
+        customHoverBox_{div_id}.style.left = left + "px";
+        customHoverBox_{div_id}.style.top = top + "px";
+    }}
+
+    function hideCustomHoverBox_{div_id}() {{
+        customHoverBox_{div_id}.style.display = "none";
+    }}
+    
+    
     function showSingleHoverLine_{div_id}(yValue) {{
         const fullLayout = gd_{div_id}._fullLayout;
 
@@ -536,18 +664,23 @@ def render_chart(fig, chart_key: str):
         if (point && point.y !== undefined && point.y !== null) {{
             showSingleHoverLine_{div_id}(point.y);
         }}
+
+        showCustomHoverBox_{div_id}(eventData);
     }});
 
     gd_{div_id}.on("plotly_unhover", function() {{
         hideSingleHoverLine_{div_id}();
+        hideCustomHoverBox_{div_id}();
     }});
 
     gd_{div_id}.addEventListener("mouseleave", function() {{
         hideSingleHoverLine_{div_id}();
+        hideCustomHoverBox_{div_id}();
     }});
 
     wrapper_{div_id}.addEventListener("mouseleave", function() {{
         hideSingleHoverLine_{div_id}();
+        hideCustomHoverBox_{div_id}();
     }});
 
     updateHistoryText_{div_id}();

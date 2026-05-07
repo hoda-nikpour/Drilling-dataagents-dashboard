@@ -12,7 +12,6 @@ from visualization.chart_scale import (
     _add_track_selected_params_summary,
 )
 from visualization.chart_sections import _add_reference_line, _add_section_boundaries
-from visualization.chart_time_axis import _build_dual_time_ticks
 from visualization.chart_transform import _normalize_with_range
 
 
@@ -102,7 +101,7 @@ def create_multi_track_chart(
                 + "Value: %{customdata[0]:.1f}"
                 + (f" {unit}" if unit else "")
                 + "<br>"
-                + "Time: %{y|%Y-%m-%d %H:%M:%S}"
+                + "Time: %{y|%H:%M:%S}"
                 + "<extra></extra>"
             )
 
@@ -113,6 +112,10 @@ def create_multi_track_chart(
                     mode=mode,
                     name=f"Track {track_idx + 1} - {label}",
                     showlegend=False,
+                    meta={
+                        "label": label,
+                        "unit": unit,
+                    },
                     line=dict(
                         color=color,
                         width=1.25,
@@ -196,11 +199,10 @@ def create_multi_track_chart(
         # Newest time at the top, oldest at the bottom.
         y_range = [t_max_view, t_min_view]
 
-    tickvals, ticktext = _build_dual_time_ticks(
-        t_min_view=t_min_view,
-        t_max_view=t_max_view,
-        n_ticks=12,
-    )
+    # More frequent left-side time labels.
+    # Use automatic ticks, not fixed tickvals, so the tick labels update after chart zoom.
+    # Roughly one label every 80–90 px, which is close to the requested 2–3 cm spacing.
+    time_tick_count = max(12, min(30, int(chart_height / 85)))
 
     fig.update_yaxes(
         range=y_range,
@@ -208,10 +210,11 @@ def create_multi_track_chart(
         showgrid=True,
         gridcolor="rgba(140,140,140,0.20)",
         gridwidth=0.6,
-        tickmode="array" if tickvals is not None else "auto",
-        tickvals=tickvals,
-        ticktext=ticktext,
+        tickmode="auto",
+        nticks=time_tick_count,
+        tickformat="%d-%b-%y<br>%H:%M:%S",
         tickfont=dict(size=10, family="Courier New"),
+        automargin=True,
         fixedrange=False,
 
         # Critical:
@@ -237,7 +240,7 @@ def create_multi_track_chart(
 
     fig.update_layout(
         height=chart_height,
-        margin=dict(l=120, r=20, t=145, b=320),
+        margin=dict(l=145, r=20, t=145, b=320),
 
         # Keep normal point hover. The continuous horizontal line is not Plotly;
         # it is drawn once in layout.py as an HTML overlay.
