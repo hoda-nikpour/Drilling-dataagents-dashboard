@@ -11,6 +11,12 @@
     `streamlit run app.py`
     `python -m compileall .`
 
+    `git remote -v`
+    `git status`
+    `git add .`
+    `git commit -m "change"`
+    `git push`
+
     you should se something like this (which is showing that the project is running in local host):
     
    
