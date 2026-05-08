@@ -730,10 +730,10 @@ def render_review_loader_before_well_selector() -> dict | None:
     a Streamlit rerun loop.
     """
     with st.sidebar:
-        st.subheader("Load Previous Review")
+        st.subheader("Load Dashboard Session")
 
         uploaded_review = st.file_uploader(
-            "Drag/drop saved review JSON here",
+            "Drag/drop saved dashboard here",
             type=["json"],
             key="review_upload_global_before_well",
         )
@@ -1003,16 +1003,16 @@ def render_time_filter(df, context_key: str):
 
         filtered_records = len(df.loc[selected_start:selected_end])
 
-        st.metric("Records in selected window", f"{filtered_records:,}")
-        st.metric("Zoom", f"{zoom_percent:.0f}%")
+        #st.metric("Records in selected window", f"{filtered_records:,}")
+        #st.metric("Zoom", f"{zoom_percent:.0f}%")
 
-        st.caption(
-            f"Available range: {_format_dt(default_start)} → {_format_dt(default_end)}"
-        )
+        # st.caption(
+        #     f"Available range: {_format_dt(default_start)} → {_format_dt(default_end)}"
+        # )
 
-        st.caption(
-            f"Applied range: {_format_dt(selected_start)} → {_format_dt(selected_end)}"
-        )
+        # st.caption(
+        #     f"Applied range: {_format_dt(selected_start)} → {_format_dt(selected_end)}"
+        # )
 
     return time_range, zoom_percent
 
@@ -2675,7 +2675,7 @@ def render_agent_review_outputs(
         )
 
         st.download_button(
-            "Save full dashboard as JSON",
+            "Save Dashboard Session",
             data=json_text,
             file_name=f"tag_review_{context_key}.json",
             mime="application/json",
