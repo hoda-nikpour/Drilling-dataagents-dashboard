@@ -53,7 +53,7 @@ from ui.sidebar import (
     build_activity_validation_df,
     build_agent_cfg_from_controls,
     build_manual_review_df,
-    build_symptom_miss_reason_df,
+    build_professional_symptom_review_df,
     build_trq_spike_evaluation_df,
     render_agent_controls,
     render_agent_review_outputs,
@@ -434,16 +434,15 @@ def main():
     )
 
     if show_symptom_miss_reason_table:
-        symptom_miss_reason_df = build_symptom_miss_reason_df(
+        professional_review_df = build_professional_symptom_review_df(
             tag_intervals=agent_cfg.get("tag_intervals", []),
             symptom_cfg=symptom_cfg,
             activity_cfg=activity_cfg,
+            df_index=df.index,
         )
 
-        # This key changes whenever tags or symptom-agent results change.
-        # Streamlit will fully remount the dataframe instead of reusing old cells.
-        miss_reason_table_key = (
-            "symptom_miss_reason_"
+        professional_review_table_key = (
+            "professional_symptom_review_"
             f"{context_key}_"
             f"{agent_cfg.get('agent_source')}_"
             f"{symptom_cfg.get('selected_symptom', '')}_"
@@ -453,15 +452,21 @@ def main():
             f"{hash(str(symptom_cfg.get('intervals', [])))}"
         )
 
-        if not symptom_miss_reason_df.empty:
+        if not professional_review_df.empty:
             with st.expander(
-                "Why selected symptom agent did or did not hit manual tags",
+                "Selected symptom review — professional hit/tag result table",
                 expanded=True,
             ):
+                st.caption(
+                    "One consolidated review table. It combines VT-style result category, "
+                    "hit rate, precision, tag/hit timing, overlap, ratio, z-value, activity context, "
+                    "and miss/blocking reason details."
+                )
+
                 st.dataframe(
-                    symptom_miss_reason_df,
+                    professional_review_df,
                     width="stretch",
-                    key=miss_reason_table_key,
+                    key=professional_review_table_key,
                 )
 
     if (
@@ -473,7 +478,7 @@ def main():
 
         with st.expander(
             "TRQSpike agent result for evaluation — Ratio and z-value",
-            expanded=True,
+            expanded=False,
         ):
             st.caption(
                 "This table prints the TRQ Ratio and TRQ z-value used by the TRQSpike agent. "

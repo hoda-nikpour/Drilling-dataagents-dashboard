@@ -2184,6 +2184,551 @@ def build_symptom_miss_reason_df(
 
     return pd.DataFrame(rows, columns=columns)
 
+
+def build_symptom_hit_tag_comparison(
+    tag_intervals: list[dict],
+    symptom_cfg: dict,
+    activity_cfg: dict,
+    df_index=None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    VT-style comparison of manual tags versus selected symptom-agent hits.
+
+    Categories:
+    - True Positive: manual tag overlaps an agent hit
+    - False Negative: manual tag has no overlapping agent hit
+    - False Positive: agent hit has no overlapping manual tag
+    - True Negative: selected-window samples outside both tags and hits
+
+    Hit rate:
+    TP / (TP + FN)
+
+    For TRQSpike/TRQErratic this also prints ratio and z-value where available.
+    """
+
+    selected_symptom = symptom_cfg.get("selected_symptom", "")
+    symptom_features = symptom_cfg.get("features", pd.DataFrame())
+    symptom_intervals = symptom_cfg.get("intervals", [])
+
+    detail_columns = [
+        "Category",
+        "Selected Agent",
+        "Tag",
+        "Hit",
+        "Severity",
+        "Tag Start",
+        "Tag End",
+        "Hit Start",
+        "Hit End",
+        "Overlap Start",
+        "Overlap End",
+        "Overlap sec",
+        "Max Ratio",
+        "Max z-value",
+        "Notes",
+    ]
+
+    summary_columns = [
+        "Metric",
+        "Value",
+    ]
+
+    def _duration_sec(start, end) -> float:
+        try:
+            return max(
+                (
+                    pd.Timestamp(end) - pd.Timestamp(start)
+                ).total_seconds(),
+                0.0,
+            )
+        except Exception:
+            return 0.0
+
+    def _safe_overlap(a_start, a_end, b_start, b_end):
+        return interval_overlap(a_start, a_end, b_start, b_end)
+
+    def _fmt_number(value, decimals: int = 3):
+        if value is None or pd.isna(value):
+            return pd.NA
+
+        try:
+            return round(float(value), decimals)
+        except Exception:
+            return pd.NA
+
+    def _feature_stats(start, end) -> dict:
+        """
+        Extract useful diagnostic values from the feature window.
+        For TRQSpike and TRQErratic this prints ratio and z-value when present.
+        """
+        stats = {
+            "max_ratio": pd.NA,
+            "max_z": pd.NA,
+        }
+
+        if symptom_features is None or symptom_features.empty:
+            return stats
+
+        try:
+            window = symptom_features.loc[pd.Timestamp(start): pd.Timestamp(end)]
+        except Exception:
+            return stats
+
+        if window.empty:
+            return stats
+
+        if "trq_ratio" in window.columns:
+            stats["max_ratio"] = _fmt_number(
+                pd.to_numeric(window["trq_ratio"], errors="coerce").max()
+            )
+
+        if "trq_zscore" in window.columns:
+            stats["max_z"] = _fmt_number(
+                pd.to_numeric(window["trq_zscore"], errors="coerce").max()
+            )
+
+        return stats
+
+    rows = []
+    used_hit_indexes = set()
+
+    # ------------------------------------------------------------
+    # Match tags to hits.
+    # Each tag gets the best overlapping hit.
+    # ------------------------------------------------------------
+    for tag_i, tag in enumerate(tag_intervals):
+        tag_start = pd.Timestamp(tag["start"])
+        tag_end = pd.Timestamp(tag["end"])
+        tag_label = str(tag.get("label", f"Tag {tag_i + 1}"))
+
+        best_hit_i = None
+        best_hit = None
+        best_overlap = None
+        best_overlap_sec = 0.0
+
+        for hit_i, hit in enumerate(symptom_intervals):
+            if hit_i in used_hit_indexes:
+                continue
+
+            ov = _safe_overlap(
+                tag_start,
+                tag_end,
+                hit["start"],
+                hit["end"],
+            )
+
+            if ov is None:
+                continue
+
+            ov_sec = _duration_sec(ov[0], ov[1])
+
+            if ov_sec >= best_overlap_sec:
+                best_hit_i = hit_i
+                best_hit = hit
+                best_overlap = ov
+                best_overlap_sec = ov_sec
+
+        if best_hit is not None:
+            used_hit_indexes.add(best_hit_i)
+
+            stats = _feature_stats(tag_start, tag_end)
+
+            rows.append(
+                {
+                    "Category": "True Positive",
+                    "Selected Agent": selected_symptom,
+                    "Tag": tag_label,
+                    "Hit": best_hit.get("label", selected_symptom),
+                    "Severity": best_hit.get("severity", ""),
+                    "Tag Start": tag_start,
+                    "Tag End": tag_end,
+                    "Hit Start": pd.Timestamp(best_hit["start"]),
+                    "Hit End": pd.Timestamp(best_hit["end"]),
+                    "Overlap Start": best_overlap[0],
+                    "Overlap End": best_overlap[1],
+                    "Overlap sec": round(best_overlap_sec, 3),
+                    "Max Ratio": stats["max_ratio"],
+                    "Max z-value": stats["max_z"],
+                    "Notes": "Manual tag overlaps selected symptom-agent hit.",
+                }
+            )
+
+        else:
+            stats = _feature_stats(tag_start, tag_end)
+
+            rows.append(
+                {
+                    "Category": "False Negative",
+                    "Selected Agent": selected_symptom,
+                    "Tag": tag_label,
+                    "Hit": "",
+                    "Severity": "",
+                    "Tag Start": tag_start,
+                    "Tag End": tag_end,
+                    "Hit Start": pd.NaT,
+                    "Hit End": pd.NaT,
+                    "Overlap Start": pd.NaT,
+                    "Overlap End": pd.NaT,
+                    "Overlap sec": 0.0,
+                    "Max Ratio": stats["max_ratio"],
+                    "Max z-value": stats["max_z"],
+                    "Notes": "Manual tag exists, but no selected symptom-agent hit overlaps it.",
+                }
+            )
+
+    # ------------------------------------------------------------
+    # Remaining unmatched hits are false positives.
+    # ------------------------------------------------------------
+    for hit_i, hit in enumerate(symptom_intervals):
+        if hit_i in used_hit_indexes:
+            continue
+
+        hit_start = pd.Timestamp(hit["start"])
+        hit_end = pd.Timestamp(hit["end"])
+
+        stats = _feature_stats(hit_start, hit_end)
+
+        rows.append(
+            {
+                "Category": "False Positive",
+                "Selected Agent": selected_symptom,
+                "Tag": "",
+                "Hit": hit.get("label", selected_symptom),
+                "Severity": hit.get("severity", ""),
+                "Tag Start": pd.NaT,
+                "Tag End": pd.NaT,
+                "Hit Start": hit_start,
+                "Hit End": hit_end,
+                "Overlap Start": pd.NaT,
+                "Overlap End": pd.NaT,
+                "Overlap sec": 0.0,
+                "Max Ratio": stats["max_ratio"],
+                "Max z-value": stats["max_z"],
+                "Notes": "Selected symptom-agent hit exists, but no manual tag overlaps it.",
+            }
+        )
+
+    # ------------------------------------------------------------
+    # True negative samples: selected-window rows outside both tags and hits.
+    # This is sample-based because interval-level true negatives are not
+    # naturally countable unless VT defines fixed negative windows.
+    # ------------------------------------------------------------
+    true_negative_samples = 0
+
+    if df_index is not None and len(df_index) > 0:
+        idx = pd.DatetimeIndex(df_index)
+
+        tag_mask = pd.Series(False, index=idx)
+        hit_mask = pd.Series(False, index=idx)
+
+        for tag in tag_intervals:
+            tag_mask.loc[
+                (idx >= pd.Timestamp(tag["start"]))
+                & (idx <= pd.Timestamp(tag["end"]))
+            ] = True
+
+        for hit in symptom_intervals:
+            hit_mask.loc[
+                (idx >= pd.Timestamp(hit["start"]))
+                & (idx <= pd.Timestamp(hit["end"]))
+            ] = True
+
+        true_negative_samples = int((~tag_mask & ~hit_mask).sum())
+
+        if true_negative_samples > 0:
+            rows.append(
+                {
+                    "Category": "True Negative",
+                    "Selected Agent": selected_symptom,
+                    "Tag": "",
+                    "Hit": "",
+                    "Severity": "",
+                    "Tag Start": pd.NaT,
+                    "Tag End": pd.NaT,
+                    "Hit Start": pd.NaT,
+                    "Hit End": pd.NaT,
+                    "Overlap Start": pd.NaT,
+                    "Overlap End": pd.NaT,
+                    "Overlap sec": pd.NA,
+                    "Max Ratio": pd.NA,
+                    "Max z-value": pd.NA,
+                    "Notes": (
+                        f"{true_negative_samples:,} selected-window samples are outside "
+                        "both manual tags and selected symptom-agent hits."
+                    ),
+                }
+            )
+
+    detail_df = pd.DataFrame(rows, columns=detail_columns)
+
+    tp = int((detail_df["Category"] == "True Positive").sum()) if not detail_df.empty else 0
+    fn = int((detail_df["Category"] == "False Negative").sum()) if not detail_df.empty else 0
+    fp = int((detail_df["Category"] == "False Positive").sum()) if not detail_df.empty else 0
+
+    hit_rate = (tp / (tp + fn) * 100.0) if (tp + fn) > 0 else 0.0
+    precision = (tp / (tp + fp) * 100.0) if (tp + fp) > 0 else 0.0
+
+    summary_rows = [
+        {"Metric": "True Positives", "Value": tp},
+        {"Metric": "False Negatives", "Value": fn},
+        {"Metric": "False Positives", "Value": fp},
+        {"Metric": "True Negative Samples", "Value": true_negative_samples},
+        {"Metric": "Hit Rate / Recall %", "Value": round(hit_rate, 1)},
+        {"Metric": "Precision %", "Value": round(precision, 1)},
+    ]
+
+    summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
+
+    return summary_df, detail_df
+
+def build_professional_symptom_review_df(
+    tag_intervals: list[dict],
+    symptom_cfg: dict,
+    activity_cfg: dict,
+    df_index=None,
+) -> pd.DataFrame:
+    """
+    Build one professional VT-style symptom review table.
+
+    This merges:
+    - summary metrics: TP, FN, FP, TN, hit rate, precision
+    - detailed hit/tag comparison
+    - selected details from the miss-reason table
+
+    Output is one table suitable for dashboard review and export.
+    """
+
+    summary_df, comparison_df = build_symptom_hit_tag_comparison(
+        tag_intervals=tag_intervals,
+        symptom_cfg=symptom_cfg,
+        activity_cfg=activity_cfg,
+        df_index=df_index,
+    )
+
+    miss_reason_df = build_symptom_miss_reason_df(
+        tag_intervals=tag_intervals,
+        symptom_cfg=symptom_cfg,
+        activity_cfg=activity_cfg,
+    )
+
+    selected_symptom = symptom_cfg.get("selected_symptom", "")
+
+    columns = [
+        "Review Result",
+        "Selected Agent",
+        "Manual Tag",
+        "Agent Hit",
+        "Severity",
+        "Tag Start",
+        "Tag End",
+        "Hit Start",
+        "Hit End",
+        "Overlap Start",
+        "Overlap End",
+        "Overlap sec",
+        "Overlap % of Tag",
+        "Max Ratio",
+        "Max z-value",
+        "Activity In Tag",
+        "Main Blocking Reason",
+        "Details",
+        "TP",
+        "FN",
+        "FP",
+        "TN Samples",
+        "Hit Rate / Recall %",
+        "Precision %",
+    ]
+
+    if comparison_df.empty and summary_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    def _metric_value(metric_name: str, default=0):
+        if summary_df.empty:
+            return default
+
+        rows = summary_df[summary_df["Metric"].astype(str).eq(metric_name)]
+
+        if rows.empty:
+            return default
+
+        return rows.iloc[0]["Value"]
+
+    tp = _metric_value("True Positives", 0)
+    fn = _metric_value("False Negatives", 0)
+    fp = _metric_value("False Positives", 0)
+    tn_samples = _metric_value("True Negative Samples", 0)
+    hit_rate = _metric_value("Hit Rate / Recall %", 0.0)
+    precision = _metric_value("Precision %", 0.0)
+
+    def _safe_seconds(start, end) -> float:
+        try:
+            return max(
+                (pd.Timestamp(end) - pd.Timestamp(start)).total_seconds(),
+                0.0,
+            )
+        except Exception:
+            return 0.0
+
+    def _safe_overlap_percent(row) -> object:
+        if pd.isna(row.get("Tag Start")) or pd.isna(row.get("Tag End")):
+            return pd.NA
+
+        tag_seconds = _safe_seconds(row.get("Tag Start"), row.get("Tag End"))
+
+        if tag_seconds <= 0:
+            return pd.NA
+
+        overlap_seconds = row.get("Overlap sec", 0.0)
+
+        try:
+            return round(float(overlap_seconds) / tag_seconds * 100.0, 1)
+        except Exception:
+            return pd.NA
+
+    def _find_miss_reason(row) -> dict:
+        if miss_reason_df.empty:
+            return {
+                "Activity In Tag": "",
+                "Main Blocking Reason": "",
+                "Details": row.get("Notes", ""),
+            }
+
+        tag = row.get("Tag", "")
+        tag_start = row.get("Tag Start", pd.NaT)
+        tag_end = row.get("Tag End", pd.NaT)
+
+        if not tag or pd.isna(tag_start) or pd.isna(tag_end):
+            return {
+                "Activity In Tag": "",
+                "Main Blocking Reason": "",
+                "Details": row.get("Notes", ""),
+            }
+
+        candidates = miss_reason_df[
+            miss_reason_df["Tag"].astype(str).eq(str(tag))
+        ].copy()
+
+        if candidates.empty:
+            return {
+                "Activity In Tag": "",
+                "Main Blocking Reason": "",
+                "Details": row.get("Notes", ""),
+            }
+
+        candidates["_start_diff"] = (
+            pd.to_datetime(candidates["Tag Start"], errors="coerce")
+            - pd.Timestamp(tag_start)
+        ).abs()
+
+        candidates["_end_diff"] = (
+            pd.to_datetime(candidates["Tag End"], errors="coerce")
+            - pd.Timestamp(tag_end)
+        ).abs()
+
+        candidates["_total_diff"] = candidates["_start_diff"] + candidates["_end_diff"]
+        best = candidates.sort_values("_total_diff").iloc[0]
+
+        return {
+            "Activity In Tag": best.get("Activity In Tag", ""),
+            "Main Blocking Reason": best.get("Main Blocking Reason", ""),
+            "Details": best.get("Details", row.get("Notes", "")),
+        }
+
+    def _clean_result(category: str) -> str:
+        if category == "True Positive":
+            return "True Positive — tag hit"
+        if category == "False Negative":
+            return "False Negative — missed tag"
+        if category == "False Positive":
+            return "False Positive — extra hit"
+        if category == "True Negative":
+            return "True Negative — quiet background"
+        return str(category)
+
+    rows = []
+
+    for _, row in comparison_df.iterrows():
+        category = str(row.get("Category", ""))
+        reason = _find_miss_reason(row)
+
+        if category == "True Positive":
+            main_reason = "Matched"
+            details = (
+                "Manual tag overlaps the selected symptom-agent hit. "
+                f"{reason.get('Details', '')}"
+            ).strip()
+        elif category == "False Positive":
+            main_reason = "Extra agent hit"
+            details = row.get(
+                "Notes",
+                "Agent created a hit, but no manual tag overlaps it.",
+            )
+        elif category == "True Negative":
+            main_reason = "No tag and no hit"
+            details = row.get(
+                "Notes",
+                "Selected-window samples outside both manual tags and agent hits.",
+            )
+        else:
+            main_reason = reason.get("Main Blocking Reason", "")
+            details = reason.get("Details", row.get("Notes", ""))
+
+        rows.append(
+            {
+                "Review Result": _clean_result(category),
+                "Selected Agent": row.get("Selected Agent", selected_symptom),
+                "Manual Tag": row.get("Tag", ""),
+                "Agent Hit": row.get("Hit", ""),
+                "Severity": row.get("Severity", ""),
+                "Tag Start": row.get("Tag Start", pd.NaT),
+                "Tag End": row.get("Tag End", pd.NaT),
+                "Hit Start": row.get("Hit Start", pd.NaT),
+                "Hit End": row.get("Hit End", pd.NaT),
+                "Overlap Start": row.get("Overlap Start", pd.NaT),
+                "Overlap End": row.get("Overlap End", pd.NaT),
+                "Overlap sec": row.get("Overlap sec", pd.NA),
+                "Overlap % of Tag": _safe_overlap_percent(row),
+                "Max Ratio": row.get("Max Ratio", pd.NA),
+                "Max z-value": row.get("Max z-value", pd.NA),
+                "Activity In Tag": reason.get("Activity In Tag", ""),
+                "Main Blocking Reason": main_reason,
+                "Details": details,
+                "TP": tp,
+                "FN": fn,
+                "FP": fp,
+                "TN Samples": tn_samples,
+                "Hit Rate / Recall %": hit_rate,
+                "Precision %": precision,
+            }
+        )
+
+    review_df = pd.DataFrame(rows, columns=columns)
+
+    if review_df.empty:
+        return review_df
+
+    result_order = {
+        "True Positive — tag hit": 1,
+        "False Negative — missed tag": 2,
+        "False Positive — extra hit": 3,
+        "True Negative — quiet background": 4,
+    }
+
+    review_df["_sort_order"] = review_df["Review Result"].map(result_order).fillna(99)
+
+    review_df = (
+        review_df
+        .sort_values(
+            by=["_sort_order", "Tag Start", "Hit Start"],
+            na_position="last",
+        )
+        .drop(columns=["_sort_order"])
+        .reset_index(drop=True)
+    )
+
+    return review_df
+
 def render_agent_controls(
     df,
     context_key: str,
