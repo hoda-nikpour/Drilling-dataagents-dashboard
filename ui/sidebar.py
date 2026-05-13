@@ -2569,7 +2569,7 @@ def build_professional_symptom_review_df(
             )
         except Exception:
             return 0.0
-
+#to keep records
     def _safe_overlap_percent(row) -> object:
         if pd.isna(row.get("Tag Start")) or pd.isna(row.get("Tag End")):
             return pd.NA
