@@ -345,7 +345,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
             color: #333;
         ">
             <summary style="cursor:pointer; font-weight:700; list-style-position:outside;">
-                Hit results from dragged tags
+                Hit results
                 <span id="hit_results_summary_{div_id}" style="color:#666; margin-left: 8px; font-weight:400;">No dragged tags yet.</span>
             </summary>
             <div style="display: flex; justify-content: flex-end; gap: 8px; align-items: center; margin: 8px 0 6px 0;">
