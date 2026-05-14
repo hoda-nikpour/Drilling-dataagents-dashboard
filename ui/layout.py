@@ -251,13 +251,33 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
                     🏷 Tagging
                 </button>
 
+                <button id="undo_client_tag_btn_{div_id}" style="
+                    padding: 6px 10px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                " title="Remove the most recently drawn Track 4 drag tag. Keeps up to 10 removed tags for redraw.">
+                    Undo drag tag
+                </button>
+
+                <button id="redo_client_tag_btn_{div_id}" style="
+                    padding: 6px 10px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                " title="Redraw the most recently undone drag tag.">
+                    Redo drag tag
+                </button>
+
                 <button id="clear_client_tags_btn_{div_id}" style="
                     padding: 6px 10px;
                     border: 1px solid #999;
                     background: white;
                     cursor: pointer;
                     font-size: 13px;
-                " title="Clear dragged visual tags stored in this browser">
+                " title="Clear all dragged visual tags stored in this browser">
                     Clear drag tags
                 </button>
 
@@ -409,6 +429,8 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
     const undoBtn_{div_id} = document.getElementById("undo_zoom_btn_{div_id}");
     const resetBtn_{div_id} = document.getElementById("reset_zoom_btn_{div_id}");
     const taggingBtn_{div_id} = document.getElementById("tagging_btn_{div_id}");
+    const undoClientTagBtn_{div_id} = document.getElementById("undo_client_tag_btn_{div_id}");
+    const redoClientTagBtn_{div_id} = document.getElementById("redo_client_tag_btn_{div_id}");
     const clearClientTagsBtn_{div_id} = document.getElementById("clear_client_tags_btn_{div_id}");
     const historyText_{div_id} = document.getElementById("zoom_history_text_{div_id}");
     const instructionText_{div_id} = document.getElementById("chart_instruction_text_{div_id}");
@@ -689,6 +711,8 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
     const clientVisualTagStorageKey_{div_id} =
         "hoda_client_visual_tags_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
+    const clientVisualTagRedoStorageKey_{div_id} =
+        "hoda_client_visual_tags_redo_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
 
     function isoForPlotly_{div_id}(dateValue) {{
         // Plotly accepts local datetime strings on datetime axes.
@@ -734,6 +758,49 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
                 JSON.stringify(Array.isArray(items) ? items : [])
             );
         }} catch (e) {{}}
+    }}
+
+    function loadClientVisualTagRedoStack_{div_id}() {{
+        if (!visualTagContextKey_{div_id}) {{
+            return [];
+        }}
+
+        try {{
+            const raw = window.localStorage.getItem(clientVisualTagRedoStorageKey_{div_id});
+            const parsed = JSON.parse(raw || "[]");
+            return Array.isArray(parsed) ? parsed : [];
+        }} catch (e) {{
+            return [];
+        }}
+    }}
+
+    function saveClientVisualTagRedoStack_{div_id}(items) {{
+        if (!visualTagContextKey_{div_id}) {{
+            return;
+        }}
+
+        const stack = Array.isArray(items) ? items.slice(-10) : [];
+        try {{
+            window.localStorage.setItem(
+                clientVisualTagRedoStorageKey_{div_id},
+                JSON.stringify(stack)
+            );
+        }} catch (e) {{}}
+    }}
+
+    function _setButtonEnabled_{div_id}(btn, enabled) {{
+        if (!btn) return;
+        btn.disabled = !enabled;
+        btn.style.opacity = enabled ? "1.0" : "0.5";
+        btn.style.cursor = enabled ? "pointer" : "not-allowed";
+    }}
+
+    function updateClientTagUndoRedoControls_{div_id}() {{
+        const activeTags = loadClientVisualTags_{div_id}();
+        const redoTags = loadClientVisualTagRedoStack_{div_id}();
+        _setButtonEnabled_{div_id}(undoClientTagBtn_{div_id}, activeTags.length > 0);
+        _setButtonEnabled_{div_id}(redoClientTagBtn_{div_id}, redoTags.length > 0);
+        _setButtonEnabled_{div_id}(clearClientTagsBtn_{div_id}, activeTags.length > 0 || redoTags.length > 0);
     }}
 
     function _dateMs_{div_id}(value) {{
@@ -1048,15 +1115,57 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
         }});
     }}
 
-    function restoreClientVisualTags_{div_id}() {{
+    function removeClientVisualTagTraces_{div_id}(callback) {{
+        const indices = [];
+        (gd_{div_id}.data || []).forEach(function(trace, idx) {{
+            if (trace && trace.meta && (trace.meta.source === "client_drag_tag" || trace.meta.source === "client_drag_overlap")) {{
+                indices.push(idx);
+            }}
+        }});
+
+        if (indices.length) {{
+            // Delete from the end so trace indices remain valid.
+            indices.sort(function(a, b) {{ return b - a; }});
+            Plotly.deleteTraces(gd_{div_id}, indices).then(function() {{
+                if (callback) callback();
+            }});
+        }} else if (callback) {{
+            callback();
+        }}
+    }}
+
+    function redrawClientVisualTagsFromStorage_{div_id}() {{
         const items = loadClientVisualTags_{div_id}();
         if (!items.length) {{
+            rebuildHitResultsTable_{div_id}();
+            updateClientTagUndoRedoControls_{div_id}();
+            Plotly.redraw(gd_{div_id});
             return;
         }}
 
         items.forEach(function(item) {{
             addClientVisualTagTrace_{div_id}(item, false);
         }});
+
+        setTimeout(function() {{
+            rebuildHitResultsTable_{div_id}();
+            updateClientTagUndoRedoControls_{div_id}();
+            Plotly.redraw(gd_{div_id});
+        }}, 80);
+    }}
+
+    function restoreClientVisualTags_{div_id}() {{
+        const items = loadClientVisualTags_{div_id}();
+        if (!items.length) {{
+            rebuildHitResultsTable_{div_id}();
+            updateClientTagUndoRedoControls_{div_id}();
+            return;
+        }}
+
+        items.forEach(function(item) {{
+            addClientVisualTagTrace_{div_id}(item, false);
+        }});
+        updateClientTagUndoRedoControls_{div_id}();
     }}
 
     function addClientVisualTag_{div_id}(startDate, endDate) {{
@@ -1071,6 +1180,10 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
         items.push(item);
         saveClientVisualTags_{div_id}(items);
+
+        // A new drawn tag starts a new forward history, like normal undo/redo.
+        saveClientVisualTagRedoStack_{div_id}([]);
+
         addClientVisualTagTrace_{div_id}(item, true);
 
         const overlapCount = _clientOverlapIntervalsForTag_{div_id}(item).length;
@@ -1079,25 +1192,61 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
             ". Client-side overlap count with visible Agent lane: " + overlapCount +
             ". This visual tag is kept only for this active dashboard session.";
         rebuildHitResultsTable_{div_id}();
+        updateClientTagUndoRedoControls_{div_id}();
+    }}
+
+    function undoLastClientVisualTag_{div_id}() {{
+        const items = loadClientVisualTags_{div_id}();
+        if (!items.length) {{
+            updateClientTagUndoRedoControls_{div_id}();
+            return;
+        }}
+
+        const removed = items.pop();
+        saveClientVisualTags_{div_id}(items);
+
+        const redoStack = loadClientVisualTagRedoStack_{div_id}();
+        redoStack.push(removed);
+        saveClientVisualTagRedoStack_{div_id}(redoStack.slice(-10));
+
+        removeClientVisualTagTraces_{div_id}(function() {{
+            redrawClientVisualTagsFromStorage_{div_id}();
+            instructionText_{div_id}.innerText =
+                "Removed latest dragged tag: " + (removed.label || "Dragged tag") +
+                ". Click Redo drag tag to redraw it.";
+        }});
+    }}
+
+    function redoLastClientVisualTag_{div_id}() {{
+        const redoStack = loadClientVisualTagRedoStack_{div_id}();
+        if (!redoStack.length) {{
+            updateClientTagUndoRedoControls_{div_id}();
+            return;
+        }}
+
+        const restored = redoStack.pop();
+        saveClientVisualTagRedoStack_{div_id}(redoStack);
+
+        const items = loadClientVisualTags_{div_id}();
+        items.push(restored);
+        saveClientVisualTags_{div_id}(items);
+
+        addClientVisualTagTrace_{div_id}(restored, true);
+        instructionText_{div_id}.innerText =
+            "Redrew dragged tag: " + (restored.label || "Dragged tag") + ".";
+        rebuildHitResultsTable_{div_id}();
+        updateClientTagUndoRedoControls_{div_id}();
     }}
 
     function clearClientVisualTags_{div_id}() {{
         saveClientVisualTags_{div_id}([]);
+        saveClientVisualTagRedoStack_{div_id}([]);
 
-        const indices = [];
-        (gd_{div_id}.data || []).forEach(function(trace, idx) {{
-            if (trace && trace.meta && (trace.meta.source === "client_drag_tag" || trace.meta.source === "client_drag_overlap")) {{
-                indices.push(idx);
-            }}
-        }});
-
-        if (indices.length) {{
-            Plotly.deleteTraces(gd_{div_id}, indices).then(function() {{
-                rebuildHitResultsTable_{div_id}();
-            }});
-        }} else {{
+        removeClientVisualTagTraces_{div_id}(function() {{
             rebuildHitResultsTable_{div_id}();
-        }}
+            updateClientTagUndoRedoControls_{div_id}();
+            Plotly.redraw(gd_{div_id});
+        }});
     }}
 
     function _selectedAgentNameForRows_{div_id}() {{
@@ -1354,10 +1503,22 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
         }}
     }};
 
+    if (undoClientTagBtn_{div_id}) {{
+        undoClientTagBtn_{div_id}.onclick = function() {{
+            undoLastClientVisualTag_{div_id}();
+        }};
+    }};
+
+    if (redoClientTagBtn_{div_id}) {{
+        redoClientTagBtn_{div_id}.onclick = function() {{
+            redoLastClientVisualTag_{div_id}();
+        }};
+    }};
+
     if (clearClientTagsBtn_{div_id}) {{
         clearClientTagsBtn_{div_id}.onclick = function() {{
             clearClientVisualTags_{div_id}();
-            instructionText_{div_id}.innerText = "Cleared browser-stored dragged tags from Track 4.";
+            instructionText_{div_id}.innerText = "Cleared all browser-stored dragged tags from Track 4.";
         }};
     }};
 
@@ -1668,6 +1829,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
     updateHistoryText_{div_id}();
     setTaggingButtonStyle_{div_id}();
+    updateClientTagUndoRedoControls_{div_id}();
     </script>
     """
 
