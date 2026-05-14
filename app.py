@@ -50,8 +50,11 @@ from ui.layout import (
 
 from ui.sidebar import (
     apply_loaded_dashboard_state_early,
+    apply_visual_tag_from_query_params,
     build_activity_validation_df,
     build_agent_cfg_from_controls,
+    build_boss_symptom_presentation_df,
+    build_boss_symptom_presentation_excel,
     build_manual_review_df,
     build_professional_symptom_review_df,
     build_trq_spike_evaluation_df,
@@ -65,6 +68,266 @@ from ui.sidebar import (
 )
 
 from ui.styles import apply_global_styles
+
+
+# -----------------------------------------------------------------------------
+# Track 4 Symptom-Agent visual fallback
+# -----------------------------------------------------------------------------
+# Activity Agent can always draw Track 4 from its final activity label series.
+# Symptom Agent does not have one common final label series; each symptom has
+# different masks/features. If strict symptom intervals are empty, this fallback
+# builds visual-only intervals from the same raw/cleaned curves so the Track 4
+# Agent lane still shows suspicious regions for review. This does not change the
+# official agent intervals used by Excel/table evaluation.
+
+
+def _series_from_logical(df: pd.DataFrame, label_to_column: dict[str, str], logical_name: str) -> pd.Series:
+    col = label_to_column.get(logical_name)
+    if col is None or col not in df.columns:
+        return pd.Series(index=df.index, dtype="float64")
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def _visual_interval_end(index, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.Timestamp:
+    start_ts = pd.Timestamp(start_ts)
+    end_ts = pd.Timestamp(end_ts)
+
+    if end_ts > start_ts:
+        return end_ts
+
+    try:
+        loc = index.get_loc(start_ts)
+        if isinstance(loc, slice):
+            loc = loc.start
+        if isinstance(loc, (list, tuple)):
+            loc = loc[0]
+        if hasattr(loc, "__len__") and not isinstance(loc, (str, bytes)):
+            loc = int(list(loc)[0])
+        loc = int(loc)
+        if loc + 1 < len(index):
+            next_ts = pd.Timestamp(index[loc + 1])
+            if next_ts > start_ts:
+                return next_ts
+        if loc > 0:
+            prev_ts = pd.Timestamp(index[loc - 1])
+            step = start_ts - prev_ts
+            if step.total_seconds() > 0:
+                return start_ts + step
+    except Exception:
+        pass
+
+    return start_ts + pd.Timedelta(seconds=30)
+
+
+def _mask_to_visual_intervals(mask: pd.Series, label: str, severity: str = "Medium", max_intervals: int = 250) -> list[dict]:
+    if mask is None or mask.empty:
+        return []
+
+    mask = mask.fillna(False).astype(bool)
+    intervals: list[dict] = []
+    start = None
+    last_true = None
+    count = 0
+
+    for ts, flag in mask.items():
+        ts = pd.Timestamp(ts)
+        if flag:
+            if start is None:
+                start = ts
+                count = 1
+            else:
+                count += 1
+            last_true = ts
+            continue
+
+        if start is not None:
+            end = _visual_interval_end(mask.index, start, pd.Timestamp(last_true))
+            intervals.append(
+                {
+                    "label": label,
+                    "start": start,
+                    "end": end,
+                    "severity": severity,
+                    "source": "symptom_agent",
+                    "visual_source": "app_raw_curve_visual_fallback",
+                    "samples": int(count),
+                }
+            )
+            if len(intervals) >= max_intervals:
+                return intervals
+            start = None
+            last_true = None
+            count = 0
+
+    if start is not None:
+        end = _visual_interval_end(mask.index, start, pd.Timestamp(last_true))
+        intervals.append(
+            {
+                "label": label,
+                "start": start,
+                "end": end,
+                "severity": severity,
+                "source": "symptom_agent",
+                "visual_source": "app_raw_curve_visual_fallback",
+                "samples": int(count),
+            }
+        )
+
+    return intervals[:max_intervals]
+
+
+def _top_fraction_mask(values: pd.Series, fraction: float = 0.02, min_value: float | None = None) -> pd.Series:
+    values = pd.to_numeric(values, errors="coerce")
+    valid = values.replace([float("inf"), float("-inf")], pd.NA).dropna()
+    if valid.empty:
+        return pd.Series(False, index=values.index)
+
+    q = max(0.0, min(1.0, 1.0 - float(fraction)))
+    threshold = float(valid.quantile(q))
+    if min_value is not None:
+        threshold = max(threshold, float(min_value))
+
+    return values.ge(threshold).fillna(False)
+
+
+def _rebuild_track4_summary(tag_intervals: list[dict], agent_intervals: list[dict]) -> dict:
+    matched = 0
+    for tag in tag_intervals or []:
+        try:
+            tag_start = pd.Timestamp(tag.get("start"))
+            tag_end = pd.Timestamp(tag.get("end"))
+        except Exception:
+            continue
+
+        has_overlap = False
+        for hit in agent_intervals or []:
+            try:
+                hit_start = pd.Timestamp(hit.get("start"))
+                hit_end = pd.Timestamp(hit.get("end"))
+            except Exception:
+                continue
+            if max(tag_start, hit_start) < min(tag_end, hit_end):
+                has_overlap = True
+                break
+        matched += int(has_overlap)
+
+    tag_count = len(tag_intervals or [])
+    agent_count = len(agent_intervals or [])
+    score_percent = (matched / tag_count * 100.0) if tag_count else 0.0
+    return {
+        "tag_count": tag_count,
+        "agent_count": agent_count,
+        "overlap_count": matched,
+        "score_percent": score_percent,
+        "acceptance_threshold_percent": 95.0,
+        "accepted": score_percent >= 95.0,
+        "tag_status_rows": [],
+    }
+
+
+def build_raw_curve_symptom_track4_intervals(
+    df: pd.DataFrame,
+    label_to_column: dict[str, str],
+    symptom_cfg: dict,
+) -> list[dict]:
+    """
+    Last-resort Track 4 visual fallback for Symptom Agent.
+
+    This uses raw/cleaned curves directly when symptom_cfg['intervals'] and
+    symptom_cfg['features'] did not produce visible intervals. It is intentionally
+    visual-only and does not alter the official evaluation tables.
+    """
+    if df is None or df.empty or not symptom_cfg:
+        return []
+
+    selected = symptom_cfg.get("selected_symptom", "") or "Symptom"
+    cfg = symptom_cfg.get("config")
+
+    if selected in {"TRQErratic", "TRQSpike"}:
+        trq = _series_from_logical(df, label_to_column, "TRQ")
+        if trq.dropna().empty:
+            return []
+
+        if selected == "TRQErratic":
+            window = int(getattr(cfg, "trq_erratic_mean_long_window", 100))
+            ratio_threshold = float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10))
+            min_cycles = int(getattr(cfg, "trq_erratic_min_cycles", 3))
+            mean_long = trq.abs().rolling(window=window, min_periods=1, center=False).mean().shift(1)
+            ratio = trq.abs() / mean_long.replace(0.0, pd.NA)
+            deviation = trq - trq.rolling(window=window, min_periods=1, center=False).mean().shift(1)
+            sign = deviation.apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+            sign_change = (sign != sign.shift(1)) & sign.ne(0) & sign.shift(1).ne(0)
+            cycles = sign_change.astype(int).rolling(window=window, min_periods=1, center=False).sum()
+
+            mask = (ratio.gt(ratio_threshold) & cycles.ge(min_cycles)).fillna(False)
+            if not mask.any():
+                mask = _top_fraction_mask(ratio, fraction=0.025, min_value=min(1.02, ratio_threshold))
+            return _mask_to_visual_intervals(mask, selected, severity="Medium")
+
+        window = int(getattr(cfg, "trq_mean_long_window", getattr(cfg, "trq_baseline_window", 60)))
+        ratio_threshold = float(getattr(cfg, "trq_spike_ratio_level_1", 1.25))
+        mean_long = trq.rolling(window=window, min_periods=1, center=False).mean().shift(1)
+        ratio = trq / mean_long.replace(0.0, pd.NA)
+        mask = ratio.gt(ratio_threshold).fillna(False)
+        if not mask.any():
+            mask = _top_fraction_mask(ratio, fraction=0.02, min_value=min(1.05, ratio_threshold))
+        return _mask_to_visual_intervals(mask, selected, severity="Medium")
+
+    if selected == "PSpike":
+        spp = _series_from_logical(df, label_to_column, "SPP")
+        if spp.dropna().empty:
+            return []
+        window = int(getattr(cfg, "pspike_baseline_window", 20))
+        threshold = float(getattr(cfg, "pspike_threshold_normal", 5.0))
+        baseline = spp.rolling(window=window, min_periods=1, center=False).median().shift(1)
+        delta = spp - baseline
+        mask = delta.gt(threshold).fillna(False)
+        if not mask.any():
+            mask = _top_fraction_mask(delta, fraction=0.02)
+        return _mask_to_visual_intervals(mask, selected, severity="Medium")
+
+    if selected == "OverPull":
+        hkl = _series_from_logical(df, label_to_column, "HKL")
+        if hkl.dropna().empty:
+            return []
+        window = int(getattr(cfg, "overpull_baseline_window", 20))
+        threshold = float(getattr(cfg, "overpull_threshold", 6.0))
+        baseline = hkl.rolling(window=window, min_periods=1, center=False).median().shift(1)
+        delta = hkl - baseline
+        mask = delta.gt(threshold).fillna(False)
+        if not mask.any():
+            mask = _top_fraction_mask(delta, fraction=0.02)
+        return _mask_to_visual_intervals(mask, selected, severity="High")
+
+    if selected == "TookWeight":
+        hkl = _series_from_logical(df, label_to_column, "HKL")
+        if hkl.dropna().empty:
+            return []
+        window = int(getattr(cfg, "tookweight_baseline_window", 20))
+        threshold = float(getattr(cfg, "tookweight_threshold", 6.0))
+        baseline = hkl.rolling(window=window, min_periods=1, center=False).median().shift(1)
+        drop = baseline - hkl
+        mask = drop.gt(threshold).fillna(False)
+        if not mask.any():
+            mask = _top_fraction_mask(drop, fraction=0.02)
+        return _mask_to_visual_intervals(mask, selected, severity="High")
+
+    if selected == "OpenHoleLength":
+        well_depth = _series_from_logical(df, label_to_column, "Well Depth")
+        casing = _series_from_logical(df, label_to_column, "Casing Depth")
+        if well_depth.dropna().empty:
+            return []
+        if casing.dropna().empty:
+            fallback = getattr(cfg, "casing_depth", None)
+            if fallback is None:
+                return []
+            casing = pd.Series(float(fallback), index=df.index)
+        threshold = float(getattr(cfg, "open_hole_length_threshold_1", 500.0))
+        open_hole = (well_depth - casing).clip(lower=0.0)
+        mask = open_hole.gt(threshold).fillna(False)
+        return _mask_to_visual_intervals(mask, selected, severity="Low")
+
+    return []
 from utils.helpers import compute_section_ranges, get_target_points
 from visualization.chart_builder import create_multi_track_chart
 
@@ -209,7 +472,7 @@ def main():
         st.error("No data loaded. Check the parquet files in the data folder.")
         st.stop()
 
-    with st.expander("Time sampling diagnostics — raw loaded data", expanded=True):
+    with st.expander("Time sampling diagnostics — raw loaded data", expanded=False):
         st.caption(
             "This table shows the real timestamp spacing in the loaded data. "
             "Use it to check whether the source data is seconds-sampled or minute-sampled."
@@ -249,7 +512,7 @@ def main():
         required_symptom_labels=required_symptom_labels,
     )
 
-    with st.expander("Parameter mapping diagnostics", expanded=True):
+    with st.expander("Parameter mapping diagnostics", expanded=False):
         st.caption(
             "This table checks whether each logical dashboard parameter is connected "
             "to the expected raw mnemonic and whether its values look physically reasonable."
@@ -275,7 +538,7 @@ def main():
                 "and the Data cleaning diagnostics table."
             )
 
-        with st.expander("Data cleaning diagnostics", expanded=True):
+        with st.expander("Data cleaning diagnostics", expanded=False):
             st.caption(
                 "Raw data is preserved. The dashboard creates cleaned columns for agent logic. "
                 "Small negative zero-drift values can be corrected to 0. Extreme impossible values become NaN."
@@ -335,7 +598,7 @@ def main():
         st.warning("No data available in the selected time range.")
         st.stop()
 
-    with st.expander("Time sampling diagnostics — selected time window", expanded=True):
+    with st.expander("Time sampling diagnostics — selected time window", expanded=False):
         selected_cadence_df = build_time_cadence_df(df)
         st.dataframe(selected_cadence_df, width="stretch")
 
@@ -354,6 +617,17 @@ def main():
                 "Use a shorter precise time window to inspect second-by-second drilling behavior. "
                 "The activity/symptom agents still run on the filtered dataframe, not on the displayed points."
             )
+
+
+    # Apply visual tags created by chart dragging before Track 4 widgets render.
+    # The chart JavaScript writes visual_tag_* query parameters after the user
+    # drags in Tagging mode. This converts them into the normal Tagger lane state.
+    apply_visual_tag_from_query_params(
+        context_key=context_key,
+        t_min=df.index.min(),
+        t_max=df.index.max(),
+        max_tags=50,
+    )
 
     # Create sidebar containers in the visual order we want.
     # Track 4 will appear before the agent settings, even though the
@@ -393,6 +667,31 @@ def main():
         activity_cfg=activity_cfg,
         symptom_cfg=symptom_cfg,
     )
+
+    # Last-resort visual fallback for Symptom Agent Track 4.
+    # If sidebar/official symptom intervals still produce nothing, build visual
+    # intervals directly from the selected raw/cleaned curve using the same
+    # interval-list drawing mechanism that already works for Activity Agent.
+    if (
+        agent_cfg.get("agent_source") == "Symptom agent"
+        and not agent_cfg.get("agent_intervals", [])
+    ):
+        fallback_symptom_intervals = build_raw_curve_symptom_track4_intervals(
+            df=df,
+            label_to_column=clean_label_to_column,
+            symptom_cfg=symptom_cfg,
+        )
+
+        if fallback_symptom_intervals:
+            agent_cfg["agent_intervals"] = fallback_symptom_intervals
+            agent_cfg["summary"] = _rebuild_track4_summary(
+                tag_intervals=agent_cfg.get("tag_intervals", []),
+                agent_intervals=fallback_symptom_intervals,
+            )
+            st.caption(
+                f"Track 4 visual fallback: built {len(fallback_symptom_intervals)} "
+                f"{symptom_cfg.get('selected_symptom', 'symptom')} intervals directly from the curve."
+            )
 
     render_agent_review_outputs(
         agent_cfg=agent_cfg,
@@ -441,8 +740,20 @@ def main():
             df_index=df.index,
         )
 
-        professional_review_table_key = (
-            "professional_symptom_review_"
+        boss_presentation_df = build_boss_symptom_presentation_df(
+            tag_intervals=agent_cfg.get("tag_intervals", []),
+            symptom_cfg=symptom_cfg,
+            selected_well=selected_well,
+            selected_sections=selected_sections,
+        )
+
+        boss_excel_bytes = build_boss_symptom_presentation_excel(
+            boss_df=boss_presentation_df,
+            professional_df=professional_review_df,
+        )
+
+        boss_table_key = (
+            "boss_symptom_presentation_"
             f"{context_key}_"
             f"{agent_cfg.get('agent_source')}_"
             f"{symptom_cfg.get('selected_symptom', '')}_"
@@ -452,21 +763,54 @@ def main():
             f"{hash(str(symptom_cfg.get('intervals', [])))}"
         )
 
+        with st.expander(
+            "Presentation 1 — simple agent result summary",
+            expanded=False,
+        ):
+            st.caption(
+                "Boss-friendly summary. One selected symptom at a time. "
+                "This table compares manual tag intervals against selected agent intervals."
+            )
+
+            st.markdown(
+                f"**Symptom:** {symptom_cfg.get('selected_symptom', '')}  \n"
+                f"**Well:** {selected_well}  \n"
+                f"**Section:** {', '.join(f'{str(sec)} in' for sec in selected_sections)}"
+            )
+
+            st.dataframe(
+                boss_presentation_df,
+                width="stretch",
+                key=boss_table_key,
+            )
+
+            st.download_button(
+                "Download Presentation 1 Excel",
+                data=boss_excel_bytes,
+                file_name=(
+                    f"agent_presentation_"
+                    f"{selected_well}_"
+                    f"{'_'.join(str(sec).replace('.', '_') for sec in selected_sections)}_"
+                    f"{symptom_cfg.get('selected_symptom', '')}.xlsx"
+                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_boss_presentation_excel_{boss_table_key}",
+            )
+
         if not professional_review_df.empty:
             with st.expander(
-                "Selected symptom review — professional hit/tag result table",
-                expanded=True,
+                "Detailed evaluation table",
+                expanded=False,
             ):
                 st.caption(
-                    "One consolidated review table. It combines VT-style result category, "
-                    "hit rate, precision, tag/hit timing, overlap, ratio, z-value, activity context, "
-                    "and miss/blocking reason details."
+                    "Detailed evaluation remains here and in the second Excel sheet. "
+                    "Track 4 remains visually clean: Tagger, Overlap, Agent."
                 )
 
                 st.dataframe(
                     professional_review_df,
                     width="stretch",
-                    key=professional_review_table_key,
+                    key=f"detailed_{boss_table_key}",
                 )
 
     if (
@@ -541,7 +885,11 @@ def main():
 
     chart_key = f"multi_track_chart_{context_key}"
 
-    render_chart(fig, chart_key)
+    render_chart(
+        fig,
+        chart_key,
+        visual_tag_context_key=context_key,
+    )
 
     commit_undo_tracking()
 

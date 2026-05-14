@@ -600,6 +600,86 @@ def _safe_uploaded_label(value, fallback: str) -> str:
     text = str(value).strip()
     return text if text else fallback
 
+
+def apply_visual_tag_from_query_params(
+    context_key: str,
+    t_min,
+    t_max,
+    max_tags: int = 50,
+):
+    """
+    Read visual tag start/end from URL query params created by the chart JavaScript.
+
+    IMPORTANT FIX:
+    Do not push visual tags into the three manual Tag 1/2/3 widgets.
+    Those widgets are limited and can be overwritten by Streamlit widget state.
+    Instead, store chart-drag tags in an unlimited session_state list and then
+    render them through the same Track 4 tag_intervals list used by manual tags.
+    """
+
+    params = st.query_params
+
+    if params.get("visual_tag_context") != context_key:
+        return
+
+    start_text = params.get("visual_tag_start")
+    end_text = params.get("visual_tag_end")
+    nonce = str(params.get("visual_tag_nonce", ""))
+
+    if not start_text or not end_text:
+        return
+
+    try:
+        start_ts = pd.Timestamp(start_text)
+        end_ts = pd.Timestamp(end_text)
+
+        min_ts = pd.Timestamp(t_min)
+        max_ts = pd.Timestamp(t_max)
+
+        start_ts = _clamp_timestamp(start_ts, min_ts, max_ts)
+        end_ts = _clamp_timestamp(end_ts, min_ts, max_ts)
+
+        if end_ts <= start_ts:
+            st.query_params.clear()
+            return
+
+        visual_tags_key = f"visual_tag_intervals_{context_key}"
+        last_nonce_key = f"_last_visual_tag_nonce_{context_key}"
+
+        # Prevent duplicate append if Streamlit reruns twice for the same URL.
+        if nonce and st.session_state.get(last_nonce_key) == nonce:
+            st.query_params.clear()
+            return
+
+        existing_tags = st.session_state.get(visual_tags_key, [])
+        if not isinstance(existing_tags, list):
+            existing_tags = []
+
+        tag_number = len(existing_tags) + 1
+        new_tag = {
+            "label": f"Visual Tag {tag_number}",
+            "start": _format_datetime_text(start_ts),
+            "end": _format_datetime_text(end_ts),
+            "source": "chart_drag",
+        }
+
+        existing_tags.append(new_tag)
+
+        # Keep a generous cap only to protect session_state, not to limit review work.
+        existing_tags = existing_tags[-int(max_tags):]
+
+        st.session_state[visual_tags_key] = existing_tags
+        if nonce:
+            st.session_state[last_nonce_key] = nonce
+
+        st.query_params.clear()
+        st.rerun()
+
+    except Exception as e:
+        st.warning(f"Could not create visual tag from chart selection: {e}")
+        st.query_params.clear()
+
+
 def _apply_loaded_review_to_state(
     uploaded_data: dict,
     context_key: str,
@@ -1256,13 +1336,13 @@ def render_activity_agent_controls(context_key: str, df=None, parent=None):
             t_min = df.index.min().to_pydatetime()
             t_max = df.index.max().to_pydatetime()
 
-        manual_activity_tags = render_manual_activity_validation_tags(
-            context_key=context_key,
-            t_min=t_min,
-            t_max=t_max,
-        )
-
-
+            manual_activity_tags = render_manual_activity_validation_tags(
+                context_key=context_key,
+                t_min=t_min,
+                t_max=t_max,
+            )
+        else:
+            st.warning("No data available for manual activity validation tags.")
 
         with st.expander("Activity thresholds — VT document definitions", expanded=False):
             short_window = st.number_input(
@@ -1453,11 +1533,32 @@ def render_symptom_agent_controls(context_key: str, parent=None):
             key=f"enable_symptom_agents_{context_key}",
         )
 
+        selected_symptom_options = [
+            "OpenHoleLength",
+            "TRQSpike",
+            "TRQErratic",
+            "PSpike",
+            "OverPull",
+            "TookWeight",
+        ]
+        selected_symptom_key = f"selected_symptom_lane_{context_key}"
+        selected_symptom_default_key = f"_selected_symptom_default_fixed_{context_key}"
+
+        # Streamlit keeps old selectbox values in session_state. If the app was
+        # opened before the default changed, it may stay on OpenHoleLength.
+        # Force TRQErratic once per well/section context, then let the user choose freely.
+        if not st.session_state.get(selected_symptom_default_key, False):
+            if st.session_state.get(selected_symptom_key) in (None, "OpenHoleLength"):
+                st.session_state[selected_symptom_key] = "TRQErratic"
+            st.session_state[selected_symptom_default_key] = True
+
+        if st.session_state.get(selected_symptom_key) not in selected_symptom_options:
+            st.session_state[selected_symptom_key] = "TRQErratic"
+
         selected_symptom = st.selectbox(
             "Symptom shown in Track 4 agent lane",
-            options=["OpenHoleLength", "TRQSpike", "TRQErratic", "PSpike", "OverPull", "TookWeight"],
-            index=0,
-            key=f"selected_symptom_lane_{context_key}",
+            options=selected_symptom_options,
+            key=selected_symptom_key,
         )
 
         with st.expander("Symptom thresholds — VT document definitions", expanded=False):
@@ -2200,10 +2301,14 @@ def build_symptom_hit_tag_comparison(
     - False Positive: agent hit has no overlapping manual tag
     - True Negative: selected-window samples outside both tags and hits
 
-    Hit rate:
-    TP / (TP + FN)
+    Important:
+    A single long agent interval is allowed to match several manual tags.
+    This is intentional for drilling review because one continuous symptom hit
+    can cover several boss-defined tag intervals. The older one-to-one matching
+    logic could incorrectly turn later tags into misses.
 
-    For TRQSpike/TRQErratic this also prints ratio and z-value where available.
+    Hit rate / recall:
+    TP / (TP + FN)
     """
 
     selected_symptom = symptom_cfg.get("selected_symptom", "")
@@ -2228,24 +2333,13 @@ def build_symptom_hit_tag_comparison(
         "Notes",
     ]
 
-    summary_columns = [
-        "Metric",
-        "Value",
-    ]
+    summary_columns = ["Metric", "Value"]
 
     def _duration_sec(start, end) -> float:
         try:
-            return max(
-                (
-                    pd.Timestamp(end) - pd.Timestamp(start)
-                ).total_seconds(),
-                0.0,
-            )
+            return max((pd.Timestamp(end) - pd.Timestamp(start)).total_seconds(), 0.0)
         except Exception:
             return 0.0
-
-    def _safe_overlap(a_start, a_end, b_start, b_end):
-        return interval_overlap(a_start, a_end, b_start, b_end)
 
     def _fmt_number(value, decimals: int = 3):
         if value is None or pd.isna(value):
@@ -2257,10 +2351,6 @@ def build_symptom_hit_tag_comparison(
             return pd.NA
 
     def _feature_stats(start, end) -> dict:
-        """
-        Extract useful diagnostic values from the feature window.
-        For TRQSpike and TRQErratic this prints ratio and z-value when present.
-        """
         stats = {
             "max_ratio": pd.NA,
             "max_z": pd.NA,
@@ -2290,27 +2380,22 @@ def build_symptom_hit_tag_comparison(
         return stats
 
     rows = []
-    used_hit_indexes = set()
 
     # ------------------------------------------------------------
-    # Match tags to hits.
-    # Each tag gets the best overlapping hit.
+    # Match each manual tag to the best overlapping hit.
+    # Do not consume the hit. One long hit may correctly cover several tags.
     # ------------------------------------------------------------
     for tag_i, tag in enumerate(tag_intervals):
         tag_start = pd.Timestamp(tag["start"])
         tag_end = pd.Timestamp(tag["end"])
         tag_label = str(tag.get("label", f"Tag {tag_i + 1}"))
 
-        best_hit_i = None
         best_hit = None
         best_overlap = None
         best_overlap_sec = 0.0
 
-        for hit_i, hit in enumerate(symptom_intervals):
-            if hit_i in used_hit_indexes:
-                continue
-
-            ov = _safe_overlap(
+        for hit in symptom_intervals:
+            ov = interval_overlap(
                 tag_start,
                 tag_end,
                 hit["start"],
@@ -2322,15 +2407,12 @@ def build_symptom_hit_tag_comparison(
 
             ov_sec = _duration_sec(ov[0], ov[1])
 
-            if ov_sec >= best_overlap_sec:
-                best_hit_i = hit_i
+            if ov_sec > best_overlap_sec:
                 best_hit = hit
                 best_overlap = ov
                 best_overlap_sec = ov_sec
 
         if best_hit is not None:
-            used_hit_indexes.add(best_hit_i)
-
             stats = _feature_stats(tag_start, tag_end)
 
             rows.append(
@@ -2352,7 +2434,6 @@ def build_symptom_hit_tag_comparison(
                     "Notes": "Manual tag overlaps selected symptom-agent hit.",
                 }
             )
-
         else:
             stats = _feature_stats(tag_start, tag_end)
 
@@ -2377,14 +2458,28 @@ def build_symptom_hit_tag_comparison(
             )
 
     # ------------------------------------------------------------
-    # Remaining unmatched hits are false positives.
+    # Agent hits that overlap no manual tag are false positives.
     # ------------------------------------------------------------
-    for hit_i, hit in enumerate(symptom_intervals):
-        if hit_i in used_hit_indexes:
-            continue
-
+    for hit in symptom_intervals:
         hit_start = pd.Timestamp(hit["start"])
         hit_end = pd.Timestamp(hit["end"])
+
+        overlaps_any_tag = False
+
+        for tag in tag_intervals:
+            ov = interval_overlap(
+                tag["start"],
+                tag["end"],
+                hit_start,
+                hit_end,
+            )
+
+            if ov is not None:
+                overlaps_any_tag = True
+                break
+
+        if overlaps_any_tag:
+            continue
 
         stats = _feature_stats(hit_start, hit_end)
 
@@ -2408,11 +2503,6 @@ def build_symptom_hit_tag_comparison(
             }
         )
 
-    # ------------------------------------------------------------
-    # True negative samples: selected-window rows outside both tags and hits.
-    # This is sample-based because interval-level true negatives are not
-    # naturally countable unless VT defines fixed negative windows.
-    # ------------------------------------------------------------
     true_negative_samples = 0
 
     if df_index is not None and len(df_index) > 0:
@@ -2729,6 +2819,190 @@ def build_professional_symptom_review_df(
 
     return review_df
 
+
+def build_boss_symptom_presentation_df(
+    tag_intervals: list[dict],
+    symptom_cfg: dict,
+    selected_well: str,
+    selected_sections: tuple[str, ...] | list[str],
+) -> pd.DataFrame:
+    """
+    Boss-friendly Presentation 1.
+
+    One symptom/parameter at a time.
+    Simple columns only:
+    Tag Start | Tag End | Agent Start | Agent End | Result | Percent
+
+    Important:
+    A single long agent interval is allowed to match multiple manual tags.
+    We do NOT consume/remove a hit after matching one tag. This avoids the
+    previous problem where a real hit could become a miss only because another
+    tag used the same agent interval first.
+    """
+
+    selected_symptom = symptom_cfg.get("selected_symptom", "")
+    agent_intervals = symptom_cfg.get("intervals", [])
+
+    section_label = ", ".join(f"{str(sec)} in" for sec in selected_sections)
+
+    columns = [
+        "Symptom",
+        "Well",
+        "Section",
+        "Date",
+        "Tag Start",
+        "Tag End",
+        "Agent Start",
+        "Agent End",
+        "Result",
+        "Percent",
+    ]
+
+    def _duration_sec(start, end) -> float:
+        try:
+            return max((pd.Timestamp(end) - pd.Timestamp(start)).total_seconds(), 0.0)
+        except Exception:
+            return 0.0
+
+    def _time_text(value) -> str:
+        if value is None or pd.isna(value):
+            return ""
+        return pd.Timestamp(value).strftime("%H:%M:%S")
+
+    def _date_text(value) -> str:
+        if value is None or pd.isna(value):
+            return ""
+        return pd.Timestamp(value).strftime("%d.%m.%Y")
+
+    rows = []
+
+    for tag_i, tag in enumerate(tag_intervals, start=1):
+        tag_start = pd.Timestamp(tag["start"])
+        tag_end = pd.Timestamp(tag["end"])
+        tag_duration = _duration_sec(tag_start, tag_end)
+
+        best_hit = None
+        best_overlap = None
+        best_overlap_sec = 0.0
+
+        for hit in agent_intervals:
+            ov = interval_overlap(
+                tag_start,
+                tag_end,
+                hit["start"],
+                hit["end"],
+            )
+
+            if ov is None:
+                continue
+
+            overlap_sec = _duration_sec(ov[0], ov[1])
+
+            if overlap_sec > best_overlap_sec:
+                best_hit = hit
+                best_overlap = ov
+                best_overlap_sec = overlap_sec
+
+        percent = 0.0
+        if tag_duration > 0:
+            percent = best_overlap_sec / tag_duration * 100.0
+
+        if best_hit is not None and best_overlap is not None:
+            result = "Hit"
+            agent_start = pd.Timestamp(best_hit["start"])
+            agent_end = pd.Timestamp(best_hit["end"])
+        else:
+            result = "Miss"
+            agent_start = pd.NaT
+            agent_end = pd.NaT
+
+        rows.append(
+            {
+                "Symptom": selected_symptom,
+                "Well": selected_well,
+                "Section": section_label,
+                "Date": _date_text(tag_start),
+                "Tag Start": _time_text(tag_start),
+                "Tag End": _time_text(tag_end),
+                "Agent Start": _time_text(agent_start),
+                "Agent End": _time_text(agent_end),
+                "Result": result,
+                "Percent": f"{round(percent, 1)}% hit",
+            }
+        )
+
+    # Add extra agent hits that do not overlap any tag.
+    for hit in agent_intervals:
+        hit_start = pd.Timestamp(hit["start"])
+        hit_end = pd.Timestamp(hit["end"])
+
+        overlaps_any_tag = False
+
+        for tag in tag_intervals:
+            ov = interval_overlap(
+                tag["start"],
+                tag["end"],
+                hit_start,
+                hit_end,
+            )
+
+            if ov is not None:
+                overlaps_any_tag = True
+                break
+
+        if overlaps_any_tag:
+            continue
+
+        rows.append(
+            {
+                "Symptom": selected_symptom,
+                "Well": selected_well,
+                "Section": section_label,
+                "Date": _date_text(hit_start),
+                "Tag Start": "",
+                "Tag End": "",
+                "Agent Start": _time_text(hit_start),
+                "Agent End": _time_text(hit_end),
+                "Result": "Extra Agent Hit",
+                "Percent": "",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_boss_symptom_presentation_excel(
+    boss_df: pd.DataFrame,
+    professional_df: pd.DataFrame | None = None,
+) -> bytes:
+    """
+    Build Excel output with:
+    Sheet 1: boss-friendly summary
+    Sheet 2: detailed evaluation table
+    """
+
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        boss_df.to_excel(
+            writer,
+            sheet_name="Presentation 1 Summary",
+            index=False,
+        )
+
+        if professional_df is not None and not professional_df.empty:
+            professional_df.to_excel(
+                writer,
+                sheet_name="Detailed Evaluation",
+                index=False,
+            )
+
+    return output.getvalue()
+
+
 def render_agent_controls(
     df,
     context_key: str,
@@ -2766,7 +3040,6 @@ def render_agent_controls(
         )
         chart_height = 950 if review_mode == "Standard review" else 1400
 
-
         show_reference_line = st.checkbox(
             "Show cross-track reference line",
             value=False,
@@ -2789,19 +3062,56 @@ def render_agent_controls(
                 format="YYYY-MM-DD HH:mm:ss",
                 key=f"reference_time_{context_key}",
             )
+
         tag_intervals = []
         manual_agent_intervals = []
 
         st.markdown("**Tagger lane**")
         st.caption(
-            "Use these fields to manually mark an observation interval. "
-            "Choose the start and end time directly."
+            "Use the 🏷 Tagging tool above the Plotly chart, then drag vertically over "
+            "the suspicious interval. The dragged time interval is copied directly into "
+            "Track 4. Manual Tag 1/2/3 fields still work, but chart-drag tags are not limited to three."
         )
+
+        visual_tags_key = f"visual_tag_intervals_{context_key}"
+        visual_tags = st.session_state.get(visual_tags_key, [])
+        if not isinstance(visual_tags, list):
+            visual_tags = []
+            st.session_state[visual_tags_key] = visual_tags
+
+        if visual_tags:
+            st.caption(f"Chart-drag tags: {len(visual_tags)}")
+
+            if st.button(
+                "Clear chart-drag tags",
+                key=f"clear_visual_tags_{context_key}",
+            ):
+                st.session_state[visual_tags_key] = []
+                st.rerun()
+
+            for visual_i, visual_tag in enumerate(visual_tags, start=1):
+                try:
+                    visual_start = pd.Timestamp(visual_tag.get("start"))
+                    visual_end = pd.Timestamp(visual_tag.get("end"))
+                except Exception:
+                    continue
+
+                if visual_end <= visual_start:
+                    continue
+
+                tag_intervals.append(
+                    {
+                        "label": str(visual_tag.get("label", f"Visual Tag {visual_i}")),
+                        "start": visual_start.to_pydatetime(),
+                        "end": visual_end.to_pydatetime(),
+                        "source": "chart_drag",
+                    }
+                )
 
         for i in range(1, 4):
             enabled = st.checkbox(
                 f"Enable Tag {i}",
-                value=(i == 1),
+                value=False,
                 key=f"enable_tag_{i}_{context_key}",
             )
 
@@ -2813,7 +3123,7 @@ def render_agent_controls(
                 )
 
                 tag_start = _safe_datetime_input(
-                    label=f"Tag {i} start time — day / hour / minute",
+                    label=f"Tag {i} start time — year / month / day / hour / minute / second",
                     key=f"tag_start_{i}_{context_key}",
                     default_value=t_min,
                     min_value=t_min,
@@ -2821,7 +3131,7 @@ def render_agent_controls(
                 )
 
                 tag_end = _safe_datetime_input(
-                    label=f"Tag {i} end time — day / hour / minute",
+                    label=f"Tag {i} end time — year / month / day / hour / minute / second",
                     key=f"tag_end_{i}_{context_key}",
                     default_value=min(t_max, t_min + timedelta(minutes=30)),
                     min_value=t_min,
@@ -2845,15 +3155,27 @@ def render_agent_controls(
                     }
                 )
 
-        
-
         st.markdown("**Agent lane**")
+
+        agent_source_options = ["Manual interval", "Activity agent", "Symptom agent"]
+        agent_source_key = f"agent_source_{context_key}"
+        agent_source_default_key = f"_agent_source_default_fixed_{context_key}"
+
+        # Streamlit keeps old widget values in session_state. If this app was opened
+        # before the default changed, the radio can stay stuck on "Manual interval".
+        # Force the new default once per well/section context, then let the user choose freely.
+        if not st.session_state.get(agent_source_default_key, False):
+            if st.session_state.get(agent_source_key) in (None, "Manual interval"):
+                st.session_state[agent_source_key] = "Symptom agent"
+            st.session_state[agent_source_default_key] = True
+
+        if st.session_state.get(agent_source_key) not in agent_source_options:
+            st.session_state[agent_source_key] = "Symptom agent"
 
         agent_source = st.radio(
             "Agent lane source",
-            options=["Manual interval", "Activity agent", "Symptom agent"],
-            index=0,
-            key=f"agent_source_{context_key}",
+            options=agent_source_options,
+            key=agent_source_key,
         )
 
         activity_ui = _default_activity_ui(enabled=False)
@@ -2891,8 +3213,6 @@ def render_agent_controls(
                     format="YYYY-MM-DD HH:mm:ss",
                     key=agent_interval_key,
                 )
-
-                
 
                 severity = st.selectbox(
                     "Agent Hit severity",
@@ -2942,6 +3262,619 @@ def render_agent_controls(
         "review_mode": review_mode,
     }
 
+
+def _infer_visual_interval_end(start_ts: pd.Timestamp, end_ts: pd.Timestamp, index=None) -> pd.Timestamp:
+    """
+    Track 4 interval lines need a visible time span.
+    Some symptom agents can produce one-sample/zero-duration hits.
+    Activity intervals are usually multi-sample, so they already draw clearly.
+    This helper gives symptom and visual-tag intervals the same practical visibility.
+    """
+    start_ts = pd.Timestamp(start_ts)
+    end_ts = pd.Timestamp(end_ts)
+
+    if end_ts > start_ts:
+        return end_ts
+
+    step = pd.Timedelta(seconds=1)
+
+    try:
+        if index is not None and len(index) > 1:
+            idx = pd.DatetimeIndex(index).sort_values()
+            diffs = pd.Series(idx).diff().dropna()
+            diffs = diffs[diffs > pd.Timedelta(0)]
+            if not diffs.empty:
+                step = diffs.median()
+    except Exception:
+        step = pd.Timedelta(seconds=1)
+
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        step = pd.Timedelta(seconds=1)
+
+    return start_ts + step
+
+
+def _mask_to_track4_intervals_for_visualization(
+    mask: pd.Series,
+    label: str,
+    severity: str,
+) -> list[dict]:
+    """
+    Convert a boolean symptom mask into Track 4 intervals using the same idea as
+    the Activity Agent interval visualization: continuous True samples become
+    vertical interval lines in the Agent lane.
+    """
+    if mask is None or mask.empty:
+        return []
+
+    mask = mask.fillna(False).astype(bool)
+    index = mask.index
+    intervals = []
+    start = None
+    count = 0
+
+    for ts, flag in mask.items():
+        if flag and start is None:
+            start = pd.Timestamp(ts)
+            count = 1
+            continue
+
+        if flag and start is not None:
+            count += 1
+            continue
+
+        if (not flag) and start is not None:
+            loc = mask.index.get_loc(ts)
+            prev_ts = mask.index[max(0, loc - 1)]
+            end = _infer_visual_interval_end(start, pd.Timestamp(prev_ts), index=index)
+            intervals.append(
+                {
+                    "label": label,
+                    "start": start,
+                    "end": end,
+                    "severity": severity,
+                    "source": "symptom_agent",
+                    "visual_source": "feature_mask",
+                    "samples": int(count),
+                }
+            )
+            start = None
+            count = 0
+
+    if start is not None:
+        end = _infer_visual_interval_end(start, pd.Timestamp(mask.index[-1]), index=index)
+        intervals.append(
+            {
+                "label": label,
+                "start": start,
+                "end": end,
+                "severity": severity,
+                "source": "symptom_agent",
+                "visual_source": "feature_mask",
+                "samples": int(count),
+            }
+        )
+
+    return intervals
+
+
+def _normalize_symptom_label(value) -> str:
+    """Normalize symptom labels before filtering Track 4 intervals."""
+    return str(value or "").strip().replace(" ", "").replace("_", "").lower()
+
+
+def _as_bool_mask(series, index=None) -> pd.Series:
+    """
+    Convert a feature column into a safe boolean mask.
+    Handles real booleans, 0/1 numbers, and text values.
+    """
+    if series is None:
+        return pd.Series(False, index=index if index is not None else pd.Index([]))
+
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series, index=index)
+
+    if series.empty:
+        return pd.Series(False, index=series.index)
+
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False).astype(bool)
+
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().any():
+        return numeric.fillna(0.0).ne(0.0)
+
+    text = series.astype(str).str.strip().str.lower()
+    return text.isin(["true", "1", "yes", "y", "on"])
+
+
+def _deduplicate_track4_intervals(intervals: list[dict]) -> list[dict]:
+    seen = set()
+    unique = []
+
+    for item in intervals or []:
+        try:
+            start = pd.Timestamp(item.get("start"))
+            end = pd.Timestamp(item.get("end"))
+        except Exception:
+            continue
+
+        key = (
+            _normalize_symptom_label(item.get("label", "")),
+            str(start),
+            str(end),
+            str(item.get("severity", "")),
+            str(item.get("source", "")),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append({**item, "start": start, "end": end})
+
+    return unique
+
+
+def _append_mask_intervals(
+    output: list[dict],
+    features: pd.DataFrame,
+    column_name: str,
+    label: str,
+    severity: str,
+    visual_source: str | None = None,
+):
+    if features is None or features.empty or column_name not in features.columns:
+        return
+
+    new_items = _mask_to_track4_intervals_for_visualization(
+        mask=_as_bool_mask(features[column_name]),
+        label=label,
+        severity=severity,
+    )
+
+    for item in new_items:
+        item["source"] = "symptom_agent"
+        item["visual_source"] = visual_source or column_name
+
+    output.extend(new_items)
+
+
+def _build_trq_erratic_candidate_intervals(
+    features: pd.DataFrame,
+    symptom_cfg: dict,
+    selected_symptom: str,
+) -> list[dict]:
+    """
+    Fallback visual lane for TRQErratic.
+
+    The official TRQErratic interval builder may return nothing if the final
+    run is shorter than min_samples, or if a context/rpm-stability gate removes
+    it. Track 4 is a visual review lane, so when official intervals are empty we
+    still show the agent's detected erratic-candidate regions from the feature
+    table, using the same interval visualization method that fixed the single
+    Activity Agent display.
+    """
+    if features is None or features.empty:
+        return []
+
+    cfg = symptom_cfg.get("config", SymptomConfig()) if isinstance(symptom_cfg, dict) else SymptomConfig()
+
+    candidate = pd.Series(False, index=features.index)
+
+    if "trq_ratio" in features.columns and "trq_cycle_count" in features.columns:
+        trq_ratio = pd.to_numeric(features["trq_ratio"], errors="coerce")
+        cycle_count = pd.to_numeric(features["trq_cycle_count"], errors="coerce")
+
+        candidate = (
+            trq_ratio.gt(float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)))
+            & cycle_count.ge(int(getattr(cfg, "trq_erratic_min_cycles", 3)))
+        )
+
+        # Prefer the real context gates if they are available, but do not let a
+        # missing gate column make the mask empty.
+        if "context_mask" in features.columns:
+            candidate &= _as_bool_mask(features["context_mask"])
+        if "rpm_stable" in features.columns:
+            candidate &= _as_bool_mask(features["rpm_stable"])
+
+    if not candidate.any():
+        # Last visual fallback: show ratio-only suspicious regions. This does
+        # not change the agent logic or Excel evaluation; it only makes Track 4
+        # useful for visual inspection when strict interval formation removed
+        # all official runs.
+        if "trq_ratio" in features.columns:
+            trq_ratio = pd.to_numeric(features["trq_ratio"], errors="coerce")
+            candidate = trq_ratio.gt(float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)))
+
+    visual_intervals = _mask_to_track4_intervals_for_visualization(
+        mask=candidate,
+        label=selected_symptom,
+        severity="Medium",
+    )
+
+    for item in visual_intervals:
+        item["source"] = "symptom_agent"
+        item["visual_source"] = "trq_erratic_candidate_mask"
+
+    return visual_intervals
+
+
+def _numeric_threshold_mask(
+    features: pd.DataFrame,
+    column_name: str,
+    threshold: float,
+    operator: str = "gt",
+) -> pd.Series:
+    """Build a safe boolean mask from a numeric feature column."""
+    if features is None or features.empty or column_name not in features.columns:
+        return pd.Series(False, index=features.index if features is not None else pd.Index([]))
+
+    values = pd.to_numeric(features[column_name], errors="coerce")
+
+    if operator == "lt":
+        return values.lt(float(threshold)).fillna(False)
+
+    if operator == "ge":
+        return values.ge(float(threshold)).fillna(False)
+
+    if operator == "le":
+        return values.le(float(threshold)).fillna(False)
+
+    return values.gt(float(threshold)).fillna(False)
+
+
+def _append_numeric_candidate_intervals(
+    output: list[dict],
+    features: pd.DataFrame,
+    column_name: str,
+    threshold: float,
+    label: str,
+    severity: str,
+    operator: str = "gt",
+    visual_source: str | None = None,
+):
+    """Append Track 4 intervals from a numeric threshold candidate mask."""
+    if features is None or features.empty or column_name not in features.columns:
+        return
+
+    mask = _numeric_threshold_mask(
+        features=features,
+        column_name=column_name,
+        threshold=threshold,
+        operator=operator,
+    )
+
+    new_items = _mask_to_track4_intervals_for_visualization(
+        mask=mask,
+        label=label,
+        severity=severity,
+    )
+
+    for item in new_items:
+        item["source"] = "symptom_agent"
+        item["visual_source"] = visual_source or f"numeric_candidate:{column_name}>{threshold}"
+
+    output.extend(new_items)
+
+
+def _build_symptom_agent_track4_intervals(symptom_cfg: dict) -> list[dict]:
+    """
+    Build Track 4 Agent-lane intervals for Symptom Agent.
+
+    This version uses the same practical visualization method that fixed the
+    one-by-one Activity Agent display:
+    1. Use official symptom intervals when they exist.
+    2. If not, build visual intervals directly from the selected symptom feature
+       masks.
+    3. If the strict masks are empty, build visual candidate intervals from the
+       same numeric feature columns used by the agent.
+
+    This is only for Track 4 visualization. The detailed Excel/table evaluation
+    still uses the official agent outputs.
+    """
+    if not symptom_cfg:
+        return []
+
+    selected_symptom = symptom_cfg.get("selected_symptom", "") or "Symptom"
+    selected_norm = _normalize_symptom_label(selected_symptom)
+    features = symptom_cfg.get("features", pd.DataFrame())
+    cfg = symptom_cfg.get("config", SymptomConfig())
+    official_intervals = symptom_cfg.get("intervals", []) or []
+
+    cleaned: list[dict] = []
+
+    # Official intervals first. Repair zero/one-sample intervals so Plotly can see them.
+    for item in official_intervals:
+        item_label = item.get("label", selected_symptom)
+        if selected_norm and _normalize_symptom_label(item_label) != selected_norm:
+            continue
+
+        try:
+            start_ts = pd.Timestamp(item.get("start"))
+            raw_end_ts = pd.Timestamp(item.get("end"))
+            end_ts = _infer_visual_interval_end(
+                start_ts,
+                raw_end_ts,
+                index=features.index if isinstance(features, pd.DataFrame) and not features.empty else None,
+            )
+        except Exception:
+            continue
+
+        cleaned.append(
+            {
+                **item,
+                "label": item_label or selected_symptom,
+                "start": start_ts,
+                "end": end_ts,
+                "severity": item.get("severity", "Medium") or "Medium",
+                "source": "symptom_agent",
+                "visual_source": item.get("visual_source", "official_symptom_interval"),
+            }
+        )
+
+    if cleaned:
+        return _deduplicate_track4_intervals(cleaned)
+
+    if features is None or features.empty:
+        return []
+
+    visual_intervals: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Strict mask path: use the final boolean masks produced by the agent.
+    # ------------------------------------------------------------------
+    if selected_symptom == "OpenHoleLength":
+        _append_mask_intervals(visual_intervals, features, "open_hole_lvl1_mask", selected_symptom, "Low")
+        _append_mask_intervals(visual_intervals, features, "open_hole_lvl2_mask", selected_symptom, "High")
+
+    elif selected_symptom == "TRQSpike":
+        _append_mask_intervals(visual_intervals, features, "lvl1_mask", selected_symptom, "Low")
+        _append_mask_intervals(visual_intervals, features, "lvl2_mask", selected_symptom, "High")
+        _append_mask_intervals(visual_intervals, features, "TRQSpike Low Mask", selected_symptom, "Low")
+        _append_mask_intervals(visual_intervals, features, "TRQSpike High Mask", selected_symptom, "High")
+
+    elif selected_symptom == "TRQErratic":
+        _append_mask_intervals(visual_intervals, features, "lvl1_mask", selected_symptom, "Low")
+        _append_mask_intervals(visual_intervals, features, "lvl2_mask", selected_symptom, "High")
+        _append_mask_intervals(visual_intervals, features, "TRQErratic Low Mask", selected_symptom, "Low")
+        _append_mask_intervals(visual_intervals, features, "TRQErratic High Mask", selected_symptom, "High")
+
+    elif selected_symptom == "PSpike":
+        _append_mask_intervals(visual_intervals, features, "combined_mask", selected_symptom, "Medium")
+        _append_mask_intervals(visual_intervals, features, "normal_mask", selected_symptom, "Medium")
+        _append_mask_intervals(visual_intervals, features, "motor_mask", selected_symptom, "High")
+
+    elif selected_symptom in {"OverPull", "TookWeight"}:
+        _append_mask_intervals(visual_intervals, features, "combined_mask", selected_symptom, "High")
+        _append_mask_intervals(visual_intervals, features, "raw_mask", selected_symptom, "High")
+
+    if visual_intervals:
+        return _deduplicate_track4_intervals(visual_intervals)
+
+    # ------------------------------------------------------------------
+    # Candidate path: if strict masks are empty, show the agent's numeric
+    # candidate regions in Track 4, similar to how Activity Agent shows labels.
+    # This is the key extra fallback compared with v7.
+    # ------------------------------------------------------------------
+    if selected_symptom == "OpenHoleLength":
+        if "open_hole_length" in features.columns:
+            _append_numeric_candidate_intervals(
+                visual_intervals,
+                features,
+                "open_hole_length",
+                float(getattr(cfg, "open_hole_length_threshold_1", 500.0)),
+                selected_symptom,
+                "Low",
+                visual_source="open_hole_length_threshold_candidate",
+            )
+
+    elif selected_symptom == "TRQSpike":
+        # Prefer the agent's spike_gate if present, then numeric TRQ candidates.
+        _append_mask_intervals(visual_intervals, features, "spike_gate", selected_symptom, "Medium")
+        if not visual_intervals:
+            _append_numeric_candidate_intervals(
+                visual_intervals,
+                features,
+                "trq_ratio",
+                float(getattr(cfg, "trq_spike_ratio_level_1", 1.25)),
+                selected_symptom,
+                "Medium",
+                visual_source="trq_spike_ratio_candidate",
+            )
+        if not visual_intervals:
+            _append_numeric_candidate_intervals(
+                visual_intervals,
+                features,
+                "trq_zscore",
+                float(getattr(cfg, "trq_spike_zscore_min", 2.9)),
+                selected_symptom,
+                "Medium",
+                visual_source="trq_spike_zscore_candidate",
+            )
+
+    elif selected_symptom == "TRQErratic":
+        # v7 still allowed context/rpm gates to erase everything. Here Track 4
+        # first shows the actual final masks, but if those are empty it shows
+        # numeric erratic candidates from TRQ ratio and cycle count.
+        if "trq_ratio" in features.columns and "trq_cycle_count" in features.columns:
+            trq_ratio = pd.to_numeric(features["trq_ratio"], errors="coerce")
+            cycle_count = pd.to_numeric(features["trq_cycle_count"], errors="coerce")
+            candidate = (
+                trq_ratio.gt(float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)))
+                & cycle_count.ge(int(getattr(cfg, "trq_erratic_min_cycles", 3)))
+            ).fillna(False)
+
+            # Important: do NOT apply context_mask/rpm_stable here. Those gates
+            # can be the reason official intervals disappear. For visual review,
+            # boss needs to see the suspicious TRQ regions first.
+            visual_intervals.extend(
+                _mask_to_track4_intervals_for_visualization(
+                    mask=candidate,
+                    label=selected_symptom,
+                    severity="Medium",
+                )
+            )
+            for item in visual_intervals:
+                item["source"] = "symptom_agent"
+                item["visual_source"] = "trq_ratio_and_cycle_candidate_no_context_gate"
+
+        if not visual_intervals:
+            _append_numeric_candidate_intervals(
+                visual_intervals,
+                features,
+                "trq_ratio",
+                float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)),
+                selected_symptom,
+                "Medium",
+                visual_source="trq_erratic_ratio_only_candidate",
+            )
+
+    elif selected_symptom == "PSpike":
+        _append_numeric_candidate_intervals(
+            visual_intervals,
+            features,
+            "spp_delta",
+            float(getattr(cfg, "pspike_threshold_normal", 5.0)),
+            selected_symptom,
+            "Medium",
+            visual_source="pspike_spp_delta_candidate",
+        )
+
+    elif selected_symptom == "OverPull":
+        _append_numeric_candidate_intervals(
+            visual_intervals,
+            features,
+            "hkl_delta",
+            float(getattr(cfg, "overpull_threshold", 6.0)),
+            selected_symptom,
+            "High",
+            visual_source="overpull_hkl_delta_candidate",
+        )
+
+    elif selected_symptom == "TookWeight":
+        _append_numeric_candidate_intervals(
+            visual_intervals,
+            features,
+            "hkl_drop",
+            float(getattr(cfg, "tookweight_threshold", 6.0)),
+            selected_symptom,
+            "High",
+            visual_source="tookweight_hkl_drop_candidate",
+        )
+
+    if visual_intervals:
+        for item in visual_intervals:
+            item["source"] = "symptom_agent"
+            item.setdefault("visual_source", "numeric_candidate")
+        return _deduplicate_track4_intervals(visual_intervals)
+
+    # ------------------------------------------------------------------
+    # Last generic fallback: any final-looking mask column.
+    # ------------------------------------------------------------------
+    excluded_mask_names = {
+        "context_mask",
+        "rpm_stable",
+        "rpm_on",
+        "started_low",
+        "normal_spike_shape",
+        "extreme_spike",
+        "stable_mask",
+        "stable_flow_mask",
+        "stable_rpm_mask",
+        "stable_wob_mask",
+        "spp_stable_before_spike",
+        "move_mask",
+        "velocity_ok",
+        "mud_motor_on",
+    }
+
+    for col in features.columns:
+        col_text = str(col)
+        col_norm = col_text.strip().lower()
+        looks_like_mask = col_norm.endswith("mask") or col_norm.endswith(" mask")
+        if not looks_like_mask or col_norm in excluded_mask_names:
+            continue
+
+        severity = "Medium"
+        if "high" in col_norm or "lvl2" in col_norm:
+            severity = "High"
+        elif "low" in col_norm or "lvl1" in col_norm:
+            severity = "Low"
+
+        _append_mask_intervals(
+            visual_intervals,
+            features,
+            col_text,
+            selected_symptom,
+            severity,
+            visual_source=f"generic_mask:{col_text}",
+        )
+
+    return _deduplicate_track4_intervals(visual_intervals)
+
+def _normalize_activity_label(value) -> str:
+    """Normalize activity labels before filtering Track 4 intervals."""
+    return str(value or "").strip().replace(" ", "").lower()
+
+
+def _build_activity_agent_track4_intervals(activity_cfg: dict) -> list[dict]:
+    """
+    Build Track 4 Agent-lane intervals for Activity Agent.
+
+    Important fix:
+    Do not rely only on filtering the precomputed interval list by exact text.
+    "All activities" works because it passes the whole interval list through.
+    One-by-one selections can fail if the labels are not exactly identical or if
+    the interval list was produced/cleaned differently. This builds the selected
+    activity lane from the final activity label series when needed, using the same
+    visual interval method that Track 4 already uses successfully for all activities.
+    """
+    if not activity_cfg:
+        return []
+
+    selected_activity = activity_cfg.get("selected_activity", "All activities")
+    intervals = activity_cfg.get("intervals", []) or []
+
+    # All activities: preserve the existing behavior that already works.
+    if selected_activity == "All activities":
+        return intervals
+
+    selected_norm = _normalize_activity_label(selected_activity)
+
+    # First try the existing interval list, but compare normalized strings.
+    filtered = [
+        item
+        for item in intervals
+        if _normalize_activity_label(item.get("label", "")) == selected_norm
+    ]
+
+    if filtered:
+        return filtered
+
+    # Fallback: build intervals directly from the final activity label series.
+    # This makes single-activity display use the same underlying classification
+    # state as All activities, instead of depending on exact interval labels.
+    labels = activity_cfg.get("labels", pd.Series(dtype="object"))
+    if labels is None or labels.empty:
+        return []
+
+    label_series = labels.astype("object").apply(_normalize_activity_label)
+    mask = label_series.eq(selected_norm)
+
+    visual_intervals = _mask_to_track4_intervals_for_visualization(
+        mask=mask,
+        label=selected_activity,
+        severity="Medium",
+    )
+
+    for item in visual_intervals:
+        item["source"] = "activity_agent"
+        item["visual_source"] = "activity_label_series"
+        item["severity"] = None
+
+    return visual_intervals
+
 def build_agent_cfg_from_controls(
     controls: dict,
     activity_cfg: dict,
@@ -2953,20 +3886,18 @@ def build_agent_cfg_from_controls(
 
     auto_agent_intervals = []
 
-    if agent_source == "Activity agent" and activity_cfg and activity_cfg.get("intervals"):
-        selected_activity = activity_cfg.get("selected_activity", "All activities")
+    if agent_source == "Activity agent":
+        # Use the same interval-building path for both "All activities" and
+        # one selected activity. This fixes the case where All activities draws
+        # correctly but Drilling/Reaming/etc. draw nothing.
+        auto_agent_intervals = _build_activity_agent_track4_intervals(activity_cfg or {})
 
-        if selected_activity == "All activities":
-            auto_agent_intervals = activity_cfg["intervals"]
-        else:
-            auto_agent_intervals = [
-                item
-                for item in activity_cfg["intervals"]
-                if item["label"] == selected_activity
-            ]
-
-    elif agent_source == "Symptom agent" and symptom_cfg and symptom_cfg.get("intervals"):
-        auto_agent_intervals = symptom_cfg["intervals"]
+    elif agent_source == "Symptom agent":
+        # Use the same visualization principle as Activity Agent:
+        # Track 4 draws a list of interval dictionaries. If the selected symptom
+        # did not emit official intervals, build visual intervals from its final
+        # boolean masks so the Agent lane still shows detected deviations.
+        auto_agent_intervals = _build_symptom_agent_track4_intervals(symptom_cfg or {})
 
     if agent_source == "Manual interval":
         agent_intervals = manual_agent_intervals
@@ -3187,6 +4118,12 @@ def render_agent_review_outputs(
             f"Summary — Tags: {summary['tag_count']} | "
             f"Hits: {summary['agent_count']} | "
             f"Overlap: {summary['overlap_count']} / {summary['tag_count']}"
+        )
+
+        st.caption(
+            f"Track 4 source: {agent_cfg.get('agent_source', '')} | "
+            f"Tagger lane intervals: {len(agent_cfg.get('tag_intervals', []))} | "
+            f"Agent lane intervals: {len(agent_cfg.get('agent_intervals', []))}"
         )
 
         st.caption(
