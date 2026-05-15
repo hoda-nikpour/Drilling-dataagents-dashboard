@@ -1024,8 +1024,14 @@ def render_chart(
         const startMs = _dateMs_{div_id}(item.start);
         const endMs = _dateMs_{div_id}(item.end);
         if (startMs === null || endMs === null) return null;
+
         const minMs = Math.min(startMs, endMs);
         const maxMs = Math.max(startMs, endMs);
+
+        // Critical: zero-duration agent points are only point events/placeholders.
+        // They must not become Agent intervals or hit-table matches.
+        if (maxMs <= minMs) return null;
+
         return {{
             startMs: minMs,
             endMs: maxMs,
@@ -1051,6 +1057,10 @@ def render_chart(
             if (!_isTrack4AgentTrace_{div_id}(trace)) return;
             const agentRange = _traceMinMaxTime_{div_id}(trace);
             if (!agentRange) return;
+
+            // Critical: ignore zero-duration agent traces.
+            if (agentRange.endMs <= agentRange.startMs) return;
+
             agents.push({{
                 startMs: agentRange.startMs,
                 endMs: agentRange.endMs,
@@ -1314,22 +1324,7 @@ def render_chart(
                 return;
             }}
 
-            // Tolerant match for one-sample / visually widened agent hits.
-            if (agent.endMs >= matchMin && agent.startMs <= matchMax) {{
-                rawOverlaps.push({{
-                    start: formatDateForStreamlit_{div_id}(new Date(Math.max(tagMin, agent.startMs))),
-                    end: formatDateForStreamlit_{div_id}(new Date(Math.min(tagMax, agent.endMs))),
-                    startMs: Math.max(tagMin, agent.startMs),
-                    endMs: Math.min(tagMax, agent.endMs),
-                    overlapMs: 0,
-                    percent: 0.0,
-                    agent_name: agent.label || "Agent hit",
-                    agent_start: agent.start,
-                    agent_end: agent.end,
-                    agent_index: agent.trace_index,
-                    tolerant_match: true
-                }});
-            }}
+
         }});
 
         rawOverlaps.forEach(function(item) {{

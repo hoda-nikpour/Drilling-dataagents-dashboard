@@ -44,8 +44,8 @@ def _compute_overlap_intervals(tag_intervals: list[dict], agent_intervals: list[
 
     return overlaps
 
-
 def _add_vertical_interval_line(
+        
     fig: go.Figure,
     x_pos: float,
     start_time,
@@ -56,10 +56,15 @@ def _add_vertical_interval_line(
     col: int,
     hover_text: str | None = None,
 ):
-    if pd.Timestamp(end_time) < pd.Timestamp(start_time):
+    start_ts = pd.Timestamp(start_time)
+    end_ts = pd.Timestamp(end_time)
+
+    # Do not draw invalid or zero-duration intervals.
+    # Real interval visualization should only represent intervals with duration.
+    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts <= start_ts:
         return
 
-    y_vals = pd.date_range(pd.Timestamp(start_time), pd.Timestamp(end_time), periods=20)
+    y_vals = pd.date_range(start_ts, end_ts, periods=20)
     x_vals = np.full(len(y_vals), x_pos)
 
     fig.add_trace(
@@ -76,7 +81,6 @@ def _add_vertical_interval_line(
     )
 
 
-
 def _add_agent_visibility_marker(
     fig: go.Figure,
     x_pos: float,
@@ -88,17 +92,15 @@ def _add_agent_visibility_marker(
     hover_text: str | None = None,
 ):
     """
-    Add a very small visible placeholder for short agent intervals.
+    Add a very small visible placeholder for real short agent intervals.
 
-    Short agent intervals can be thinner than one screen pixel when the user is
-    looking at a full section. This tiny dot only acts as a locator,
-    while the real agent interval is still drawn as the main Agent-lane line.
-    The metadata lets layout.py exclude these placeholders from hit-result
-    interval extraction.
+    Zero-duration intervals are ignored because they are not real intervals
+    and should not appear as data-agent tags or hit-table matches.
     """
     start_ts = pd.Timestamp(start_time)
     end_ts = pd.Timestamp(end_time)
-    if end_ts < start_ts:
+
+    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts <= start_ts:
         return
 
     mid_ts = start_ts + (end_ts - start_ts) / 2
@@ -123,7 +125,7 @@ def _add_agent_visibility_marker(
         col=col,
     )
 
-
+    
 def _compute_activity_lane_summary(activity_intervals: list[dict]) -> list[dict]:
     if not activity_intervals:
         return []
