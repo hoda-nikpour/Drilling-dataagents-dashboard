@@ -1,5 +1,3 @@
- 
- 
 import json
 import re
 import uuid
@@ -99,8 +97,10 @@ def _extract_track4_agent_intervals_from_fig(fig) -> list[dict]:
     intervals: list[dict] = []
     for idx, trace in enumerate(getattr(fig, "data", []) or []):
         meta = getattr(trace, "meta", None) or {}
-        if isinstance(meta, dict) and str(meta.get("source", "")).startswith("client_drag"):
-            continue
+        if isinstance(meta, dict):
+            source_text = str(meta.get("source", ""))
+            if source_text.startswith("client_drag") or source_text == "agent_visibility_marker":
+                continue
         x_values = _safe_trace_values(getattr(trace, "x", None))
         y_values = _safe_trace_values(getattr(trace, "y", None))
         if not x_values or not y_values:
@@ -137,7 +137,72 @@ def _extract_track4_agent_intervals_from_fig(fig) -> list[dict]:
         )
     return intervals
 
-def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None):
+
+
+def _extract_track4_tag_intervals_from_fig(fig) -> list[dict]:
+    """
+    Build a payload of Track 4 Tagger-lane intervals from the Python Plotly
+    figure before it is converted to HTML.
+
+    This is used by the browser-side Hit results table after a saved dashboard
+    session is restored: restored tags are already in the Python figure, so the
+    browser table can rebuild its rows even when localStorage is empty.
+    """
+    intervals: list[dict] = []
+    for idx, trace in enumerate(getattr(fig, "data", []) or []):
+        meta = getattr(trace, "meta", None) or {}
+        if isinstance(meta, dict) and str(meta.get("source", "")).startswith("client_drag"):
+            continue
+
+        x_values = _safe_trace_values(getattr(trace, "x", None))
+        y_values = _safe_trace_values(getattr(trace, "y", None))
+        if not x_values or not y_values:
+            continue
+
+        numeric_x = []
+        for value in x_values:
+            try:
+                numeric_x.append(float(value))
+            except Exception:
+                pass
+        if not numeric_x:
+            continue
+
+        avg_x = sum(numeric_x) / len(numeric_x)
+        # Track 4 lane positions: Tagger=0.24, Overlap=0.50, Agent=0.76.
+        if avg_x < 0.16 or avg_x > 0.32:
+            continue
+
+        parsed_times = []
+        for value in y_values:
+            ts = pd.to_datetime(value, errors="coerce")
+            if pd.notna(ts):
+                parsed_times.append(pd.Timestamp(ts))
+        if not parsed_times:
+            continue
+
+        start = min(parsed_times)
+        end = max(parsed_times)
+        hovertemplate = str(getattr(trace, "hovertemplate", "") or "")
+        match = re.search(r"Tagger<br>([^<]+)", hovertemplate, flags=re.IGNORECASE)
+        label = match.group(1).strip() if match else "Tagger tag"
+
+        intervals.append(
+            {
+                "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+                "end": end.strftime("%Y-%m-%d %H:%M:%S"),
+                "label": label,
+                "trace_index": idx,
+            }
+        )
+    return intervals
+
+def render_chart(
+    fig,
+    chart_key: str,
+    visual_tag_context_key: str | None = None,
+    restore_saved_browser_zoom: bool = False,
+):
     """
     Render Plotly chart with controlled zoom tools and one custom cross-track
     horizontal hover line.
@@ -188,6 +253,8 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
     chart_height = int(fig.layout.height or 950)
     server_agent_intervals = _extract_track4_agent_intervals_from_fig(fig)
     server_agent_intervals_json = json.dumps(server_agent_intervals, ensure_ascii=False)
+    server_tag_intervals = _extract_track4_tag_intervals_from_fig(fig)
+    server_tag_intervals_json = json.dumps(server_tag_intervals, ensure_ascii=False)
 
     # This token is created once per Streamlit session. It prevents browser-stored
     # dragged tags from a previous dashboard session from appearing when the
@@ -281,6 +348,17 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
                     Clear drag tags
                 </button>
 
+                <button id="sync_client_tags_btn_{div_id}" style="
+                    padding: 6px 10px;
+                    border: 1px solid #7e22ce;
+                    background: #f8f0ff;
+                    cursor: pointer;
+                    font-size: 13px;
+                    font-weight: 700;
+                " title="Send the drawn tags to Streamlit so Save Dashboard Session can include them">
+                    Save drawn tags
+                </button>
+
                 <span id="zoom_history_text_{div_id}" style="
                     font-size: 12px;
                     color: #555;
@@ -336,7 +414,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
             Click Tagging, then drag vertically over an abnormal interval to create a Track 4 tag.
         </div>
 
-        <details id="hit_results_panel_{div_id}" style="
+        <details id="hit_results_panel_{div_id}" open style="
             margin: 8px 0 10px 0;
             padding: 8px 10px;
             border: 1px solid #d9d9d9;
@@ -432,6 +510,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
     const undoClientTagBtn_{div_id} = document.getElementById("undo_client_tag_btn_{div_id}");
     const redoClientTagBtn_{div_id} = document.getElementById("redo_client_tag_btn_{div_id}");
     const clearClientTagsBtn_{div_id} = document.getElementById("clear_client_tags_btn_{div_id}");
+    const syncClientTagsBtn_{div_id} = document.getElementById("sync_client_tags_btn_{div_id}");
     const historyText_{div_id} = document.getElementById("zoom_history_text_{div_id}");
     const instructionText_{div_id} = document.getElementById("chart_instruction_text_{div_id}");
     const hitResultsSummary_{div_id} = document.getElementById("hit_results_summary_{div_id}");
@@ -461,7 +540,9 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
     const visualTagContextKey_{div_id} = "{visual_tag_context_key or ''}";
     const browserTagSessionToken_{div_id} = "{browser_tag_session_token}";
+    const restoreSavedBrowserZoom_{div_id} = { "true" if restore_saved_browser_zoom else "false" };
     const serverAgentIntervals_{div_id} = {server_agent_intervals_json};
+    const serverTagIntervals_{div_id} = {server_tag_intervals_json};
 
     function deepCopy_{div_id}(obj) {{
         return JSON.parse(JSON.stringify(obj));
@@ -605,6 +686,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
         zoomHistory_{div_id} = [];
         updateHistoryText_{div_id}();
+        clearSavedZoomFromBrowser_{div_id}();
 
         programmaticRelayout_{div_id} = true;
 
@@ -711,8 +793,59 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
     const clientVisualTagStorageKey_{div_id} =
         "hoda_client_visual_tags_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
+    const clientVisualTagLatestStorageKey_{div_id} =
+        "hoda_client_visual_tags_latest_" + visualTagContextKey_{div_id};
     const clientVisualTagRedoStorageKey_{div_id} =
         "hoda_client_visual_tags_redo_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
+    const clientVisualTagClearAfterSyncKey_{div_id} =
+        "hoda_clear_client_visual_tags_after_sync_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
+
+    // Persist chart zoom across Streamlit reruns. This prevents the user from
+    // losing the zoom when sidebar tags or chart-drawn tags update Python state.
+    const chartZoomStorageKey_{div_id} =
+        restoreSavedBrowserZoom_{div_id}
+            ? ("hoda_chart_zoom_" + visualTagContextKey_{div_id})
+            : ("hoda_chart_zoom_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id});
+
+    function saveCurrentZoomToBrowser_{div_id}() {{
+        try {{
+            const ranges = getCurrentRanges_{div_id}();
+            if (ranges && Object.keys(ranges).length) {{
+                window.localStorage.setItem(chartZoomStorageKey_{div_id}, JSON.stringify(ranges));
+            }}
+        }} catch (e) {{}}
+    }}
+
+    function loadSavedZoomFromBrowser_{div_id}() {{
+        try {{
+            const raw = window.localStorage.getItem(chartZoomStorageKey_{div_id});
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === "object" ? parsed : null;
+        }} catch (e) {{
+            return null;
+        }}
+    }}
+
+    function clearSavedZoomFromBrowser_{div_id}() {{
+        try {{ window.localStorage.removeItem(chartZoomStorageKey_{div_id}); }} catch (e) {{}}
+    }}
+
+    function restoreSavedZoomFromBrowser_{div_id}() {{
+        const savedRanges = loadSavedZoomFromBrowser_{div_id}();
+        if (!savedRanges || !Object.keys(savedRanges).length) return false;
+        programmaticRelayout_{div_id} = true;
+        Plotly.relayout(gd_{div_id}, makeRelayoutUpdate_{div_id}(savedRanges))
+            .then(function() {{ return Plotly.redraw(gd_{div_id}); }})
+            .then(function() {{
+                setTimeout(function() {{
+                    lastRanges_{div_id} = getCurrentRanges_{div_id}();
+                    programmaticRelayout_{div_id} = false;
+                    updateHistoryText_{div_id}();
+                }}, 100);
+            }});
+        return true;
+    }}
 
     function isoForPlotly_{div_id}(dateValue) {{
         // Plotly accepts local datetime strings on datetime axes.
@@ -752,10 +885,23 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
             return;
         }}
 
+        const safeItems = Array.isArray(items) ? items : [];
+
         try {{
             window.localStorage.setItem(
                 clientVisualTagStorageKey_{div_id},
-                JSON.stringify(Array.isArray(items) ? items : [])
+                JSON.stringify(safeItems)
+            );
+        }} catch (e) {{}}
+
+        // Also keep a context-level "latest" copy. This lets the sidebar
+        // Save Dashboard Session button read the browser-drawn tags and inject
+        // them into the downloaded JSON without needing fragile iframe-to-Python
+        // communication.
+        try {{
+            window.localStorage.setItem(
+                clientVisualTagLatestStorageKey_{div_id},
+                JSON.stringify(safeItems)
             );
         }} catch (e) {{}}
     }}
@@ -801,6 +947,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
         _setButtonEnabled_{div_id}(undoClientTagBtn_{div_id}, activeTags.length > 0);
         _setButtonEnabled_{div_id}(redoClientTagBtn_{div_id}, redoTags.length > 0);
         _setButtonEnabled_{div_id}(clearClientTagsBtn_{div_id}, activeTags.length > 0 || redoTags.length > 0);
+        _setButtonEnabled_{div_id}(syncClientTagsBtn_{div_id}, activeTags.length > 0);
     }}
 
     function _dateMs_{div_id}(value) {{
@@ -920,6 +1067,196 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
         const serverAgents = _visibleAgentIntervalsFromServer_{div_id}();
         if (serverAgents.length) return serverAgents;
         return _visibleAgentIntervalsFromPlotTraces_{div_id}();
+    }}
+
+
+    function _normalizeServerTagInterval_{div_id}(item) {{
+        const startMs = _dateMs_{div_id}(item.start);
+        const endMs = _dateMs_{div_id}(item.end);
+        if (startMs === null || endMs === null) return null;
+        const minMs = Math.min(startMs, endMs);
+        const maxMs = Math.max(startMs, endMs);
+        return {{
+            label: item.label || "Restored tag",
+            start: formatDateForStreamlit_{div_id}(new Date(minMs)),
+            end: formatDateForStreamlit_{div_id}(new Date(maxMs)),
+            created_at: "server_" + String(item.trace_index ?? ""),
+            source: "server_tagger"
+        }};
+    }}
+
+    function _serverTagIntervals_{div_id}() {{
+        const tags = [];
+        (serverTagIntervals_{div_id} || []).forEach(function(item) {{
+            const normalized = _normalizeServerTagInterval_{div_id}(item || {{}});
+            if (normalized) tags.push(normalized);
+        }});
+        return tags;
+    }}
+
+    function _sameTagTimeOnly_{div_id}(a, b) {{
+        const as = _dateMs_{div_id}(a && a.start);
+        const ae = _dateMs_{div_id}(a && a.end);
+        const bs = _dateMs_{div_id}(b && b.start);
+        const be = _dateMs_{div_id}(b && b.end);
+        if (as === null || ae === null || bs === null || be === null) return false;
+        return Math.abs(as - bs) <= 1000 && Math.abs(ae - be) <= 1000;
+    }}
+
+    function _allTagIntervalsForResults_{div_id}() {{
+        // Hit results should survive save/load. Restored tags are in the Python
+        // figure, while newly dragged unsaved tags live in browser localStorage.
+        const serverTags = _serverTagIntervals_{div_id}();
+        const clientTags = loadClientVisualTags_{div_id}();
+        const out = serverTags.slice();
+        clientTags.forEach(function(tag) {{
+            const duplicate = out.some(function(existing) {{
+                return _sameTagTimeOnly_{div_id}(existing, tag);
+            }});
+            if (!duplicate) out.push(tag);
+        }});
+        return out;
+    }}
+
+    function notifyStreamlitAboutVisualTag_{div_id}(tagItem) {{
+        // Server-side Save Dashboard Session can only save tags that reach
+        // Streamlit session_state. Because this chart is inside components.html,
+        // the only no-custom-component path is to navigate the top Streamlit page
+        // with visual_tag_* query parameters. Do this immediately from mouse-up.
+        if (!tagItem || !visualTagContextKey_{div_id}) return;
+
+        let currentHref = window.location.href;
+        try {{
+            if (window.top && window.top.location && window.top.location.href) {{
+                currentHref = window.top.location.href;
+            }} else if (window.parent && window.parent.location && window.parent.location.href) {{
+                currentHref = window.parent.location.href;
+            }}
+        }} catch (e0) {{
+            try {{ currentHref = window.parent.location.href; }} catch (e00) {{}}
+        }}
+
+        const url = new URL(currentHref);
+        url.searchParams.set("visual_tag_context", visualTagContextKey_{div_id});
+        url.searchParams.set("visual_tag_start", tagItem.start || "");
+        url.searchParams.set("visual_tag_end", tagItem.end || "");
+        url.searchParams.set("visual_tag_nonce", tagItem.created_at || String(Date.now()));
+        const targetUrl = url.toString();
+
+        try {{
+            saveCurrentZoomToBrowser_{div_id}();
+        }} catch (eSave) {{}}
+
+        try {{
+            if (window.top && window.top.location) {{
+                window.top.location.href = targetUrl;
+                return;
+            }}
+        }} catch (e1) {{}}
+
+        try {{
+            if (window.parent && window.parent.location) {{
+                window.parent.location.href = targetUrl;
+                return;
+            }}
+        }} catch (e2) {{}}
+
+        try {{
+            const form = document.createElement("form");
+            form.method = "GET";
+            form.action = url.pathname;
+            form.target = "_top";
+            url.searchParams.forEach(function(value, key) {{
+                const input = document.createElement("input");
+                input.type = "hidden";
+                input.name = key;
+                input.value = value;
+                form.appendChild(input);
+            }});
+            document.body.appendChild(form);
+            form.submit();
+            return;
+        }} catch (e3) {{}}
+
+        try {{
+            window.open(targetUrl, "_top");
+            return;
+        }} catch (e4) {{
+            console.warn("Could not notify Streamlit about dragged tag", e4);
+            alert("The tag was drawn in the browser, but Streamlit could not receive it for session saving. Please use the sidebar tag fields for a saveable tag.");
+        }}
+    }}
+
+
+    function clearClientVisualTagsAfterSyncIfRequested_{div_id}() {{
+        try {{
+            const shouldClear = window.sessionStorage.getItem(clientVisualTagClearAfterSyncKey_{div_id});
+            if (shouldClear === "1") {{
+                window.localStorage.removeItem(clientVisualTagStorageKey_{div_id});
+                window.localStorage.removeItem(clientVisualTagLatestStorageKey_{div_id});
+                window.localStorage.removeItem(clientVisualTagRedoStorageKey_{div_id});
+                window.sessionStorage.removeItem(clientVisualTagClearAfterSyncKey_{div_id});
+            }}
+        }} catch (e) {{}}
+    }}
+
+    function syncClientVisualTagsToStreamlit_{div_id}() {{
+        const items = loadClientVisualTags_{div_id}();
+        if (!items.length) {{
+            instructionText_{div_id}.innerText = "There are no browser-drawn tags to save.";
+            updateClientTagUndoRedoControls_{div_id}();
+            return;
+        }}
+        if (!visualTagContextKey_{div_id}) {{
+            alert("Visual tagging needs visual_tag_context_key from Streamlit.");
+            return;
+        }}
+
+        let currentHref = window.location.href;
+        try {{
+            if (window.top && window.top.location && window.top.location.href) {{
+                currentHref = window.top.location.href;
+            }} else if (window.parent && window.parent.location && window.parent.location.href) {{
+                currentHref = window.parent.location.href;
+            }}
+        }} catch (e0) {{}}
+
+        const url = new URL(currentHref);
+        url.searchParams.set("visual_tag_context", visualTagContextKey_{div_id});
+        url.searchParams.set("visual_tags_payload", JSON.stringify(items));
+        url.searchParams.set("visual_tag_nonce", String(Date.now()));
+
+        try {{ saveCurrentZoomToBrowser_{div_id}(); }} catch (eSave) {{}}
+        try {{ window.sessionStorage.setItem(clientVisualTagClearAfterSyncKey_{div_id}, "1"); }} catch (eStore) {{}}
+
+        instructionText_{div_id}.innerText =
+            "Sending " + items.length + " drawn tag(s) to Streamlit. The page will refresh once.";
+
+        try {{
+            if (window.top && window.top.location) {{
+                window.top.location.href = url.toString();
+                return;
+            }}
+        }} catch (e1) {{}}
+
+        try {{
+            const form = document.createElement("form");
+            form.method = "GET";
+            form.action = url.pathname;
+            form.target = "_top";
+            url.searchParams.forEach(function(value, key) {{
+                const input = document.createElement("input");
+                input.type = "hidden";
+                input.name = key;
+                input.value = value;
+                form.appendChild(input);
+            }});
+            document.body.appendChild(form);
+            form.submit();
+            return;
+        }} catch (e2) {{
+            alert("Could not send drawn tags to Streamlit. The tags are still visible in this browser, but they are not saveable until synced.");
+        }}
     }}
 
     function _mergeOverlapSegments_{div_id}(segments) {{
@@ -1190,9 +1527,14 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
         instructionText_{div_id}.innerText =
             "Created " + label + " in Track 4 Tagger lane: " + item.start + " → " + item.end +
             ". Client-side overlap count with visible Agent lane: " + overlapCount +
-            ". This visual tag is kept only for this active dashboard session.";
+            ". Now click Save Dashboard Session in the sidebar to download a JSON that includes this drawn tag.";
         rebuildHitResultsTable_{div_id}();
         updateClientTagUndoRedoControls_{div_id}();
+
+        // Keep drawn tagging fully client-side while the user is drawing.
+        // The Save drawn tags button sends the browser-drawn tags to Streamlit
+        // once, avoiding the page-freeze caused by top-page navigation on mouse-up.
+        saveCurrentZoomToBrowser_{div_id}();
     }}
 
     function undoLastClientVisualTag_{div_id}() {{
@@ -1256,7 +1598,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
     }}
 
     function _tagResultRows_{div_id}() {{
-        const tags = loadClientVisualTags_{div_id}();
+        const tags = _allTagIntervalsForResults_{div_id}();
         const rows = [];
         const defaultSymptom = _selectedAgentNameForRows_{div_id}();
 
@@ -1522,6 +1864,12 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
         }};
     }};
 
+    if (syncClientTagsBtn_{div_id}) {{
+        syncClientTagsBtn_{div_id}.onclick = function() {{
+            syncClientVisualTagsToStreamlit_{div_id}();
+        }};
+    }};
+
     if (downloadHitResultsBtn_{div_id}) {{
         downloadHitResultsBtn_{div_id}.onclick = function() {{
             downloadHitResultsExcel_{div_id}();
@@ -1543,10 +1891,18 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
     setTimeout(function() {{
         captureInitialRangesOnce_{div_id}();
 
-        // Default mode: vertical/time zoom.
+        // Default mode: vertical/time zoom. Then restore the previous browser zoom
+        // if Streamlit reran because a tag/sidebar value changed.
         setZoomMode_{div_id}("y");
         setZoomButtonStyle_{div_id}(zoomYBtn_{div_id});
-        restoreClientVisualTags_{div_id}();
+        setTimeout(function() {{
+            restoreSavedZoomFromBrowser_{div_id}();
+        }}, 120);
+        clearClientVisualTagsAfterSyncIfRequested_{div_id}();
+        if (!clientTagsRestored_{div_id}) {{
+            clientTagsRestored_{div_id} = true;
+            restoreClientVisualTags_{div_id}();
+        }}
     }}, 500);
 
     gd_{div_id}.on("plotly_relayout", function(eventData) {{
@@ -1562,6 +1918,7 @@ def render_chart(fig, chart_key: str, visual_tag_context_key: str | None = None)
 
         setTimeout(function() {{
             lastRanges_{div_id} = getCurrentRanges_{div_id}();
+            saveCurrentZoomToBrowser_{div_id}();
             updateHistoryText_{div_id}();
         }}, 100);
     }});

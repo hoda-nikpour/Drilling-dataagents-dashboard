@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from agents.activity_agents import ActivityConfig
 from agents.activity_support import interval_overlap, overlap_ratio
@@ -234,6 +235,7 @@ def _build_full_dashboard_state(context_key: str) -> dict:
         "upload",
         "FormSubmitter",
         "_undo_",
+        "use_current_window_as_tag_",
     ]
 
     state = {}
@@ -241,7 +243,7 @@ def _build_full_dashboard_state(context_key: str) -> dict:
     for key, value in st.session_state.items():
         key = str(key)
 
-        if key.startswith("_"):
+        if _is_non_restorable_widget_key(key):
             continue
 
         if any(fragment in key for fragment in ignored_fragments):
@@ -283,6 +285,41 @@ def _is_early_dashboard_key(key: str, context_key: str) -> bool:
         return False
 
     return any(key.startswith(prefix) for prefix in early_prefixes)
+
+
+def _is_non_restorable_widget_key(key: str) -> bool:
+    """
+    Streamlit button-like widgets cannot be restored by assigning values into
+    st.session_state before the widget is created.
+
+    Saved JSON files from older versions may contain these one-click keys because
+    they match the context suffix. Restoring them causes:
+    StreamlitValueAssignmentNotAllowedError.
+
+    Keep these keys out of both future saved sessions and loaded sessions.
+    """
+    key = str(key)
+
+    blocked_exact_prefixes = [
+        "use_current_window_as_tag_",
+    ]
+
+    blocked_fragments = [
+        "download_",
+        "upload",
+        "FormSubmitter",
+    ]
+
+    if key.startswith("_"):
+        return True
+
+    if any(key.startswith(prefix) for prefix in blocked_exact_prefixes):
+        return True
+
+    if any(fragment in key for fragment in blocked_fragments):
+        return True
+
+    return False
 
 def _restore_full_dashboard_state(uploaded_data: dict, context_key: str, t_min=None, t_max=None):
     """
@@ -326,12 +363,10 @@ def _restore_full_dashboard_state(uploaded_data: dict, context_key: str, t_min=N
         key = str(key)
 
         # Critical:
-        # Old saved JSON files may contain internal restore flags/pending payloads.
-        # Restoring those causes an infinite rerun loop.
-        if key.startswith("_"):
-            continue
-
-        if "upload" in key or "download_" in key or "FormSubmitter" in key:
+        # Old saved JSON files may contain internal restore flags, pending payloads,
+        # and button-like widget keys. Restoring those causes either rerun loops or
+        # StreamlitValueAssignmentNotAllowedError when the button is created.
+        if _is_non_restorable_widget_key(key):
             continue
 
         # Critical fix:
@@ -392,6 +427,31 @@ def _build_export_payload(
         "widget_state": _build_full_dashboard_state(context_key=context_key),
     }
 
+    # Keep manual sidebar tags and chart-drawn tags explicit in the saved JSON.
+    # Track 4 receives both through tag_intervals, but restore needs to know which
+    # ones came from the browser-drawn tagger path.
+    visual_key = f"visual_tag_intervals_{context_key}" if context_key else ""
+    drawn_tag_intervals = []
+    if visual_key:
+        for idx, item in enumerate(st.session_state.get(visual_key, []) or [], start=1):
+            normalized = _normalize_restored_visual_tag(
+                item,
+                fallback_label=f"Drawn Tag {idx}",
+            )
+            if normalized:
+                drawn_tag_intervals.append(normalized)
+
+    if not drawn_tag_intervals:
+        drawn_tag_intervals = [
+            x for x in tag_intervals
+            if isinstance(x, dict) and str(x.get("source", "")).lower() == "chart_drag"
+        ]
+
+    manual_tagger_intervals = [
+        x for x in tag_intervals
+        if not (isinstance(x, dict) and str(x.get("source", "")).lower() == "chart_drag")
+    ]
+
     payload = {
         "dashboard_context": {
             "selected_well": selected_well,
@@ -399,11 +459,30 @@ def _build_export_payload(
             "context_key": context_key,
         },
         "dashboard_state": dashboard_state,
+        "manual_tagger_intervals": [
+            {
+                "label": str(x.get("label", "")),
+                "start": _json_safe_text(x.get("start")),
+                "end": _json_safe_text(x.get("end")),
+                "source": x.get("source", "manual"),
+            }
+            for x in manual_tagger_intervals
+        ],
+        "drawn_tag_intervals": [
+            {
+                "label": str(x.get("label", "")),
+                "start": _json_safe_text(x.get("start")),
+                "end": _json_safe_text(x.get("end")),
+                "source": "chart_drag",
+            }
+            for x in drawn_tag_intervals
+        ],
         "tag_intervals": [
             {
                 "label": str(x.get("label", "")),
                 "start": _json_safe_text(x.get("start")),
                 "end": _json_safe_text(x.get("end")),
+                "source": x.get("source", "manual"),
             }
             for x in tag_intervals
         ],
@@ -465,7 +544,7 @@ def _build_export_payload(
                 _json_safe_text(item.get("start")),
                 _json_safe_text(item.get("end")),
                 "",
-                "manual",
+                item.get("source", "manual"),
             ]
         )
 
@@ -601,6 +680,197 @@ def _safe_uploaded_label(value, fallback: str) -> str:
     return text if text else fallback
 
 
+
+
+def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag", t_min=None, t_max=None) -> dict | None:
+    """
+    Normalize a saved or browser-created chart-drawn tag.
+
+    This accepts several schemas so old saved dashboard JSON files can still be
+    restored. The returned item uses the same shape as normal Track 4 tagger
+    intervals: label/start/end/source.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    start_raw = (
+        item.get("start")
+        or item.get("Tag Start")
+        or item.get("tag_start")
+        or item.get("start_time")
+    )
+    end_raw = (
+        item.get("end")
+        or item.get("Tag End")
+        or item.get("tag_end")
+        or item.get("end_time")
+    )
+
+    start_ts = _parse_uploaded_datetime(start_raw)
+    end_ts = _parse_uploaded_datetime(end_raw)
+
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return None
+
+    if t_min is not None and t_max is not None:
+        start_ts = _clamp_timestamp(start_ts, t_min, t_max)
+        end_ts = _clamp_timestamp(end_ts, t_min, t_max)
+
+    if pd.Timestamp(end_ts) <= pd.Timestamp(start_ts):
+        return None
+
+    label = (
+        item.get("label")
+        or item.get("Tag Label")
+        or item.get("tag_label")
+        or fallback_label
+    )
+    label = str(label).strip() or fallback_label
+
+    return {
+        "label": label,
+        "start": _format_datetime_text(start_ts),
+        "end": _format_datetime_text(end_ts),
+        "source": "chart_drag",
+    }
+
+
+def _visual_tag_identity(item: dict) -> tuple[str, str, str]:
+    """Stable identity used to remove duplicate restored/drawn tags."""
+    if not isinstance(item, dict):
+        return ("", "", "")
+
+    try:
+        start = _format_datetime_text(item.get("start"))
+    except Exception:
+        start = str(item.get("start", ""))
+
+    try:
+        end = _format_datetime_text(item.get("end"))
+    except Exception:
+        end = str(item.get("end", ""))
+
+    # Time is the important identity. Keep label in the tuple only as a fallback
+    # when two intentionally separate tags have exactly the same interval.
+    return (str(item.get("label", "")), start, end)
+
+
+def _deduplicate_visual_tags(items: list[dict]) -> list[dict]:
+    """Remove duplicate chart-drawn tags while preserving order."""
+    seen = set()
+    out: list[dict] = []
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        ident = _visual_tag_identity(item)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(item)
+
+    return out
+
+
+def _looks_like_chart_drag_tag(item: dict) -> bool:
+    """
+    Identify drawn tags inside older saved files.
+
+    Some older JSON exports did not have a dedicated drawn_tag_intervals field,
+    so this also recognizes labels such as Dragged Tag / Drawn Tag / Visual Tag.
+    """
+    if not isinstance(item, dict):
+        return False
+
+    source = str(item.get("source", "") or item.get("Tag Source", "")).strip().lower()
+    label = str(item.get("label", "") or item.get("Tag Label", "")).strip().lower()
+
+    if source in {"chart_drag", "visual", "visual_tag", "dragged", "browser_drag", "server_tagger"}:
+        return True
+
+    return (
+        label.startswith("visual tag")
+        or label.startswith("dragged tag")
+        or label.startswith("drawn tag")
+    )
+
+
+def _extract_restorable_visual_tags(uploaded_data: dict, context_key: str, t_min=None, t_max=None) -> list[dict]:
+    """
+    Extract chart-drawn tags from new and old saved dashboard JSON files.
+
+    The important bridge is: saved drawn tags must be restored into
+    visual_tag_intervals_<context_key>. render_agent_controls() then adds them
+    into tag_intervals, which is what Track 4 actually draws.
+    """
+    if not isinstance(uploaded_data, dict):
+        return []
+
+    candidates: list[dict] = []
+
+    # New schema: dedicated drawn-tag rows.
+    for idx, item in enumerate(uploaded_data.get("drawn_tag_intervals", []) or [], start=1):
+        normalized = _normalize_restored_visual_tag(
+            item,
+            fallback_label=f"Drawn Tag {idx}",
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if normalized:
+            candidates.append(normalized)
+
+    # Widget-state fallback: visual tags saved under their context-specific key.
+    widget_state = (uploaded_data.get("dashboard_state", {}) or {}).get("widget_state", {}) or {}
+    visual_key = f"visual_tag_intervals_{context_key}"
+    for idx, item in enumerate(widget_state.get(visual_key, []) or [], start=1):
+        normalized = _normalize_restored_visual_tag(
+            item,
+            fallback_label=f"Drawn Tag {idx}",
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if normalized:
+            candidates.append(normalized)
+
+    # Compatibility: drawn tags may be mixed into tag_intervals.
+    for idx, item in enumerate(uploaded_data.get("tag_intervals", []) or [], start=1):
+        if not _looks_like_chart_drag_tag(item):
+            continue
+        normalized = _normalize_restored_visual_tag(
+            item,
+            fallback_label=f"Drawn Tag {idx}",
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if normalized:
+            candidates.append(normalized)
+
+    # Last-resort compatibility: saved hit-results rows may contain tag times.
+    for idx, item in enumerate(uploaded_data.get("hit_results", []) or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("Tag Source", "") or item.get("source", "")).strip().lower()
+        label = str(item.get("Tag Label", "") or item.get("label", "")).strip().lower()
+        if source and source not in {"chart_drag", "visual", "visual_tag", "dragged", "browser_drag", "server_tagger"}:
+            continue
+        if not source and not (
+            label.startswith("visual tag")
+            or label.startswith("dragged tag")
+            or label.startswith("drawn tag")
+        ):
+            continue
+        normalized = _normalize_restored_visual_tag(
+            item,
+            fallback_label=f"Drawn Tag {idx}",
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if normalized:
+            candidates.append(normalized)
+
+    return _deduplicate_visual_tags(candidates)
+
+
 def apply_visual_tag_from_query_params(
     context_key: str,
     t_min,
@@ -608,77 +878,103 @@ def apply_visual_tag_from_query_params(
     max_tags: int = 50,
 ):
     """
-    Read visual tag start/end from URL query params created by the chart JavaScript.
+    Read chart-drawn tags from URL query params and store them in Streamlit
+    session_state as visual_tag_intervals_<context_key>.
 
-    IMPORTANT FIX:
-    Do not push visual tags into the three manual Tag 1/2/3 widgets.
-    Those widgets are limited and can be overwritten by Streamlit widget state.
-    Instead, store chart-drag tags in an unlimited session_state list and then
-    render them through the same Track 4 tag_intervals list used by manual tags.
+    This version supports two paths:
+    1. visual_tags_payload: a JSON list sent by the chart's Save drawn tags button.
+    2. visual_tag_start / visual_tag_end: backward-compatible single-tag path.
+
+    Important stability fix:
+    It does not call st.rerun() after clearing query params. The state is updated
+    before render_agent_controls(), so the same run can continue and draw the tags.
+    This avoids the browser freeze/rerun loop that happened when a tag was drawn.
     """
-
     params = st.query_params
 
     if params.get("visual_tag_context") != context_key:
         return
 
-    start_text = params.get("visual_tag_start")
-    end_text = params.get("visual_tag_end")
-    nonce = str(params.get("visual_tag_nonce", ""))
-
-    if not start_text or not end_text:
+    nonce = str(params.get("visual_tag_nonce") or "")
+    nonce_key = f"_last_visual_tag_nonce_{context_key}"
+    if nonce and st.session_state.get(nonce_key) == nonce:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
         return
 
+    raw_items: list[dict] = []
+
+    payload_text = params.get("visual_tags_payload")
+    if payload_text:
+        try:
+            parsed = json.loads(payload_text)
+            if isinstance(parsed, list):
+                raw_items.extend([item for item in parsed if isinstance(item, dict)])
+            elif isinstance(parsed, dict):
+                raw_items.append(parsed)
+        except Exception as e:
+            st.warning(f"Could not read drawn-tag payload from chart: {e}")
+
+    start_text = params.get("visual_tag_start")
+    end_text = params.get("visual_tag_end")
+    if start_text and end_text:
+        raw_items.append(
+            {
+                "label": "Drawn Tag",
+                "start": start_text,
+                "end": end_text,
+                "source": "chart_drag",
+            }
+        )
+
+    if not raw_items:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        return
+
+    visual_key = f"visual_tag_intervals_{context_key}"
+    existing = st.session_state.get(visual_key, [])
+    if not isinstance(existing, list):
+        existing = []
+
+    combined = []
+    for item in existing:
+        normalized = _normalize_restored_visual_tag(
+            item,
+            fallback_label="Drawn Tag",
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if normalized:
+            combined.append(normalized)
+
+    next_index = len(combined) + 1
+    for item in raw_items:
+        normalized = _normalize_restored_visual_tag(
+            item,
+            fallback_label=f"Drawn Tag {next_index}",
+            t_min=t_min,
+            t_max=t_max,
+        )
+        if normalized:
+            # Preserve a browser label such as Dragged Tag 1, but mark source safely.
+            normalized["source"] = "chart_drag"
+            combined.append(normalized)
+            next_index += 1
+
+    st.session_state[visual_key] = _deduplicate_visual_tags(combined)[-max_tags:]
+
+    if nonce:
+        st.session_state[nonce_key] = nonce
+
     try:
-        start_ts = pd.Timestamp(start_text)
-        end_ts = pd.Timestamp(end_text)
-
-        min_ts = pd.Timestamp(t_min)
-        max_ts = pd.Timestamp(t_max)
-
-        start_ts = _clamp_timestamp(start_ts, min_ts, max_ts)
-        end_ts = _clamp_timestamp(end_ts, min_ts, max_ts)
-
-        if end_ts <= start_ts:
-            st.query_params.clear()
-            return
-
-        visual_tags_key = f"visual_tag_intervals_{context_key}"
-        last_nonce_key = f"_last_visual_tag_nonce_{context_key}"
-
-        # Prevent duplicate append if Streamlit reruns twice for the same URL.
-        if nonce and st.session_state.get(last_nonce_key) == nonce:
-            st.query_params.clear()
-            return
-
-        existing_tags = st.session_state.get(visual_tags_key, [])
-        if not isinstance(existing_tags, list):
-            existing_tags = []
-
-        tag_number = len(existing_tags) + 1
-        new_tag = {
-            "label": f"Visual Tag {tag_number}",
-            "start": _format_datetime_text(start_ts),
-            "end": _format_datetime_text(end_ts),
-            "source": "chart_drag",
-        }
-
-        existing_tags.append(new_tag)
-
-        # Keep a generous cap only to protect session_state, not to limit review work.
-        existing_tags = existing_tags[-int(max_tags):]
-
-        st.session_state[visual_tags_key] = existing_tags
-        if nonce:
-            st.session_state[last_nonce_key] = nonce
-
         st.query_params.clear()
-        st.rerun()
-
-    except Exception as e:
-        st.warning(f"Could not create visual tag from chart selection: {e}")
-        st.query_params.clear()
-
+    except Exception:
+        pass
 
 def _apply_loaded_review_to_state(
     uploaded_data: dict,
@@ -707,6 +1003,19 @@ def _apply_loaded_review_to_state(
         t_max=t_max,
     )
 
+    # Restore chart-drawn tags into the dedicated Streamlit state used by
+    # render_agent_controls(). This is the missing bridge: the JSON may contain
+    # drawn_tag_intervals, but Track 4 only visualizes tags that are included in
+    # agent_cfg["tag_intervals"].
+    restored_visual_tags = _extract_restorable_visual_tags(
+        uploaded_data=uploaded_data,
+        context_key=context_key,
+        t_min=t_min,
+        t_max=t_max,
+    )
+    if restored_visual_tags:
+        st.session_state[f"visual_tag_intervals_{context_key}"] = restored_visual_tags
+
     def _maybe_clamp(ts):
         if pd.isna(ts):
             return ts
@@ -724,9 +1033,19 @@ def _apply_loaded_review_to_state(
     st.session_state[f"enable_agent_1_{context_key}"] = False
 
     # ------------------------------------------------------------
-    # Normal tagger lane: text_input start/end keys need strings.
+    # Normal sidebar tagger lane: text_input start/end keys need strings.
+    # Keep chart-drawn tags out of these three sidebar slots; drawn tags are
+    # restored through visual_tag_intervals_<context_key> and drawn directly in
+    # Track 4.
     # ------------------------------------------------------------
-    for i, tag in enumerate(uploaded_data.get("tag_intervals", [])[:3], start=1):
+    manual_tags_to_restore = uploaded_data.get("manual_tagger_intervals")
+    if manual_tags_to_restore is None:
+        manual_tags_to_restore = [
+            item for item in (uploaded_data.get("tag_intervals", []) or [])
+            if not _looks_like_chart_drag_tag(item)
+        ]
+
+    for i, tag in enumerate((manual_tags_to_restore or [])[:3], start=1):
         start_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("start")))
         end_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("end")))
 
@@ -1533,32 +1852,11 @@ def render_symptom_agent_controls(context_key: str, parent=None):
             key=f"enable_symptom_agents_{context_key}",
         )
 
-        selected_symptom_options = [
-            "OpenHoleLength",
-            "TRQSpike",
-            "TRQErratic",
-            "PSpike",
-            "OverPull",
-            "TookWeight",
-        ]
-        selected_symptom_key = f"selected_symptom_lane_{context_key}"
-        selected_symptom_default_key = f"_selected_symptom_default_fixed_{context_key}"
-
-        # Streamlit keeps old selectbox values in session_state. If the app was
-        # opened before the default changed, it may stay on OpenHoleLength.
-        # Force TRQErratic once per well/section context, then let the user choose freely.
-        if not st.session_state.get(selected_symptom_default_key, False):
-            if st.session_state.get(selected_symptom_key) in (None, "OpenHoleLength"):
-                st.session_state[selected_symptom_key] = "TRQErratic"
-            st.session_state[selected_symptom_default_key] = True
-
-        if st.session_state.get(selected_symptom_key) not in selected_symptom_options:
-            st.session_state[selected_symptom_key] = "TRQErratic"
-
         selected_symptom = st.selectbox(
             "Symptom shown in Track 4 agent lane",
-            options=selected_symptom_options,
-            key=selected_symptom_key,
+            options=["OpenHoleLength", "TRQSpike", "TRQErratic", "PSpike", "OverPull", "TookWeight"],
+            index=2,
+            key=f"selected_symptom_lane_{context_key}",
         )
 
         with st.expander("Symptom thresholds — VT document definitions", expanded=False):
@@ -3068,45 +3366,44 @@ def render_agent_controls(
 
         st.markdown("**Tagger lane**")
         st.caption(
-            "Use the 🏷 Tagging tool above the Plotly chart, then drag vertically over "
-            "the suspicious interval. The dragged time interval is copied directly into "
-            "Track 4. Manual Tag 1/2/3 fields still work, but chart-drag tags are not limited to three."
+            "Reliable Streamlit-native tagging: use the sidebar Time Filter to zoom to "
+            "the suspicious interval, then click the button below. The selected time "
+            "window is copied into the next available Track 4 Tagger slot."
         )
 
-        visual_tags_key = f"visual_tag_intervals_{context_key}"
-        visual_tags = st.session_state.get(visual_tags_key, [])
-        if not isinstance(visual_tags, list):
-            visual_tags = []
-            st.session_state[visual_tags_key] = visual_tags
+        if st.button(
+            "Use current selected time window as Tag",
+            key=f"use_current_window_as_tag_{context_key}",
+            help=(
+                "Copies the current sidebar time-filter window into the next available "
+                "Tagger lane slot. This avoids unreliable JavaScript-to-Streamlit iframe communication."
+            ),
+        ):
+            target_i = None
 
-        if visual_tags:
-            st.caption(f"Chart-drag tags: {len(visual_tags)}")
+            for i in range(1, 4):
+                enabled_key = f"enable_tag_{i}_{context_key}"
+                if not st.session_state.get(enabled_key, False):
+                    target_i = i
+                    break
 
-            if st.button(
-                "Clear chart-drag tags",
-                key=f"clear_visual_tags_{context_key}",
-            ):
-                st.session_state[visual_tags_key] = []
-                st.rerun()
+            if target_i is None:
+                target_i = 3
 
-            for visual_i, visual_tag in enumerate(visual_tags, start=1):
-                try:
-                    visual_start = pd.Timestamp(visual_tag.get("start"))
-                    visual_end = pd.Timestamp(visual_tag.get("end"))
-                except Exception:
-                    continue
+            st.session_state[f"enable_tag_{target_i}_{context_key}"] = True
+            st.session_state[f"tag_label_{target_i}_{context_key}"] = f"Window Tag {target_i}"
+            st.session_state[f"tag_start_{target_i}_{context_key}"] = _format_datetime_text(t_min)
+            st.session_state[f"tag_end_{target_i}_{context_key}"] = _format_datetime_text(t_max)
 
-                if visual_end <= visual_start:
-                    continue
+            st.success(
+                f"Created Tag {target_i} from the current selected time window: "
+                f"{_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
+            )
+            st.rerun()
 
-                tag_intervals.append(
-                    {
-                        "label": str(visual_tag.get("label", f"Visual Tag {visual_i}")),
-                        "start": visual_start.to_pydatetime(),
-                        "end": visual_end.to_pydatetime(),
-                        "source": "chart_drag",
-                    }
-                )
+        st.caption(
+            f"Current selected time window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
+        )
 
         for i in range(1, 4):
             enabled = st.checkbox(
@@ -3154,6 +3451,29 @@ def render_agent_controls(
                         "end": tag_end,
                     }
                 )
+
+        # Chart-drawn tags restored from JSON or received from the browser are
+        # stored separately from the three sidebar Tagger slots. Add them to the
+        # same tag_intervals list that Track 4 uses, so they are visualized as
+        # real Tagger-lane intervals and included in the Hit results.
+        visual_key = f"visual_tag_intervals_{context_key}"
+        visual_items = st.session_state.get(visual_key, [])
+        if isinstance(visual_items, list):
+            cleaned_visual_items = []
+            for visual_idx, visual_item in enumerate(visual_items, start=1):
+                normalized_visual = _normalize_restored_visual_tag(
+                    visual_item,
+                    fallback_label=f"Drawn Tag {visual_idx}",
+                    t_min=t_min,
+                    t_max=t_max,
+                )
+                if normalized_visual is None:
+                    continue
+                cleaned_visual_items.append(normalized_visual)
+                tag_intervals.append(normalized_visual)
+
+            # Keep session_state clean and JSON-safe after clamping/normalization.
+            st.session_state[visual_key] = _deduplicate_visual_tags(cleaned_visual_items)
 
         st.markdown("**Agent lane**")
 
@@ -3262,619 +3582,6 @@ def render_agent_controls(
         "review_mode": review_mode,
     }
 
-
-def _infer_visual_interval_end(start_ts: pd.Timestamp, end_ts: pd.Timestamp, index=None) -> pd.Timestamp:
-    """
-    Track 4 interval lines need a visible time span.
-    Some symptom agents can produce one-sample/zero-duration hits.
-    Activity intervals are usually multi-sample, so they already draw clearly.
-    This helper gives symptom and visual-tag intervals the same practical visibility.
-    """
-    start_ts = pd.Timestamp(start_ts)
-    end_ts = pd.Timestamp(end_ts)
-
-    if end_ts > start_ts:
-        return end_ts
-
-    step = pd.Timedelta(seconds=1)
-
-    try:
-        if index is not None and len(index) > 1:
-            idx = pd.DatetimeIndex(index).sort_values()
-            diffs = pd.Series(idx).diff().dropna()
-            diffs = diffs[diffs > pd.Timedelta(0)]
-            if not diffs.empty:
-                step = diffs.median()
-    except Exception:
-        step = pd.Timedelta(seconds=1)
-
-    if pd.isna(step) or step <= pd.Timedelta(0):
-        step = pd.Timedelta(seconds=1)
-
-    return start_ts + step
-
-
-def _mask_to_track4_intervals_for_visualization(
-    mask: pd.Series,
-    label: str,
-    severity: str,
-) -> list[dict]:
-    """
-    Convert a boolean symptom mask into Track 4 intervals using the same idea as
-    the Activity Agent interval visualization: continuous True samples become
-    vertical interval lines in the Agent lane.
-    """
-    if mask is None or mask.empty:
-        return []
-
-    mask = mask.fillna(False).astype(bool)
-    index = mask.index
-    intervals = []
-    start = None
-    count = 0
-
-    for ts, flag in mask.items():
-        if flag and start is None:
-            start = pd.Timestamp(ts)
-            count = 1
-            continue
-
-        if flag and start is not None:
-            count += 1
-            continue
-
-        if (not flag) and start is not None:
-            loc = mask.index.get_loc(ts)
-            prev_ts = mask.index[max(0, loc - 1)]
-            end = _infer_visual_interval_end(start, pd.Timestamp(prev_ts), index=index)
-            intervals.append(
-                {
-                    "label": label,
-                    "start": start,
-                    "end": end,
-                    "severity": severity,
-                    "source": "symptom_agent",
-                    "visual_source": "feature_mask",
-                    "samples": int(count),
-                }
-            )
-            start = None
-            count = 0
-
-    if start is not None:
-        end = _infer_visual_interval_end(start, pd.Timestamp(mask.index[-1]), index=index)
-        intervals.append(
-            {
-                "label": label,
-                "start": start,
-                "end": end,
-                "severity": severity,
-                "source": "symptom_agent",
-                "visual_source": "feature_mask",
-                "samples": int(count),
-            }
-        )
-
-    return intervals
-
-
-def _normalize_symptom_label(value) -> str:
-    """Normalize symptom labels before filtering Track 4 intervals."""
-    return str(value or "").strip().replace(" ", "").replace("_", "").lower()
-
-
-def _as_bool_mask(series, index=None) -> pd.Series:
-    """
-    Convert a feature column into a safe boolean mask.
-    Handles real booleans, 0/1 numbers, and text values.
-    """
-    if series is None:
-        return pd.Series(False, index=index if index is not None else pd.Index([]))
-
-    if not isinstance(series, pd.Series):
-        series = pd.Series(series, index=index)
-
-    if series.empty:
-        return pd.Series(False, index=series.index)
-
-    if pd.api.types.is_bool_dtype(series):
-        return series.fillna(False).astype(bool)
-
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.notna().any():
-        return numeric.fillna(0.0).ne(0.0)
-
-    text = series.astype(str).str.strip().str.lower()
-    return text.isin(["true", "1", "yes", "y", "on"])
-
-
-def _deduplicate_track4_intervals(intervals: list[dict]) -> list[dict]:
-    seen = set()
-    unique = []
-
-    for item in intervals or []:
-        try:
-            start = pd.Timestamp(item.get("start"))
-            end = pd.Timestamp(item.get("end"))
-        except Exception:
-            continue
-
-        key = (
-            _normalize_symptom_label(item.get("label", "")),
-            str(start),
-            str(end),
-            str(item.get("severity", "")),
-            str(item.get("source", "")),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        unique.append({**item, "start": start, "end": end})
-
-    return unique
-
-
-def _append_mask_intervals(
-    output: list[dict],
-    features: pd.DataFrame,
-    column_name: str,
-    label: str,
-    severity: str,
-    visual_source: str | None = None,
-):
-    if features is None or features.empty or column_name not in features.columns:
-        return
-
-    new_items = _mask_to_track4_intervals_for_visualization(
-        mask=_as_bool_mask(features[column_name]),
-        label=label,
-        severity=severity,
-    )
-
-    for item in new_items:
-        item["source"] = "symptom_agent"
-        item["visual_source"] = visual_source or column_name
-
-    output.extend(new_items)
-
-
-def _build_trq_erratic_candidate_intervals(
-    features: pd.DataFrame,
-    symptom_cfg: dict,
-    selected_symptom: str,
-) -> list[dict]:
-    """
-    Fallback visual lane for TRQErratic.
-
-    The official TRQErratic interval builder may return nothing if the final
-    run is shorter than min_samples, or if a context/rpm-stability gate removes
-    it. Track 4 is a visual review lane, so when official intervals are empty we
-    still show the agent's detected erratic-candidate regions from the feature
-    table, using the same interval visualization method that fixed the single
-    Activity Agent display.
-    """
-    if features is None or features.empty:
-        return []
-
-    cfg = symptom_cfg.get("config", SymptomConfig()) if isinstance(symptom_cfg, dict) else SymptomConfig()
-
-    candidate = pd.Series(False, index=features.index)
-
-    if "trq_ratio" in features.columns and "trq_cycle_count" in features.columns:
-        trq_ratio = pd.to_numeric(features["trq_ratio"], errors="coerce")
-        cycle_count = pd.to_numeric(features["trq_cycle_count"], errors="coerce")
-
-        candidate = (
-            trq_ratio.gt(float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)))
-            & cycle_count.ge(int(getattr(cfg, "trq_erratic_min_cycles", 3)))
-        )
-
-        # Prefer the real context gates if they are available, but do not let a
-        # missing gate column make the mask empty.
-        if "context_mask" in features.columns:
-            candidate &= _as_bool_mask(features["context_mask"])
-        if "rpm_stable" in features.columns:
-            candidate &= _as_bool_mask(features["rpm_stable"])
-
-    if not candidate.any():
-        # Last visual fallback: show ratio-only suspicious regions. This does
-        # not change the agent logic or Excel evaluation; it only makes Track 4
-        # useful for visual inspection when strict interval formation removed
-        # all official runs.
-        if "trq_ratio" in features.columns:
-            trq_ratio = pd.to_numeric(features["trq_ratio"], errors="coerce")
-            candidate = trq_ratio.gt(float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)))
-
-    visual_intervals = _mask_to_track4_intervals_for_visualization(
-        mask=candidate,
-        label=selected_symptom,
-        severity="Medium",
-    )
-
-    for item in visual_intervals:
-        item["source"] = "symptom_agent"
-        item["visual_source"] = "trq_erratic_candidate_mask"
-
-    return visual_intervals
-
-
-def _numeric_threshold_mask(
-    features: pd.DataFrame,
-    column_name: str,
-    threshold: float,
-    operator: str = "gt",
-) -> pd.Series:
-    """Build a safe boolean mask from a numeric feature column."""
-    if features is None or features.empty or column_name not in features.columns:
-        return pd.Series(False, index=features.index if features is not None else pd.Index([]))
-
-    values = pd.to_numeric(features[column_name], errors="coerce")
-
-    if operator == "lt":
-        return values.lt(float(threshold)).fillna(False)
-
-    if operator == "ge":
-        return values.ge(float(threshold)).fillna(False)
-
-    if operator == "le":
-        return values.le(float(threshold)).fillna(False)
-
-    return values.gt(float(threshold)).fillna(False)
-
-
-def _append_numeric_candidate_intervals(
-    output: list[dict],
-    features: pd.DataFrame,
-    column_name: str,
-    threshold: float,
-    label: str,
-    severity: str,
-    operator: str = "gt",
-    visual_source: str | None = None,
-):
-    """Append Track 4 intervals from a numeric threshold candidate mask."""
-    if features is None or features.empty or column_name not in features.columns:
-        return
-
-    mask = _numeric_threshold_mask(
-        features=features,
-        column_name=column_name,
-        threshold=threshold,
-        operator=operator,
-    )
-
-    new_items = _mask_to_track4_intervals_for_visualization(
-        mask=mask,
-        label=label,
-        severity=severity,
-    )
-
-    for item in new_items:
-        item["source"] = "symptom_agent"
-        item["visual_source"] = visual_source or f"numeric_candidate:{column_name}>{threshold}"
-
-    output.extend(new_items)
-
-
-def _build_symptom_agent_track4_intervals(symptom_cfg: dict) -> list[dict]:
-    """
-    Build Track 4 Agent-lane intervals for Symptom Agent.
-
-    This version uses the same practical visualization method that fixed the
-    one-by-one Activity Agent display:
-    1. Use official symptom intervals when they exist.
-    2. If not, build visual intervals directly from the selected symptom feature
-       masks.
-    3. If the strict masks are empty, build visual candidate intervals from the
-       same numeric feature columns used by the agent.
-
-    This is only for Track 4 visualization. The detailed Excel/table evaluation
-    still uses the official agent outputs.
-    """
-    if not symptom_cfg:
-        return []
-
-    selected_symptom = symptom_cfg.get("selected_symptom", "") or "Symptom"
-    selected_norm = _normalize_symptom_label(selected_symptom)
-    features = symptom_cfg.get("features", pd.DataFrame())
-    cfg = symptom_cfg.get("config", SymptomConfig())
-    official_intervals = symptom_cfg.get("intervals", []) or []
-
-    cleaned: list[dict] = []
-
-    # Official intervals first. Repair zero/one-sample intervals so Plotly can see them.
-    for item in official_intervals:
-        item_label = item.get("label", selected_symptom)
-        if selected_norm and _normalize_symptom_label(item_label) != selected_norm:
-            continue
-
-        try:
-            start_ts = pd.Timestamp(item.get("start"))
-            raw_end_ts = pd.Timestamp(item.get("end"))
-            end_ts = _infer_visual_interval_end(
-                start_ts,
-                raw_end_ts,
-                index=features.index if isinstance(features, pd.DataFrame) and not features.empty else None,
-            )
-        except Exception:
-            continue
-
-        cleaned.append(
-            {
-                **item,
-                "label": item_label or selected_symptom,
-                "start": start_ts,
-                "end": end_ts,
-                "severity": item.get("severity", "Medium") or "Medium",
-                "source": "symptom_agent",
-                "visual_source": item.get("visual_source", "official_symptom_interval"),
-            }
-        )
-
-    if cleaned:
-        return _deduplicate_track4_intervals(cleaned)
-
-    if features is None or features.empty:
-        return []
-
-    visual_intervals: list[dict] = []
-
-    # ------------------------------------------------------------------
-    # Strict mask path: use the final boolean masks produced by the agent.
-    # ------------------------------------------------------------------
-    if selected_symptom == "OpenHoleLength":
-        _append_mask_intervals(visual_intervals, features, "open_hole_lvl1_mask", selected_symptom, "Low")
-        _append_mask_intervals(visual_intervals, features, "open_hole_lvl2_mask", selected_symptom, "High")
-
-    elif selected_symptom == "TRQSpike":
-        _append_mask_intervals(visual_intervals, features, "lvl1_mask", selected_symptom, "Low")
-        _append_mask_intervals(visual_intervals, features, "lvl2_mask", selected_symptom, "High")
-        _append_mask_intervals(visual_intervals, features, "TRQSpike Low Mask", selected_symptom, "Low")
-        _append_mask_intervals(visual_intervals, features, "TRQSpike High Mask", selected_symptom, "High")
-
-    elif selected_symptom == "TRQErratic":
-        _append_mask_intervals(visual_intervals, features, "lvl1_mask", selected_symptom, "Low")
-        _append_mask_intervals(visual_intervals, features, "lvl2_mask", selected_symptom, "High")
-        _append_mask_intervals(visual_intervals, features, "TRQErratic Low Mask", selected_symptom, "Low")
-        _append_mask_intervals(visual_intervals, features, "TRQErratic High Mask", selected_symptom, "High")
-
-    elif selected_symptom == "PSpike":
-        _append_mask_intervals(visual_intervals, features, "combined_mask", selected_symptom, "Medium")
-        _append_mask_intervals(visual_intervals, features, "normal_mask", selected_symptom, "Medium")
-        _append_mask_intervals(visual_intervals, features, "motor_mask", selected_symptom, "High")
-
-    elif selected_symptom in {"OverPull", "TookWeight"}:
-        _append_mask_intervals(visual_intervals, features, "combined_mask", selected_symptom, "High")
-        _append_mask_intervals(visual_intervals, features, "raw_mask", selected_symptom, "High")
-
-    if visual_intervals:
-        return _deduplicate_track4_intervals(visual_intervals)
-
-    # ------------------------------------------------------------------
-    # Candidate path: if strict masks are empty, show the agent's numeric
-    # candidate regions in Track 4, similar to how Activity Agent shows labels.
-    # This is the key extra fallback compared with v7.
-    # ------------------------------------------------------------------
-    if selected_symptom == "OpenHoleLength":
-        if "open_hole_length" in features.columns:
-            _append_numeric_candidate_intervals(
-                visual_intervals,
-                features,
-                "open_hole_length",
-                float(getattr(cfg, "open_hole_length_threshold_1", 500.0)),
-                selected_symptom,
-                "Low",
-                visual_source="open_hole_length_threshold_candidate",
-            )
-
-    elif selected_symptom == "TRQSpike":
-        # Prefer the agent's spike_gate if present, then numeric TRQ candidates.
-        _append_mask_intervals(visual_intervals, features, "spike_gate", selected_symptom, "Medium")
-        if not visual_intervals:
-            _append_numeric_candidate_intervals(
-                visual_intervals,
-                features,
-                "trq_ratio",
-                float(getattr(cfg, "trq_spike_ratio_level_1", 1.25)),
-                selected_symptom,
-                "Medium",
-                visual_source="trq_spike_ratio_candidate",
-            )
-        if not visual_intervals:
-            _append_numeric_candidate_intervals(
-                visual_intervals,
-                features,
-                "trq_zscore",
-                float(getattr(cfg, "trq_spike_zscore_min", 2.9)),
-                selected_symptom,
-                "Medium",
-                visual_source="trq_spike_zscore_candidate",
-            )
-
-    elif selected_symptom == "TRQErratic":
-        # v7 still allowed context/rpm gates to erase everything. Here Track 4
-        # first shows the actual final masks, but if those are empty it shows
-        # numeric erratic candidates from TRQ ratio and cycle count.
-        if "trq_ratio" in features.columns and "trq_cycle_count" in features.columns:
-            trq_ratio = pd.to_numeric(features["trq_ratio"], errors="coerce")
-            cycle_count = pd.to_numeric(features["trq_cycle_count"], errors="coerce")
-            candidate = (
-                trq_ratio.gt(float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)))
-                & cycle_count.ge(int(getattr(cfg, "trq_erratic_min_cycles", 3)))
-            ).fillna(False)
-
-            # Important: do NOT apply context_mask/rpm_stable here. Those gates
-            # can be the reason official intervals disappear. For visual review,
-            # boss needs to see the suspicious TRQ regions first.
-            visual_intervals.extend(
-                _mask_to_track4_intervals_for_visualization(
-                    mask=candidate,
-                    label=selected_symptom,
-                    severity="Medium",
-                )
-            )
-            for item in visual_intervals:
-                item["source"] = "symptom_agent"
-                item["visual_source"] = "trq_ratio_and_cycle_candidate_no_context_gate"
-
-        if not visual_intervals:
-            _append_numeric_candidate_intervals(
-                visual_intervals,
-                features,
-                "trq_ratio",
-                float(getattr(cfg, "trq_erratic_ratio_level_1", 1.10)),
-                selected_symptom,
-                "Medium",
-                visual_source="trq_erratic_ratio_only_candidate",
-            )
-
-    elif selected_symptom == "PSpike":
-        _append_numeric_candidate_intervals(
-            visual_intervals,
-            features,
-            "spp_delta",
-            float(getattr(cfg, "pspike_threshold_normal", 5.0)),
-            selected_symptom,
-            "Medium",
-            visual_source="pspike_spp_delta_candidate",
-        )
-
-    elif selected_symptom == "OverPull":
-        _append_numeric_candidate_intervals(
-            visual_intervals,
-            features,
-            "hkl_delta",
-            float(getattr(cfg, "overpull_threshold", 6.0)),
-            selected_symptom,
-            "High",
-            visual_source="overpull_hkl_delta_candidate",
-        )
-
-    elif selected_symptom == "TookWeight":
-        _append_numeric_candidate_intervals(
-            visual_intervals,
-            features,
-            "hkl_drop",
-            float(getattr(cfg, "tookweight_threshold", 6.0)),
-            selected_symptom,
-            "High",
-            visual_source="tookweight_hkl_drop_candidate",
-        )
-
-    if visual_intervals:
-        for item in visual_intervals:
-            item["source"] = "symptom_agent"
-            item.setdefault("visual_source", "numeric_candidate")
-        return _deduplicate_track4_intervals(visual_intervals)
-
-    # ------------------------------------------------------------------
-    # Last generic fallback: any final-looking mask column.
-    # ------------------------------------------------------------------
-    excluded_mask_names = {
-        "context_mask",
-        "rpm_stable",
-        "rpm_on",
-        "started_low",
-        "normal_spike_shape",
-        "extreme_spike",
-        "stable_mask",
-        "stable_flow_mask",
-        "stable_rpm_mask",
-        "stable_wob_mask",
-        "spp_stable_before_spike",
-        "move_mask",
-        "velocity_ok",
-        "mud_motor_on",
-    }
-
-    for col in features.columns:
-        col_text = str(col)
-        col_norm = col_text.strip().lower()
-        looks_like_mask = col_norm.endswith("mask") or col_norm.endswith(" mask")
-        if not looks_like_mask or col_norm in excluded_mask_names:
-            continue
-
-        severity = "Medium"
-        if "high" in col_norm or "lvl2" in col_norm:
-            severity = "High"
-        elif "low" in col_norm or "lvl1" in col_norm:
-            severity = "Low"
-
-        _append_mask_intervals(
-            visual_intervals,
-            features,
-            col_text,
-            selected_symptom,
-            severity,
-            visual_source=f"generic_mask:{col_text}",
-        )
-
-    return _deduplicate_track4_intervals(visual_intervals)
-
-def _normalize_activity_label(value) -> str:
-    """Normalize activity labels before filtering Track 4 intervals."""
-    return str(value or "").strip().replace(" ", "").lower()
-
-
-def _build_activity_agent_track4_intervals(activity_cfg: dict) -> list[dict]:
-    """
-    Build Track 4 Agent-lane intervals for Activity Agent.
-
-    Important fix:
-    Do not rely only on filtering the precomputed interval list by exact text.
-    "All activities" works because it passes the whole interval list through.
-    One-by-one selections can fail if the labels are not exactly identical or if
-    the interval list was produced/cleaned differently. This builds the selected
-    activity lane from the final activity label series when needed, using the same
-    visual interval method that Track 4 already uses successfully for all activities.
-    """
-    if not activity_cfg:
-        return []
-
-    selected_activity = activity_cfg.get("selected_activity", "All activities")
-    intervals = activity_cfg.get("intervals", []) or []
-
-    # All activities: preserve the existing behavior that already works.
-    if selected_activity == "All activities":
-        return intervals
-
-    selected_norm = _normalize_activity_label(selected_activity)
-
-    # First try the existing interval list, but compare normalized strings.
-    filtered = [
-        item
-        for item in intervals
-        if _normalize_activity_label(item.get("label", "")) == selected_norm
-    ]
-
-    if filtered:
-        return filtered
-
-    # Fallback: build intervals directly from the final activity label series.
-    # This makes single-activity display use the same underlying classification
-    # state as All activities, instead of depending on exact interval labels.
-    labels = activity_cfg.get("labels", pd.Series(dtype="object"))
-    if labels is None or labels.empty:
-        return []
-
-    label_series = labels.astype("object").apply(_normalize_activity_label)
-    mask = label_series.eq(selected_norm)
-
-    visual_intervals = _mask_to_track4_intervals_for_visualization(
-        mask=mask,
-        label=selected_activity,
-        severity="Medium",
-    )
-
-    for item in visual_intervals:
-        item["source"] = "activity_agent"
-        item["visual_source"] = "activity_label_series"
-        item["severity"] = None
-
-    return visual_intervals
-
 def build_agent_cfg_from_controls(
     controls: dict,
     activity_cfg: dict,
@@ -3886,18 +3593,20 @@ def build_agent_cfg_from_controls(
 
     auto_agent_intervals = []
 
-    if agent_source == "Activity agent":
-        # Use the same interval-building path for both "All activities" and
-        # one selected activity. This fixes the case where All activities draws
-        # correctly but Drilling/Reaming/etc. draw nothing.
-        auto_agent_intervals = _build_activity_agent_track4_intervals(activity_cfg or {})
+    if agent_source == "Activity agent" and activity_cfg and activity_cfg.get("intervals"):
+        selected_activity = activity_cfg.get("selected_activity", "All activities")
 
-    elif agent_source == "Symptom agent":
-        # Use the same visualization principle as Activity Agent:
-        # Track 4 draws a list of interval dictionaries. If the selected symptom
-        # did not emit official intervals, build visual intervals from its final
-        # boolean masks so the Agent lane still shows detected deviations.
-        auto_agent_intervals = _build_symptom_agent_track4_intervals(symptom_cfg or {})
+        if selected_activity == "All activities":
+            auto_agent_intervals = activity_cfg["intervals"]
+        else:
+            auto_agent_intervals = [
+                item
+                for item in activity_cfg["intervals"]
+                if item["label"] == selected_activity
+            ]
+
+    elif agent_source == "Symptom agent" and symptom_cfg and symptom_cfg.get("intervals"):
+        auto_agent_intervals = symptom_cfg["intervals"]
 
     if agent_source == "Manual interval":
         agent_intervals = manual_agent_intervals
@@ -4096,6 +3805,237 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
             st.session_state[key] = value
 
 
+def _render_dashboard_session_download_with_browser_tags(
+    json_text: str,
+    context_key: str,
+    file_name: str,
+):
+    """
+    Browser-side save button for full dashboard sessions.
+
+    Why this exists:
+    chart-drawn tags are created inside components.html / Plotly JavaScript first.
+    A normal st.download_button is prepared on the Python side before the click,
+    so it cannot see unsynced browser/localStorage tags at click time.
+
+    This component reads the current browser-drawn tags from localStorage, injects
+    them into the already-built JSON payload, and downloads the final JSON in the
+    browser. Manual sidebar tags remain in the base JSON from Python.
+    """
+    base_json_text = json.dumps(json_text)
+    context_json = json.dumps(str(context_key or ""))
+    file_name_json = json.dumps(file_name)
+
+    components.html(
+        f"""
+        <div style="font-family:Arial,sans-serif; margin: 0 0 8px 0;">
+            <button id="save_dashboard_with_drawn_tags_btn" style="
+                width: 100%;
+                padding: 0.45rem 0.65rem;
+                border: 1px solid rgba(49,51,63,0.25);
+                border-radius: 0.35rem;
+                background: rgb(255,255,255);
+                color: rgb(49,51,63);
+                cursor: pointer;
+                font-size: 0.92rem;
+                line-height: 1.4;
+            ">
+                Save Dashboard Session
+            </button>
+            <div id="save_dashboard_with_drawn_tags_status" style="
+                font-size: 11px;
+                color: #666;
+                margin-top: 4px;
+                line-height: 1.25;
+            "></div>
+        </div>
+
+        <script>
+        (function() {{
+            const baseJsonText = {base_json_text};
+            const contextKey = {context_json};
+            const fileName = {file_name_json};
+            const button = document.getElementById("save_dashboard_with_drawn_tags_btn");
+            const status = document.getElementById("save_dashboard_with_drawn_tags_status");
+
+            function parseDateMs(value) {{
+                const d = new Date(value);
+                return isNaN(d.getTime()) ? null : d.getTime();
+            }}
+
+            function normalizeTag(item, idx) {{
+                if (!item || typeof item !== "object") return null;
+
+                const start = item.start || item["Tag Start"] || item.tag_start || item.start_time || "";
+                const end = item.end || item["Tag End"] || item.tag_end || item.end_time || "";
+
+                if (!start || !end) return null;
+
+                const startMs = parseDateMs(start);
+                const endMs = parseDateMs(end);
+
+                if (startMs === null || endMs === null || endMs <= startMs) return null;
+
+                return {{
+                    label: String(item.label || item["Tag Label"] || item.tag_label || ("Drawn Tag " + idx)),
+                    start: String(start).replace("T", " ").slice(0, 19),
+                    end: String(end).replace("T", " ").slice(0, 19),
+                    source: "chart_drag"
+                }};
+            }}
+
+            function identity(tag) {{
+                return String(tag.label || "") + "|" + String(tag.start || "") + "|" + String(tag.end || "");
+            }}
+
+            function deduplicate(tags) {{
+                const out = [];
+                const seen = new Set();
+
+                (Array.isArray(tags) ? tags : []).forEach(function(tag) {{
+                    const normalized = normalizeTag(tag, out.length + 1);
+                    if (!normalized) return;
+
+                    const key = identity(normalized);
+                    if (seen.has(key)) return;
+
+                    seen.add(key);
+                    out.push(normalized);
+                }});
+
+                return out;
+            }}
+
+            function readJsonList(key) {{
+                try {{
+                    const raw = window.localStorage.getItem(key);
+                    if (!raw) return [];
+                    const parsed = JSON.parse(raw);
+                    return Array.isArray(parsed) ? parsed : [];
+                }} catch (e) {{
+                    return [];
+                }}
+            }}
+
+            function readBrowserDrawnTags() {{
+                if (!contextKey) return [];
+
+                const latestKey = "hoda_client_visual_tags_latest_" + contextKey;
+                let items = readJsonList(latestKey);
+
+                // Fallback for dashboards opened before the latest-key fix:
+                // collect all session-token-specific keys for this context.
+                if (!items.length) {{
+                    const prefix = "hoda_client_visual_tags_" + contextKey + "_";
+                    try {{
+                        for (let i = 0; i < window.localStorage.length; i++) {{
+                            const key = window.localStorage.key(i);
+                            if (!key || !key.startsWith(prefix)) continue;
+                            if (key.includes("_redo_")) continue;
+                            items = items.concat(readJsonList(key));
+                        }}
+                    }} catch (e) {{}}
+                }}
+
+                return deduplicate(items);
+            }}
+
+            function mergePayloadWithDrawnTags(basePayload, browserDrawnTags) {{
+                const payload = basePayload && typeof basePayload === "object" ? basePayload : {{}};
+
+                if (!payload.dashboard_context) payload.dashboard_context = {{}};
+                if (!payload.dashboard_state) payload.dashboard_state = {{}};
+                if (!payload.dashboard_state.widget_state) payload.dashboard_state.widget_state = {{}};
+
+                const existingDrawn = deduplicate(payload.drawn_tag_intervals || []);
+                const allDrawn = deduplicate(existingDrawn.concat(browserDrawnTags));
+
+                payload.drawn_tag_intervals = allDrawn;
+                payload.dashboard_state.widget_state["visual_tag_intervals_" + contextKey] = allDrawn;
+
+                const manual = Array.isArray(payload.manual_tagger_intervals)
+                    ? payload.manual_tagger_intervals
+                    : [];
+
+                const nonDrawnExisting = (Array.isArray(payload.tag_intervals) ? payload.tag_intervals : [])
+                    .filter(function(tag) {{
+                        return String((tag && tag.source) || "").toLowerCase() !== "chart_drag";
+                    }});
+
+                // Prefer the explicit manual_tagger_intervals, but keep compatibility
+                // with older payloads that only had tag_intervals.
+                const manualBase = manual.length ? manual : nonDrawnExisting;
+                payload.tag_intervals = deduplicate(manualBase.concat(allDrawn));
+
+                if (!payload.summary) payload.summary = {{}};
+                payload.summary.tag_count = payload.tag_intervals.length;
+
+                return payload;
+            }}
+
+            function downloadText(text, name) {{
+                const blob = new Blob([text], {{type: "application/json;charset=utf-8"}});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = name || "dashboard_session.json";
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }}
+
+            function setStatus(message) {{
+                if (status) status.textContent = message;
+            }}
+
+            function doSave() {{
+                let basePayload = null;
+                try {{
+                    basePayload = JSON.parse(baseJsonText);
+                }} catch (e) {{
+                    alert("Could not prepare the saved dashboard JSON.");
+                    return;
+                }}
+
+                const browserDrawnTags = readBrowserDrawnTags();
+                const finalPayload = mergePayloadWithDrawnTags(basePayload, browserDrawnTags);
+                const finalText = JSON.stringify(finalPayload, null, 2);
+
+                downloadText(finalText, fileName);
+
+                if (browserDrawnTags.length) {{
+                    setStatus("Saved with " + browserDrawnTags.length + " drawn tag(s).");
+                }} else {{
+                    setStatus("Saved. No browser-drawn tags were found.");
+                }}
+            }}
+
+            if (button) {{
+                button.addEventListener("mouseenter", function() {{
+                    button.style.borderColor = "rgba(49,51,63,0.45)";
+                    button.style.background = "rgb(250,250,250)";
+                }});
+                button.addEventListener("mouseleave", function() {{
+                    button.style.borderColor = "rgba(49,51,63,0.25)";
+                    button.style.background = "rgb(255,255,255)";
+                }});
+                button.addEventListener("click", doSave);
+            }}
+
+            const initialCount = readBrowserDrawnTags().length;
+            if (initialCount) {{
+                setStatus("Ready to save with " + initialCount + " browser-drawn tag(s).");
+            }} else {{
+                setStatus("Ready to save.");
+            }}
+        }})();
+        </script>
+        """,
+        height=68,
+        scrolling=False,
+    )
+
 def render_agent_review_outputs(
     agent_cfg: dict,
     context_key: str,
@@ -4118,12 +4058,6 @@ def render_agent_review_outputs(
             f"Summary — Tags: {summary['tag_count']} | "
             f"Hits: {summary['agent_count']} | "
             f"Overlap: {summary['overlap_count']} / {summary['tag_count']}"
-        )
-
-        st.caption(
-            f"Track 4 source: {agent_cfg.get('agent_source', '')} | "
-            f"Tagger lane intervals: {len(agent_cfg.get('tag_intervals', []))} | "
-            f"Agent lane intervals: {len(agent_cfg.get('agent_intervals', []))}"
         )
 
         st.caption(
@@ -4156,12 +4090,10 @@ def render_agent_review_outputs(
             context_key=context_key,
         )
 
-        st.download_button(
-            "Save Dashboard Session",
-            data=json_text,
+        _render_dashboard_session_download_with_browser_tags(
+            json_text=json_text,
+            context_key=context_key,
             file_name=f"tag_review_{context_key}.json",
-            mime="application/json",
-            key=f"download_json_{context_key}",
         )
 
         st.download_button(

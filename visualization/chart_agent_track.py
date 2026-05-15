@@ -76,6 +76,54 @@ def _add_vertical_interval_line(
     )
 
 
+
+def _add_agent_visibility_marker(
+    fig: go.Figure,
+    x_pos: float,
+    start_time,
+    end_time,
+    color: str,
+    row: int,
+    col: int,
+    hover_text: str | None = None,
+):
+    """
+    Add a very small visible placeholder for short agent intervals.
+
+    Short agent intervals can be thinner than one screen pixel when the user is
+    looking at a full section. This tiny dot only acts as a locator,
+    while the real agent interval is still drawn as the main Agent-lane line.
+    The metadata lets layout.py exclude these placeholders from hit-result
+    interval extraction.
+    """
+    start_ts = pd.Timestamp(start_time)
+    end_ts = pd.Timestamp(end_time)
+    if end_ts < start_ts:
+        return
+
+    mid_ts = start_ts + (end_ts - start_ts) / 2
+
+    fig.add_trace(
+        go.Scatter(
+            x=[x_pos],
+            y=[mid_ts],
+            mode="markers",
+            marker=dict(
+                color=color,
+                size=3,
+                symbol="circle",
+                opacity=0.85,
+                line=dict(color=color, width=0),
+            ),
+            showlegend=False,
+            hovertemplate=(hover_text or "Agent interval") + "<extra></extra>",
+            meta={"source": "agent_visibility_marker"},
+        ),
+        row=row,
+        col=col,
+    )
+
+
 def _compute_activity_lane_summary(activity_intervals: list[dict]) -> list[dict]:
     if not activity_intervals:
         return []
@@ -225,6 +273,17 @@ def _add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
             end_time=agent["end"],
             color=color,
             width=width,
+            row=row,
+            col=col,
+            hover_text=hover_text,
+        )
+
+        _add_agent_visibility_marker(
+            fig=fig,
+            x_pos=AGENT_X,
+            start_time=agent["start"],
+            end_time=agent["end"],
+            color=color,
             row=row,
             col=col,
             hover_text=hover_text,
