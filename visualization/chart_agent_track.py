@@ -80,7 +80,7 @@ def _add_vertical_interval_line(
         col=col,
     )
 
-
+#record
 def _add_agent_visibility_marker(
     fig: go.Figure,
     x_pos: float,
