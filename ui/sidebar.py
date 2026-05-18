@@ -264,6 +264,27 @@ def _get_saved_track_param_labels(context_key: str) -> list[list[str]]:
     ])
     return tracks
 
+
+def _sanitize_dashboard_session_filename(value: str, fallback: str = "dashboard_session") -> str:
+    """Return a safe .json filename chosen by the user."""
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+
+    # Remove an existing extension first, then sanitize the base name.
+    if text.lower().endswith(".json"):
+        text = text[:-5]
+
+    safe = []
+    for ch in text:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            safe.append(ch)
+        elif ch.isspace():
+            safe.append("_")
+
+    name = "".join(safe).strip("._-") or fallback
+    return f"{name}.json"
+
 def _build_full_dashboard_state(context_key: str) -> dict:
     """
     Save all small dashboard/session values for this selected well/section context.
@@ -3708,13 +3729,13 @@ def render_agent_controls(
 
             st.success("Saved review restored for this well/section.")
 
-        review_mode = st.selectbox(
-            "Review mode",
-            options=["Standard review", "Stretched inspection"],
-            index=1,
-            key=f"review_mode_{context_key}",
-        )
-        chart_height = 950 if review_mode == "Standard review" else 1400
+        # Review mode is intentionally not shown in the UI.
+        # Keep the setting in session_state for compatibility with saved sessions
+        # and downstream code, but always use the boss-preferred stretched view.
+        review_mode_key = f"review_mode_{context_key}"
+        st.session_state[review_mode_key] = "Stretched inspection"
+        review_mode = "Stretched inspection"
+        chart_height = 1400
 
         show_reference_line = st.checkbox(
             "Show cross-track reference line",
@@ -4569,19 +4590,34 @@ def render_agent_review_outputs(
             context_key=context_key,
         )
 
+        default_json_name = f"tag_review_{context_key}"
+        requested_json_name = st.text_input(
+            "Dashboard session file name",
+            value=default_json_name,
+            key=f"dashboard_session_file_name_{context_key}",
+            help="Choose the name of the saved dashboard .json file.",
+        )
+
+        safe_json_name = _sanitize_dashboard_session_filename(
+            requested_json_name,
+            fallback=default_json_name,
+        )
+
         _render_dashboard_session_download_with_browser_tags(
             json_text=json_text,
             context_key=context_key,
-            file_name=f"tag_review_{context_key}.json",
+            file_name=safe_json_name,
         )
 
-        st.download_button(
-            "Export tags/hits as CSV",
-            data=csv_text,
-            file_name=f"tag_review_{context_key}.csv",
-            mime="text/csv",
-            key=f"download_csv_{context_key}",
-        )
+        # CSV export is kept in the code but hidden from the normal UI.
+        if st.session_state.get(f"_show_hidden_csv_export_{context_key}", False):
+            st.download_button(
+                "Export tags/hits as CSV",
+                data=csv_text,
+                file_name=f"tag_review_{context_key}.csv",
+                mime="text/csv",
+                key=f"download_csv_{context_key}",
+            )
 
 
 

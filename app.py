@@ -539,30 +539,31 @@ def main():
         st.error("No data loaded. Check the parquet files in the data folder.")
         st.stop()
 
-    with st.expander("Time sampling diagnostics — raw loaded data", expanded=False):
-        st.caption(
-            "This table shows the real timestamp spacing in the loaded data. "
-            "Use it to check whether the source data is seconds-sampled or minute-sampled."
-        )
-
-        cadence_df = build_time_cadence_df(df)
-        st.dataframe(cadence_df, width="stretch")
-
-        if not cadence_df.empty:
-            median_steps = pd.to_numeric(cadence_df["Median step sec"], errors="coerce")
-            worst_median_step = median_steps.max()
-
-            if pd.notna(worst_median_step) and worst_median_step > 30.0:
-                st.warning(
-                    "The selected data appears to be low-frequency or minute-range sampled. "
-                    "Fast symptoms such as TRQErratic may not be detectable from this data."
-                )
-            else:
-                st.success(
-                    "The selected data is not minute-range sampled based on the median timestamp step. "
-                    "If the chart still looks sparse, it is probably a plotting scale/downsampling issue."
-                )
-
+    if st.session_state.get("_show_hidden_time_sampling_raw", False):
+        with st.expander("Time sampling diagnostics — raw loaded data", expanded=False):
+            st.caption(
+                "This table shows the real timestamp spacing in the loaded data. "
+                "Use it to check whether the source data is seconds-sampled or minute-sampled."
+            )
+    
+            cadence_df = build_time_cadence_df(df)
+            st.dataframe(cadence_df, width="stretch")
+    
+            if not cadence_df.empty:
+                median_steps = pd.to_numeric(cadence_df["Median step sec"], errors="coerce")
+                worst_median_step = median_steps.max()
+    
+                if pd.notna(worst_median_step) and worst_median_step > 30.0:
+                    st.warning(
+                        "The selected data appears to be low-frequency or minute-range sampled. "
+                        "Fast symptoms such as TRQErratic may not be detectable from this data."
+                    )
+                else:
+                    st.success(
+                        "The selected data is not minute-range sampled based on the median timestamp step. "
+                        "If the chart still looks sparse, it is probably a plotting scale/downsampling issue."
+                    )
+    
     context_cleaning_rules = build_context_cleaning_rules(
         selected_well=selected_well,
         selected_sections=selected_sections,
@@ -579,76 +580,77 @@ def main():
         required_symptom_labels=required_symptom_labels,
     )
 
-    with st.expander("Parameter mapping diagnostics", expanded=False):
-        st.caption(
-            "This table checks whether each logical dashboard parameter is connected "
-            "to the expected raw mnemonic and whether its values look physically reasonable."
-        )
-
-        mapping_diagnostic_df = build_mapping_diagnostic_df(
-            df=df,
-            label_to_column=label_to_column,
-            parameter_catalog=PARAMETER_CATALOG,
-        )
-
-        st.dataframe(mapping_diagnostic_df, width="stretch")
-
-        bad_rows = mapping_diagnostic_df[
-            mapping_diagnostic_df["Status"].astype(str).ne("OK")
-        ]
-
-        if not bad_rows.empty:
-            st.warning(
-                "Some curves contain values outside the expected display/diagnostic range. "
-                "This does not automatically mean wrong mapping. It may indicate sensor zero drift, "
-                "unit mismatch, outliers, or valid high-range operation. Check both this table "
-                "and the Data cleaning diagnostics table."
-            )
-
-        with st.expander("Data cleaning diagnostics", expanded=False):
+    if st.session_state.get("_show_hidden_parameter_mapping_diagnostics", False):
+        with st.expander("Parameter mapping diagnostics", expanded=False):
             st.caption(
-                "Raw data is preserved. The dashboard creates cleaned columns for agent logic. "
-                "Small negative zero-drift values can be corrected to 0. Extreme impossible values become NaN."
+                "This table checks whether each logical dashboard parameter is connected "
+                "to the expected raw mnemonic and whether its values look physically reasonable."
             )
-
-            if cleaning_summary_df.empty:
-                st.info("No cleaning summary is available.")
-            else:
-                st.dataframe(cleaning_summary_df, width="stretch")
-
-                changed_rows = cleaning_summary_df[
-                    (
-                        cleaning_summary_df["Zero drift corrected"]
-                        .fillna(0)
-                        .astype(int)
-                        > 0
-                    )
-                    | (
-                        cleaning_summary_df["Below hard min invalid"]
-                        .fillna(0)
-                        .astype(int)
-                        > 0
-                    )
-                    | (
-                        cleaning_summary_df["Above hard max invalid"]
-                        .fillna(0)
-                        .astype(int)
-                        > 0
-                    )
-                    | (
-                        cleaning_summary_df["Infinite invalid"]
-                        .fillna(0)
-                        .astype(int)
-                        > 0
-                    )
-                ]
-
-                if not changed_rows.empty:
-                    st.warning(
-                        "Some raw values were corrected or marked invalid for agent use. "
-                        "The original raw columns are still preserved for visual review."
-                    )
-
+    
+            mapping_diagnostic_df = build_mapping_diagnostic_df(
+                df=df,
+                label_to_column=label_to_column,
+                parameter_catalog=PARAMETER_CATALOG,
+            )
+    
+            st.dataframe(mapping_diagnostic_df, width="stretch")
+    
+            bad_rows = mapping_diagnostic_df[
+                mapping_diagnostic_df["Status"].astype(str).ne("OK")
+            ]
+    
+            if not bad_rows.empty:
+                st.warning(
+                    "Some curves contain values outside the expected display/diagnostic range. "
+                    "This does not automatically mean wrong mapping. It may indicate sensor zero drift, "
+                    "unit mismatch, outliers, or valid high-range operation. Check both this table "
+                    "and the Data cleaning diagnostics table."
+                )
+    
+            with st.expander("Data cleaning diagnostics", expanded=False):
+                st.caption(
+                    "Raw data is preserved. The dashboard creates cleaned columns for agent logic. "
+                    "Small negative zero-drift values can be corrected to 0. Extreme impossible values become NaN."
+                )
+    
+                if cleaning_summary_df.empty:
+                    st.info("No cleaning summary is available.")
+                else:
+                    st.dataframe(cleaning_summary_df, width="stretch")
+    
+                    changed_rows = cleaning_summary_df[
+                        (
+                            cleaning_summary_df["Zero drift corrected"]
+                            .fillna(0)
+                            .astype(int)
+                            > 0
+                        )
+                        | (
+                            cleaning_summary_df["Below hard min invalid"]
+                            .fillna(0)
+                            .astype(int)
+                            > 0
+                        )
+                        | (
+                            cleaning_summary_df["Above hard max invalid"]
+                            .fillna(0)
+                            .astype(int)
+                            > 0
+                        )
+                        | (
+                            cleaning_summary_df["Infinite invalid"]
+                            .fillna(0)
+                            .astype(int)
+                            > 0
+                        )
+                    ]
+    
+                    if not changed_rows.empty:
+                        st.warning(
+                            "Some raw values were corrected or marked invalid for agent use. "
+                            "The original raw columns are still preserved for visual review."
+                        )
+    
     # The dataframe has already been loaded only for the selected fixed 12-hour window.
     # No secondary time filter and no downsampling are used.
     marker_display = DEFAULT_MARKER_DISPLAY
@@ -661,16 +663,17 @@ def main():
         t_max=df.index.max(),
     )
 
-    with st.expander("Time sampling diagnostics — selected 12-hour window", expanded=False):
-        selected_cadence_df = build_time_cadence_df(df)
-        st.dataframe(selected_cadence_df, width="stretch")
-
-        st.caption(
-            f"Selected 12-hour window contains {len(df):,} raw rows. "
-            "No dashboard downsampling is applied; every loaded point is plotted."
-        )
-
-
+    if st.session_state.get("_show_hidden_time_sampling_window", False):
+        with st.expander("Time sampling diagnostics — selected 12-hour window", expanded=False):
+            selected_cadence_df = build_time_cadence_df(df)
+            st.dataframe(selected_cadence_df, width="stretch")
+    
+            st.caption(
+                f"Selected 12-hour window contains {len(df):,} raw rows. "
+                "No dashboard downsampling is applied; every loaded point is plotted."
+            )
+    
+    
     # Create sidebar containers in the visual order we want.
     # Track 4 will appear before the agent settings, even though the
     # agent settings are read first internally.
@@ -891,12 +894,13 @@ def main():
             )
 
     if symptom_cfg and not symptom_cfg.get("features", pd.DataFrame()).empty:
-        with st.expander("Selected symptom debug features", expanded=False):
-            st.dataframe(
-                symptom_cfg["features"].tail(1000),
-                width="stretch",
-            )
-
+        if st.session_state.get("_show_hidden_selected_symptom_debug", False):
+            with st.expander("Selected symptom debug features", expanded=False):
+                st.dataframe(
+                    symptom_cfg["features"].tail(1000),
+                    width="stretch",
+                )
+    
     section_ranges = compute_section_ranges(df, list(selected_sections))
 
     track_colors = [
@@ -968,3 +972,4 @@ if __name__ == "__main__":
         print("========== END DASHBOARD CRASH TRACEBACK ==========\n\n")
 
         raise
+

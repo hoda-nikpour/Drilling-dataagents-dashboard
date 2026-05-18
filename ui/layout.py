@@ -17,7 +17,7 @@ def render_dashboard_header(
     st.markdown(
         f'<div class="well-header">Well {selected_well}</div>'
         f'<div class="well-subheader">Mud Logging Dashboard &nbsp;|&nbsp; '
-        f'Sections: {sections_label} &nbsp;|&nbsp; Review mode: {review_mode}</div>',
+        f'Sections: {sections_label}</div>',
         unsafe_allow_html=True,
     )
 
@@ -41,9 +41,10 @@ def render_result_tables(
     review_df: pd.DataFrame,
 ):
     if not activity_cfg["summary_df"].empty:
-        with st.expander("Activity summary", expanded=False):
-            st.dataframe(activity_cfg["summary_df"], width="stretch")
-
+        if st.session_state.get("_show_hidden_activity_summary", False):
+            with st.expander("Activity summary", expanded=False):
+                st.dataframe(activity_cfg["summary_df"], width="stretch")
+    
     if symptom_cfg["intervals"]:
         symptom_rows = pd.DataFrame(symptom_cfg["intervals"])
         with st.expander("Symptom intervals", expanded=False):
@@ -371,6 +372,7 @@ def render_chart(
                 </button>
 
                 <button id="sync_client_tags_btn_{div_id}" style="
+                    display: none;
                     padding: 6px 10px;
                     border: 1px solid #7e22ce;
                     background: #f8f0ff;
@@ -1624,6 +1626,7 @@ def render_chart(
 
         const removed = items.pop();
         saveClientVisualTags_{div_id}(items);
+        removeHitRowsForTag_{div_id}(removed);
 
         const redoStack = loadClientVisualTagRedoStack_{div_id}();
         redoStack.push(removed);
@@ -1659,6 +1662,8 @@ def render_chart(
     }}
 
     function clearClientVisualTags_{div_id}() {{
+        const removedTags = loadClientVisualTags_{div_id}();
+        removeHitRowsForTags_{div_id}(removedTags);
         saveClientVisualTags_{div_id}([]);
         saveClientVisualTagRedoStack_{div_id}([]);
 
@@ -1689,6 +1694,34 @@ def render_chart(
                 JSON.stringify(safeRows)
             );
         }} catch (e) {{}}
+    }}
+
+    function _sameTagIntervalForHistory_{div_id}(row, tagItem) {{
+        const rowStart = _dateMs_{div_id}(row && row.tag_start);
+        const rowEnd = _dateMs_{div_id}(row && row.tag_end);
+        const tagStart = _dateMs_{div_id}(tagItem && tagItem.start);
+        const tagEnd = _dateMs_{div_id}(tagItem && tagItem.end);
+        if (rowStart === null || rowEnd === null || tagStart === null || tagEnd === null) return false;
+        return Math.abs(rowStart - tagStart) <= 1000 && Math.abs(rowEnd - tagEnd) <= 1000;
+    }}
+
+    function removeHitRowsForTag_{div_id}(tagItem) {{
+        if (!tagItem) return;
+        const kept = loadHitResultHistory_{div_id}().filter(function(row) {{
+            return !_sameTagIntervalForHistory_{div_id}(row, tagItem);
+        }});
+        saveHitResultHistory_{div_id}(kept);
+    }}
+
+    function removeHitRowsForTags_{div_id}(tagItems) {{
+        const tags = Array.isArray(tagItems) ? tagItems : [];
+        if (!tags.length) return;
+        const kept = loadHitResultHistory_{div_id}().filter(function(row) {{
+            return !tags.some(function(tag) {{
+                return _sameTagIntervalForHistory_{div_id}(row, tag);
+            }});
+        }});
+        saveHitResultHistory_{div_id}(kept);
     }}
 
     function _rowIdentity_{div_id}(row) {{
@@ -1800,16 +1833,16 @@ def render_chart(
         const restored = Array.isArray(savedHitResultsFromServer_{div_id}) ? savedHitResultsFromServer_{div_id} : [];
         if (!restored.length) return;
 
-        // Important:
-        // savedHitResultsFromServer comes from Streamlit session_state after
-        // Python has already filtered it against the saved section-level drawn
-        // tags. Do NOT filter it again against _allTagIntervalsForResults() here,
-        // because that function only sees tags in the currently loaded 12-hour
-        // window. Re-filtering here deletes valid hit rows from other windows
-        // when a saved session is uploaded.
-        saveHitResultHistory_{div_id}(
-            mergeHitResultRows_{div_id}(existing, restored)
-        );
+        // Critical: saved hit rows must belong to the saved Track 4 tags. Old
+        // browser history can contain stale rows from tags that were removed;
+        // those should not reappear after uploading a saved session.
+        const savedTags = _allTagIntervalsForResults_{div_id}();
+        const filtered = restored.filter(function(row) {{
+            return _hitRowMatchesSavedTag_{div_id}(row, savedTags);
+        }});
+        if (!filtered.length) return;
+
+        saveHitResultHistory_{div_id}(mergeHitResultRows_{div_id}(existing, filtered));
     }}
 
     function rebuildHitResultsTable_{div_id}() {{
@@ -2176,6 +2209,29 @@ def render_chart(
         return num.toFixed(1);
     }}
 
+    function getPointRawValue_{div_id}(point) {{
+        if (!point) return "";
+
+        if (point.customdata !== undefined && point.customdata !== null) {{
+            if (Array.isArray(point.customdata) && point.customdata.length > 0) {{
+                return point.customdata[0];
+            }}
+            return point.customdata;
+        }}
+
+        try {{
+            const cd = point.data && point.data.customdata ? point.data.customdata : null;
+            const idx = point.pointIndex !== undefined ? point.pointIndex : point.pointNumber;
+            if (cd && idx !== undefined && cd[idx] !== undefined) {{
+                const row = cd[idx];
+                if (Array.isArray(row) && row.length > 0) return row[0];
+                return row;
+            }}
+        }} catch (e) {{}}
+
+        return point.x;
+    }}
+
     function showCustomHoverBox_{div_id}(eventData) {{
         if (!eventData || !eventData.points || eventData.points.length === 0) {{
             return;
@@ -2200,13 +2256,7 @@ def render_chart(
             parameterName = "Value";
         }}
 
-        let value = "";
-
-        if (point.customdata && point.customdata.length > 0) {{
-            value = formatValue_{div_id}(point.customdata[0]);
-        }} else if (point.x !== undefined && point.x !== null) {{
-            value = formatValue_{div_id}(point.x);
-        }}
+        let value = formatValue_{div_id}(getPointRawValue_{div_id}(point));
 
         const unit = meta.unit ? " " + meta.unit : "";
         const timeText = formatTimeOnly_{div_id}(point.y);
@@ -2392,6 +2442,4 @@ def render_chart(
         height=chart_height + 260,
         scrolling=True,
     )
-
-
 
