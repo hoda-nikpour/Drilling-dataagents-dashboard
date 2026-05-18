@@ -7,10 +7,6 @@ DATA_DIR = BASE_DIR / "data"
 N_TRACKS = 4
 MAX_PARAMS_PER_TRACK = 3
 
-# Performance tuning
-MAX_POINTS_PER_TRACE = 30000
-MAX_POINTS_PER_TRACE_ZOOM = 60000
-
 # Marker settings
 # Default dashboard view should be clean lines without dots.
 BASE_MARKER_SIZE = 2.0

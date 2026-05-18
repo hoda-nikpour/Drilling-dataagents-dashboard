@@ -3,24 +3,11 @@ import pandas as pd
 
 from config import (
     BASE_MARKER_SIZE,
-    MAX_POINTS_PER_TRACE,
-    MAX_POINTS_PER_TRACE_ZOOM,
     ZOOM_MARKER_SIZE,
 )
 
 
 def get_display_mode(marker_display: str = "Lines only") -> tuple[str, float]:
-    """
-    Control whether parameter curves are shown as clean lines or lines with dots.
-
-    Important:
-    This is intentionally independent of the sidebar time filter.
-
-    True automatic marker switching based on manual Plotly zoom is not available
-    through plain st.plotly_chart(), because Plotly zoom events are not sent back
-    to Python. Therefore, the dashboard uses chart buttons and a sidebar default
-    setting instead.
-    """
     if marker_display == "Small dots":
         return "lines+markers", BASE_MARKER_SIZE
 
@@ -28,26 +15,6 @@ def get_display_mode(marker_display: str = "Lines only") -> tuple[str, float]:
         return "lines+markers", ZOOM_MARKER_SIZE
 
     return "lines", BASE_MARKER_SIZE
-
-def get_target_points(zoom_percent: float) -> int:
-    """
-    Keep enough points so direct chart zoom remains informative.
-
-    This can still depend on sidebar time-filter zoom for performance only.
-    Marker visibility is controlled separately.
-    """
-    if zoom_percent < 20:
-        return MAX_POINTS_PER_TRACE
-    return MAX_POINTS_PER_TRACE_ZOOM
-
-def downsample_xy(x_series: pd.Series, y_series: pd.Series, n_max: int):
-    n = len(x_series)
-    if n <= n_max:
-        return x_series, y_series
-
-    step = max(1, n // n_max)
-    idx = x_series.index[::step]
-    return x_series.loc[idx], y_series.loc[idx]
 
 
 def compute_section_ranges(df: pd.DataFrame, selected_sections: list[str]) -> list[dict]:

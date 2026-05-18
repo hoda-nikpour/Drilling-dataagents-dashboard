@@ -1,3 +1,5 @@
+import gc
+
 import pandas as pd
 import streamlit as st
 
@@ -26,6 +28,7 @@ from data_access.data_loader import (
     get_available_numeric_columns,
     load_catalog,
     load_sections_for_columns,
+    load_section_time_index,
 )
 
 from services.dashboard_service import (
@@ -61,14 +64,14 @@ from ui.sidebar import (
     render_agent_review_outputs,
     render_parameter_range_controls,
     render_review_loader_before_well_selector,
-    render_time_filter,
+    render_window_pager,
     render_track_parameter_selector,
     render_well_section_selector,
     apply_visual_tag_from_query_params,
 )
 
 from ui.styles import apply_global_styles
-from utils.helpers import compute_section_ranges, get_target_points
+from utils.helpers import compute_section_ranges
 from visualization.chart_builder import create_multi_track_chart
 
 from services.undo_service import (
@@ -80,6 +83,267 @@ from services.undo_service import (
 
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
 apply_global_styles()
+
+
+def _build_fixed_time_windows_from_index(time_index, window_hours: int = 12) -> list[dict]:
+    """
+    Build the same fixed backend windows used by the sidebar pager.
+    Only timestamps are used here; no curve data is loaded.
+    """
+    if time_index is None or len(time_index) == 0:
+        return []
+
+    t_min = pd.Timestamp(time_index.min())
+    t_max = pd.Timestamp(time_index.max())
+
+    if pd.isna(t_min) or pd.isna(t_max) or t_max <= t_min:
+        return []
+
+    window_delta = pd.Timedelta(hours=int(window_hours))
+    total_sec = max((t_max - t_min).total_seconds(), 1.0)
+    n_windows = max(1, int(total_sec // window_delta.total_seconds()))
+    if t_min + n_windows * window_delta < t_max:
+        n_windows += 1
+
+    windows = []
+    for idx in range(n_windows):
+        start = t_min + idx * window_delta
+        end = min(start + window_delta, t_max)
+        if end > start:
+            windows.append({"index": idx, "start": start, "end": end})
+
+    return windows
+
+
+@st.cache_data(show_spinner="Computing section-wide symptom intervals …", max_entries=4)
+def build_section_wide_symptom_intervals(
+    well: str,
+    sections: tuple[str, ...],
+    windows: tuple[tuple[str, str], ...],
+    requested_columns: tuple[str, ...],
+    label_to_column: dict,
+    cleaning_rules: dict,
+    required_activity_labels: tuple[str, ...],
+    required_symptom_labels: tuple[str, ...],
+    activity_enabled: bool,
+    selected_activity: str,
+    activity_config,
+    symptom_enabled: bool,
+    selected_symptom: str,
+    symptom_config,
+) -> list[dict]:
+    """
+    Compute selected symptom-agent intervals for the whole section without
+    keeping the full section dataframe in memory.
+
+    The function loops through the same 12-hour windows, loads one window,
+    runs cleaning + activity + symptom agents, stores only interval rows, then
+    deletes the dataframe before moving to the next window.
+    """
+    if not activity_enabled or not symptom_enabled or not windows:
+        return []
+
+    all_intervals: list[dict] = []
+
+    activity_ui = {
+        "enabled": bool(activity_enabled),
+        "selected_activity": selected_activity,
+        "config": activity_config,
+    }
+    symptom_ui = {
+        "enabled": bool(symptom_enabled),
+        "selected_symptom": selected_symptom,
+        "config": symptom_config,
+    }
+
+    for win_idx, (start_text, end_text) in enumerate(windows, start=1):
+        df_part = load_sections_for_columns(
+            well=well,
+            sections=sections,
+            requested_columns=requested_columns,
+            time_start=start_text,
+            time_end=end_text,
+        )
+
+        if df_part.empty:
+            continue
+
+        df_part, clean_label_to_column_part, _ = apply_cleaning_layer(
+            df=df_part,
+            label_to_column=label_to_column,
+            cleaning_rules=cleaning_rules,
+            required_activity_labels=list(required_activity_labels),
+            required_symptom_labels=list(required_symptom_labels),
+        )
+
+        activity_cfg_part = run_activity_agent(
+            df=df_part,
+            label_to_column=clean_label_to_column_part,
+            activity_ui=activity_ui,
+        )
+
+        symptom_cfg_part = run_symptom_agent(
+            df=df_part,
+            label_to_column=clean_label_to_column_part,
+            symptom_ui=symptom_ui,
+            activity_ui=activity_ui,
+            activity_cfg=activity_cfg_part,
+        )
+
+        for item in symptom_cfg_part.get("intervals", []) or []:
+            row = dict(item)
+            row["window"] = win_idx
+            row["window_start"] = start_text
+            row["window_end"] = end_text
+            all_intervals.append(row)
+
+        del df_part, activity_cfg_part, symptom_cfg_part
+        gc.collect()
+
+    all_intervals.sort(key=lambda x: pd.Timestamp(x.get("start")))
+    return all_intervals
+
+
+
+def _normalize_track_selection_payload(value) -> list[list[str]]:
+    """Return exactly three track-selection lists from saved/session data."""
+    out: list[list[str]] = []
+
+    if isinstance(value, dict):
+        value = [
+            value.get("track1", []),
+            value.get("track2", []),
+            value.get("track3", []),
+        ]
+
+    if not isinstance(value, list):
+        value = []
+
+    for i in range(3):
+        item = value[i] if i < len(value) else []
+        if isinstance(item, (list, tuple)):
+            out.append([str(x) for x in item if str(x).strip()])
+        elif isinstance(item, str) and item.strip():
+            out.append([item.strip()])
+        else:
+            out.append([])
+
+    return out
+
+
+def _infer_track_params_from_loaded_payload(context_key: str, label_to_column: dict[str, str]) -> list[list[str]]:
+    """
+    Recover plot selections from an uploaded dashboard session.
+
+    New saved sessions contain saved_track_param_labels_<context>. Older sessions
+    may only contain track_params_* widget keys. The user's uploaded example has
+    empty track_params but still has max_override_TRQ/RPMB keys, so we also use
+    those raw mnemonics as a last-resort compatibility hint.
+    """
+    payload = st.session_state.get(f"_pending_loaded_review_payload_{context_key}")
+    if not isinstance(payload, dict):
+        return [[], [], []]
+
+    widget_state = (payload.get("dashboard_state", {}) or {}).get("widget_state", {}) or {}
+
+    candidates = [
+        payload.get("plot_track_param_labels"),
+        (payload.get("dashboard_state", {}) or {}).get("plot_track_param_labels"),
+        widget_state.get(f"saved_track_param_labels_{context_key}"),
+        widget_state.get(f"plot_track_param_labels_{context_key}"),
+    ]
+
+    for candidate in candidates:
+        restored = _normalize_track_selection_payload(candidate)
+        if any(restored):
+            return restored
+
+    restored = _normalize_track_selection_payload([
+        widget_state.get(f"track_params_1_{context_key}", []),
+        widget_state.get(f"track_params_2_{context_key}", []),
+        widget_state.get(f"track_params_3_{context_key}", []),
+    ])
+    if any(restored):
+        return restored
+
+    # Last-resort compatibility for older saved sessions where the track widgets
+    # were saved empty but parameter scale controls reveal what was plotted.
+    raw_to_label = {str(raw): label for label, raw in (label_to_column or {}).items()}
+    inferred_labels: list[str] = []
+    suffix = f"_{context_key}"
+    for key in widget_state:
+        key = str(key)
+        if not key.startswith("max_override_") or not key.endswith(suffix):
+            continue
+        raw_col = key[len("max_override_") : -len(suffix)]
+        label = raw_to_label.get(raw_col)
+        if label and label not in inferred_labels:
+            inferred_labels.append(label)
+
+    if inferred_labels:
+        tracks = [[], [], []]
+        for idx, label in enumerate(inferred_labels[:9]):
+            tracks[min(idx, 2)].append(label)
+        return tracks
+
+    return [[], [], []]
+
+
+def _remember_track_params_for_save(context_key: str, track_param_labels: list[list[str]]):
+    """Store current plot selections under non-widget keys so JSON save/load is reliable."""
+    safe_tracks = _normalize_track_selection_payload(track_param_labels)
+    if any(safe_tracks):
+        # These keys intentionally do not start with '_' so _build_full_dashboard_state()
+        # saves them into the dashboard session JSON.
+        st.session_state[f"saved_track_param_labels_{context_key}"] = safe_tracks
+        st.session_state[f"plot_track_param_labels_{context_key}"] = safe_tracks
+
+
+def _restore_track_params_after_window_change(
+    track_param_labels,
+    context_key: str,
+    label_to_column: dict[str, str] | None = None,
+):
+    """
+    Keep selected plot parameters when browsing 12-hour windows and after loading
+    a saved dashboard session.
+
+    Streamlit does not allow assigning to a widget key after that widget has
+    already been instantiated in the same run. Therefore this helper returns the
+    restored selections to the plotting pipeline and saves them under separate
+    non-widget keys for future JSON export.
+    """
+    memory_key = f"_last_nonempty_track_params_{context_key}"
+    changed_key = f"_window_changed_{context_key}"
+
+    safe_tracks = _normalize_track_selection_payload(track_param_labels)
+    has_selection = any(bool(track) for track in safe_tracks)
+
+    if has_selection:
+        st.session_state[memory_key] = [list(track) for track in safe_tracks]
+        _remember_track_params_for_save(context_key, safe_tracks)
+        st.session_state[changed_key] = False
+        return safe_tracks
+
+    remembered = st.session_state.get(memory_key)
+    remembered_tracks = _normalize_track_selection_payload(remembered)
+    if any(remembered_tracks):
+        _remember_track_params_for_save(context_key, remembered_tracks)
+        st.session_state[changed_key] = False
+        return remembered_tracks
+
+    loaded_tracks = _infer_track_params_from_loaded_payload(
+        context_key=context_key,
+        label_to_column=label_to_column or {},
+    )
+    if any(loaded_tracks):
+        st.session_state[memory_key] = [list(track) for track in loaded_tracks]
+        _remember_track_params_for_save(context_key, loaded_tracks)
+        st.session_state[changed_key] = False
+        return loaded_tracks
+
+    st.session_state[changed_key] = False
+    return safe_tracks
 
 
 def main():
@@ -121,6 +385,25 @@ def main():
         # the chart restore saved/browser zoom only for loaded sessions, while
         # a fresh app restart starts from the unzoomed/default view.
         st.session_state[f"_loaded_dashboard_active_{context_key}"] = True
+
+    time_df = load_section_time_index(
+        well=selected_well,
+        sections=selected_sections,
+    )
+
+    window_info = render_window_pager(
+        time_df=time_df,
+        context_key=context_key,
+        window_hours=12,
+    )
+
+    if window_info is None:
+        st.warning("No valid 12-hour time window is available for the selected section.")
+        st.stop()
+
+    selected_time_window = (window_info["start"], window_info["end"])
+    plot_context_key = window_info["plot_context_key"]
+    zoom_percent = 100.0
     
     discovered_params = get_available_numeric_columns(selected_well, selected_sections)
 
@@ -145,6 +428,16 @@ def main():
         label for label in REQUIRED_SYMPTOM_INPUTS if label in label_to_column
     ]
 
+    # Columns needed to compute data-agent intervals. This is intentionally
+    # separate from plot/diagnostic columns so the section-wide interval table
+    # can be built window-by-window without loading unnecessary plot columns.
+    section_agent_requested_columns = build_requested_columns(
+        selected_labels=[],
+        required_activity_labels=required_activity_labels,
+        required_symptom_labels=required_symptom_labels,
+        label_to_column=label_to_column,
+    )
+
     available_param_labels = list(dict.fromkeys(list(label_to_column.keys())))
 
     if not available_param_labels:
@@ -163,9 +456,34 @@ def main():
             width="stretch",
         )
 
+    # If a saved dashboard session was uploaded and its normal track_params
+    # widget values were empty in the JSON, recover the plot selections before
+    # the multiselect widgets are created. This makes restored parameters both
+    # visible in the sidebar and available for plotting.
+    restored_tracks_before_widget = _infer_track_params_from_loaded_payload(
+        context_key=context_key,
+        label_to_column=label_to_column,
+    )
+    if any(restored_tracks_before_widget):
+        for idx in range(3):
+            widget_key = f"track_params_{idx + 1}_{context_key}"
+            current_value = st.session_state.get(widget_key, [])
+            if not current_value:
+                st.session_state[widget_key] = restored_tracks_before_widget[idx]
+        _remember_track_params_for_save(context_key, restored_tracks_before_widget)
+
+    # Keep parameter selections section-level, not window-level.
+    # When the user moves to the next/previous 12-hour window, the same
+    # previously selected parameters are plotted automatically for the new window.
     track_param_labels = render_track_parameter_selector(
         available_param_labels=available_param_labels,
         context_key=context_key,
+    )
+
+    track_param_labels = _restore_track_params_after_window_change(
+        track_param_labels=track_param_labels,
+        context_key=context_key,
+        label_to_column=label_to_column,
     )
 
     selected_labels = flatten_selected_params(track_param_labels)
@@ -213,6 +531,8 @@ def main():
         well=selected_well,
         sections=selected_sections,
         requested_columns=tuple(requested_columns),
+        time_start=selected_time_window[0],
+        time_end=selected_time_window[1],
     )
 
     if df.empty:
@@ -329,50 +649,26 @@ def main():
                         "The original raw columns are still preserved for visual review."
                     )
 
-    time_range, zoom_percent = render_time_filter(df, context_key)
-
-    # Keep the initial chart style fixed.
-    # Users can still switch style using the Plotly buttons above the chart.
+    # The dataframe has already been loaded only for the selected fixed 12-hour window.
+    # No secondary time filter and no downsampling are used.
     marker_display = DEFAULT_MARKER_DISPLAY
 
-    if time_range is None:
-        st.warning("No valid time range is available.")
-        st.stop()
-
-    df = df.loc[pd.Timestamp(time_range[0]) : pd.Timestamp(time_range[1])].copy()
-
-    if df.empty:
-        st.warning("No data available in the selected time range.")
-        st.stop()
-
     # Consume chart-drawn tag URL payloads before Track 4 controls and the Plotly
-    # figure are built. This turns a browser-drawn tag into normal Python state,
-    # so it can be saved, uploaded, and visualized again later.
+    # figure are built. Tags are stored as section-level absolute timestamps.
     apply_visual_tag_from_query_params(
         context_key=context_key,
         t_min=df.index.min(),
         t_max=df.index.max(),
     )
 
-    with st.expander("Time sampling diagnostics — selected time window", expanded=False):
+    with st.expander("Time sampling diagnostics — selected 12-hour window", expanded=False):
         selected_cadence_df = build_time_cadence_df(df)
         st.dataframe(selected_cadence_df, width="stretch")
 
-        chart_point_limit = get_target_points(zoom_percent)
-
         st.caption(
-            f"Selected window contains {len(df):,} raw rows. "
-            f"Current chart target is about {chart_point_limit:,} points per curve."
+            f"Selected 12-hour window contains {len(df):,} raw rows. "
+            "No dashboard downsampling is applied; every loaded point is plotted."
         )
-
-        if len(df) > chart_point_limit:
-            approx_step = max(1, len(df) // chart_point_limit)
-            st.warning(
-                f"The chart is visually downsampled because the selected window has more rows "
-                f"than the plotting target. Roughly every {approx_step}th row may be shown per curve. "
-                "Use a shorter precise time window to inspect second-by-second drilling behavior. "
-                "The activity/symptom agents still run on the filtered dataframe, not on the displayed points."
-            )
 
 
     # Create sidebar containers in the visual order we want.
@@ -405,6 +701,43 @@ def main():
         activity_ui=activity_ui,
         activity_cfg=activity_cfg,
     )
+
+    # Build section-wide selected symptom intervals for the table only.
+    # This does NOT change Track 4 and does NOT load/plot the whole section.
+    # It loops over 12-hour windows, stores only interval rows, and releases
+    # each temporary dataframe before moving to the next window.
+    section_windows = _build_fixed_time_windows_from_index(
+        time_df.index,
+        window_hours=12,
+    )
+    section_window_tuple = tuple(
+        (
+            item["start"].strftime("%Y-%m-%d %H:%M:%S"),
+            item["end"].strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        for item in section_windows
+    )
+
+    section_wide_symptom_intervals = build_section_wide_symptom_intervals(
+        well=selected_well,
+        sections=selected_sections,
+        windows=section_window_tuple,
+        requested_columns=tuple(section_agent_requested_columns),
+        label_to_column=label_to_column,
+        cleaning_rules=context_cleaning_rules,
+        required_activity_labels=tuple(required_activity_labels),
+        required_symptom_labels=tuple(required_symptom_labels),
+        activity_enabled=bool(activity_ui.get("enabled", False)),
+        selected_activity=str(activity_ui.get("selected_activity", "All activities")),
+        activity_config=activity_ui.get("config"),
+        symptom_enabled=bool(symptom_ui.get("enabled", False)),
+        selected_symptom=str(symptom_ui.get("selected_symptom", "")),
+        symptom_config=symptom_ui.get("config"),
+    )
+
+    symptom_table_cfg = dict(symptom_cfg)
+    symptom_table_cfg["intervals"] = section_wide_symptom_intervals
+    symptom_table_cfg["interval_scope"] = "Full selected section, computed window-by-window"
 
     # This is visually placed above the agent settings because it is rendered
     # into review_controls_container, which was created first.
@@ -439,7 +772,7 @@ def main():
 
     render_result_tables(
         activity_cfg=activity_cfg,
-        symptom_cfg=symptom_cfg,
+        symptom_cfg=symptom_table_cfg,
         activity_validation_df=activity_validation_df,
         review_df=review_df,
     )
@@ -606,13 +939,16 @@ def main():
 
     chart_key = f"multi_track_chart_{context_key}"
 
+    saved_hit_results = st.session_state.get(f"hit_result_history_{context_key}", [])
+
     render_chart(
         fig,
         chart_key,
         visual_tag_context_key=context_key,
-        restore_saved_browser_zoom=bool(
-            st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)
-        ),
+        restore_saved_browser_zoom=False,
+        current_window_start=selected_time_window[0],
+        current_window_end=selected_time_window[1],
+        saved_hit_results=saved_hit_results,
     )
 
     commit_undo_tracking()

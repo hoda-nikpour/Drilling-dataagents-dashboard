@@ -11,11 +11,44 @@ AGENT_X = 0.76
 
 
 def _agent_line_width(severity: str) -> int:
-    return {"Low": 2, "Medium": 4, "High": 7}.get(severity, 4)
+    """Thickness for real Agent-lane intervals only.
+
+    These are intentionally a little thicker so the real data-agent tags remain
+    visible in the full 12-hour overview. This does not add any extra marker or
+    synthetic preview trace; it only changes the real interval line width.
+    """
+    return {"Low": 5, "Medium": 7, "High": 10}.get(severity, 7)
 
 
 def _activity_line_width(label: str) -> int:
-    return 5 if label in {"Drilling", "Reaming", "TrippingIn", "TrippingOut"} else 4
+    return 8 if label in {"Drilling", "Reaming", "TrippingIn", "TrippingOut"} else 7
+
+
+def _darker_rgba(color: str, alpha: float = 0.98) -> str:
+    """Return a darker RGBA color when color is already an rgba/rgb string."""
+    text = str(color or "").strip()
+    lower = text.lower()
+
+    try:
+        if lower.startswith("rgba(") and lower.endswith(")"):
+            parts = [x.strip() for x in text[5:-1].split(",")]
+            if len(parts) >= 3:
+                r = max(0, min(255, int(float(parts[0]) * 0.55)))
+                g = max(0, min(255, int(float(parts[1]) * 0.55)))
+                b = max(0, min(255, int(float(parts[2]) * 0.55)))
+                return f"rgba({r}, {g}, {b}, {alpha})"
+
+        if lower.startswith("rgb(") and lower.endswith(")"):
+            parts = [x.strip() for x in text[4:-1].split(",")]
+            if len(parts) >= 3:
+                r = max(0, min(255, int(float(parts[0]) * 0.55)))
+                g = max(0, min(255, int(float(parts[1]) * 0.55)))
+                b = max(0, min(255, int(float(parts[2]) * 0.55)))
+                return f"rgba({r}, {g}, {b}, {alpha})"
+    except Exception:
+        pass
+
+    return text or f"rgba(120, 0, 0, {alpha})"
 
 
 def _interval_overlap(a_start, a_end, b_start, b_end):
@@ -45,7 +78,6 @@ def _compute_overlap_intervals(tag_intervals: list[dict], agent_intervals: list[
     return overlaps
 
 def _add_vertical_interval_line(
-        
     fig: go.Figure,
     x_pos: float,
     start_time,
@@ -55,14 +87,27 @@ def _add_vertical_interval_line(
     row: int,
     col: int,
     hover_text: str | None = None,
+    meta: dict | None = None,
+    min_visible_seconds: float = 0.0,
 ):
     start_ts = pd.Timestamp(start_time)
     end_ts = pd.Timestamp(end_time)
 
-    # Do not draw invalid or zero-duration intervals.
-    # Real interval visualization should only represent intervals with duration.
-    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts <= start_ts:
+    if pd.isna(start_ts) or pd.isna(end_ts):
         return
+
+    # Draw only the real interval trace.
+    # Do NOT add extra marker traces for visibility. Those marker traces created
+    # the many red dots in the Track 4 Agent lane.
+    #
+    # For real one-sample symptom intervals where start == end, draw one tiny
+    # one-second line, not a dot. This keeps short TRQSpike events visible while
+    # avoiding artificial extra marks.
+    if end_ts <= start_ts:
+        if min_visible_seconds and end_ts == start_ts:
+            end_ts = start_ts + pd.Timedelta(seconds=float(min_visible_seconds))
+        else:
+            return
 
     y_vals = pd.date_range(start_ts, end_ts, periods=20)
     x_vals = np.full(len(y_vals), x_pos)
@@ -75,57 +120,13 @@ def _add_vertical_interval_line(
             line=dict(color=color, width=width),
             showlegend=False,
             hovertemplate=(hover_text or "") + "<extra></extra>",
+            meta=meta or {},
         ),
         row=row,
         col=col,
     )
 
-#record
-def _add_agent_visibility_marker(
-    fig: go.Figure,
-    x_pos: float,
-    start_time,
-    end_time,
-    color: str,
-    row: int,
-    col: int,
-    hover_text: str | None = None,
-):
-    """
-    Add a very small visible placeholder for real short agent intervals.
 
-    Zero-duration intervals are ignored because they are not real intervals
-    and should not appear as data-agent tags or hit-table matches.
-    """
-    start_ts = pd.Timestamp(start_time)
-    end_ts = pd.Timestamp(end_time)
-
-    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts <= start_ts:
-        return
-
-    mid_ts = start_ts + (end_ts - start_ts) / 2
-
-    fig.add_trace(
-        go.Scatter(
-            x=[x_pos],
-            y=[mid_ts],
-            mode="markers",
-            marker=dict(
-                color=color,
-                size=3,
-                symbol="circle",
-                opacity=0.85,
-                line=dict(color=color, width=0),
-            ),
-            showlegend=False,
-            hovertemplate=(hover_text or "Agent interval") + "<extra></extra>",
-            meta={"source": "agent_visibility_marker"},
-        ),
-        row=row,
-        col=col,
-    )
-
-    
 def _compute_activity_lane_summary(activity_intervals: list[dict]) -> list[dict]:
     if not activity_intervals:
         return []
@@ -256,15 +257,15 @@ def _add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
         severity = agent.get("severity", "Medium")
 
         if agent.get("source") == "activity_agent":
-            color = ACTIVITY_COLOR_MAP.get(label, "rgba(149, 165, 166, 0.88)")
+            color = _darker_rgba(ACTIVITY_COLOR_MAP.get(label, "rgba(110, 120, 125, 0.98)"))
             width = _activity_line_width(label)
             hover_text = f"Activity<br>{label}"
         elif agent.get("source") == "symptom_agent":
-            color = SYMPTOM_COLOR_MAP.get(label, "rgba(220, 50, 47, 0.92)")
+            color = _darker_rgba(SYMPTOM_COLOR_MAP.get(label, "rgba(150, 0, 0, 0.98)"))
             width = _agent_line_width(severity)
             hover_text = f"Symptom<br>{label}<br>Severity: {severity}"
         else:
-            color = "rgba(220, 50, 47, 0.92)"
+            color = "rgba(120, 0, 0, 0.98)"
             width = _agent_line_width(severity)
             hover_text = f"Agent hit<br>{label}<br>Severity: {severity}"
 
@@ -278,17 +279,14 @@ def _add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
             row=row,
             col=col,
             hover_text=hover_text,
-        )
-
-        _add_agent_visibility_marker(
-            fig=fig,
-            x_pos=AGENT_X,
-            start_time=agent["start"],
-            end_time=agent["end"],
-            color=color,
-            row=row,
-            col=col,
-            hover_text=hover_text,
+            meta={
+                "source": agent.get("source", "agent_interval"),
+                "label": label,
+                "severity": severity,
+                "start": str(agent.get("start", "")),
+                "end": str(agent.get("end", "")),
+            },
+            min_visible_seconds=1.0 if agent.get("source") == "symptom_agent" else 0.0,
         )
 
     activity_intervals_only = [

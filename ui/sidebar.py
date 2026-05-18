@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import uuid
 from datetime import timedelta
 
 import pandas as pd
@@ -218,6 +219,51 @@ def _json_safe_value(value):
     return str(value)
 
 
+
+
+def _normalize_track_param_labels_for_save(value) -> list[list[str]]:
+    """Return exactly three JSON-safe track parameter lists."""
+    out: list[list[str]] = []
+
+    if isinstance(value, dict):
+        value = [
+            value.get("track1", []),
+            value.get("track2", []),
+            value.get("track3", []),
+        ]
+
+    if not isinstance(value, list):
+        value = []
+
+    for i in range(3):
+        item = value[i] if i < len(value) else []
+        if isinstance(item, (list, tuple)):
+            out.append([str(x) for x in item if str(x).strip()])
+        elif isinstance(item, str) and item.strip():
+            out.append([item.strip()])
+        else:
+            out.append([])
+
+    return out
+
+
+def _get_saved_track_param_labels(context_key: str) -> list[list[str]]:
+    """Prefer the app's non-widget saved track selection, then widget keys."""
+    for key in (
+        f"saved_track_param_labels_{context_key}",
+        f"plot_track_param_labels_{context_key}",
+    ):
+        tracks = _normalize_track_param_labels_for_save(st.session_state.get(key))
+        if any(tracks):
+            return tracks
+
+    tracks = _normalize_track_param_labels_for_save([
+        st.session_state.get(f"track_params_1_{context_key}", []),
+        st.session_state.get(f"track_params_2_{context_key}", []),
+        st.session_state.get(f"track_params_3_{context_key}", []),
+    ])
+    return tracks
+
 def _build_full_dashboard_state(context_key: str) -> dict:
     """
     Save all small dashboard/session values for this selected well/section context.
@@ -276,9 +322,7 @@ def _is_early_dashboard_key(key: str, context_key: str) -> bool:
         "track_params_",
         "max_override_",
         "curve_source_",
-        "exact_time_start_",
-        "exact_time_end_",
-        "time_filter_data_signature_",
+        "window_index_",
     ]
 
     if not key.endswith(f"_{context_key}") and f"_{context_key}_" not in key:
@@ -421,10 +465,20 @@ def _build_export_payload(
     manual_activity_tags = manual_activity_tags or []
     activity_validation_summary = activity_validation_summary or {}
 
+    saved_track_param_labels = _get_saved_track_param_labels(context_key) if context_key else [[], [], []]
+
+    widget_state = _build_full_dashboard_state(context_key=context_key)
+    if context_key and any(saved_track_param_labels):
+        widget_state[f"saved_track_param_labels_{context_key}"] = saved_track_param_labels
+        widget_state[f"plot_track_param_labels_{context_key}"] = saved_track_param_labels
+        for idx in range(3):
+            widget_state[f"track_params_{idx + 1}_{context_key}"] = saved_track_param_labels[idx]
+
     dashboard_state = {
         "schema_version": 2,
         "save_type": "full_dashboard_restore",
-        "widget_state": _build_full_dashboard_state(context_key=context_key),
+        "plot_track_param_labels": saved_track_param_labels,
+        "widget_state": widget_state,
     }
 
     # Keep manual sidebar tags and chart-drawn tags explicit in the saved JSON.
@@ -459,6 +513,7 @@ def _build_export_payload(
             "context_key": context_key,
         },
         "dashboard_state": dashboard_state,
+        "plot_track_param_labels": saved_track_param_labels,
         "manual_tagger_intervals": [
             {
                 "label": str(x.get("label", "")),
@@ -682,6 +737,59 @@ def _safe_uploaded_label(value, fallback: str) -> str:
 
 
 
+
+def _normalize_section_tag(item: dict, fallback_label: str = "Saved Tag", t_min=None, t_max=None) -> dict | None:
+    """
+    Normalize any saved section-level tag without forcing it into the current
+    12-hour window. These tags are stored by absolute timestamp and are later
+    filtered for display only when they overlap the active window.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    start_raw = (
+        item.get("start")
+        or item.get("Tag Start")
+        or item.get("tag_start")
+        or item.get("start_time")
+    )
+    end_raw = (
+        item.get("end")
+        or item.get("Tag End")
+        or item.get("tag_end")
+        or item.get("end_time")
+    )
+
+    start_ts = _parse_uploaded_datetime(start_raw)
+    end_ts = _parse_uploaded_datetime(end_raw)
+
+    if pd.isna(start_ts) or pd.isna(end_ts):
+        return None
+
+    if t_min is not None and t_max is not None:
+        start_ts = _clamp_timestamp(start_ts, t_min, t_max)
+        end_ts = _clamp_timestamp(end_ts, t_min, t_max)
+
+    if pd.Timestamp(end_ts) <= pd.Timestamp(start_ts):
+        return None
+
+    label = (
+        item.get("label")
+        or item.get("Tag Label")
+        or item.get("tag_label")
+        or fallback_label
+    )
+    label = str(label).strip() or fallback_label
+
+    source = str(item.get("source", "manual") or "manual").strip() or "manual"
+
+    return {
+        "label": label,
+        "start": _format_datetime_text(start_ts),
+        "end": _format_datetime_text(end_ts),
+        "source": source,
+    }
+
 def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag", t_min=None, t_max=None) -> dict | None:
     """
     Normalize a saved or browser-created chart-drawn tag.
@@ -772,6 +880,24 @@ def _deduplicate_visual_tags(items: list[dict]) -> list[dict]:
     return out
 
 
+def _interval_overlaps_window(item: dict, t_min, t_max) -> bool:
+    """Return True when a section-level tag overlaps the currently loaded window."""
+    if not isinstance(item, dict):
+        return False
+    try:
+        start = pd.Timestamp(item.get("start"))
+        end = pd.Timestamp(item.get("end"))
+        win_start = pd.Timestamp(t_min)
+        win_end = pd.Timestamp(t_max)
+    except Exception:
+        return False
+    if pd.isna(start) or pd.isna(end) or pd.isna(win_start) or pd.isna(win_end):
+        return False
+    if end <= start:
+        return False
+    return start < win_end and end > win_start
+
+
 def _looks_like_chart_drag_tag(item: dict) -> bool:
     """
     Identify drawn tags inside older saved files.
@@ -813,8 +939,8 @@ def _extract_restorable_visual_tags(uploaded_data: dict, context_key: str, t_min
         normalized = _normalize_restored_visual_tag(
             item,
             fallback_label=f"Drawn Tag {idx}",
-            t_min=t_min,
-            t_max=t_max,
+            t_min=None,
+            t_max=None,
         )
         if normalized:
             candidates.append(normalized)
@@ -826,8 +952,8 @@ def _extract_restorable_visual_tags(uploaded_data: dict, context_key: str, t_min
         normalized = _normalize_restored_visual_tag(
             item,
             fallback_label=f"Drawn Tag {idx}",
-            t_min=t_min,
-            t_max=t_max,
+            t_min=None,
+            t_max=None,
         )
         if normalized:
             candidates.append(normalized)
@@ -839,8 +965,8 @@ def _extract_restorable_visual_tags(uploaded_data: dict, context_key: str, t_min
         normalized = _normalize_restored_visual_tag(
             item,
             fallback_label=f"Drawn Tag {idx}",
-            t_min=t_min,
-            t_max=t_max,
+            t_min=None,
+            t_max=None,
         )
         if normalized:
             candidates.append(normalized)
@@ -862,8 +988,8 @@ def _extract_restorable_visual_tags(uploaded_data: dict, context_key: str, t_min
         normalized = _normalize_restored_visual_tag(
             item,
             fallback_label=f"Drawn Tag {idx}",
-            t_min=t_min,
-            t_max=t_max,
+            t_min=None,
+            t_max=None,
         )
         if normalized:
             candidates.append(normalized)
@@ -946,8 +1072,8 @@ def apply_visual_tag_from_query_params(
         normalized = _normalize_restored_visual_tag(
             item,
             fallback_label="Drawn Tag",
-            t_min=t_min,
-            t_max=t_max,
+            t_min=None,
+            t_max=None,
         )
         if normalized:
             combined.append(normalized)
@@ -957,8 +1083,8 @@ def apply_visual_tag_from_query_params(
         normalized = _normalize_restored_visual_tag(
             item,
             fallback_label=f"Drawn Tag {next_index}",
-            t_min=t_min,
-            t_max=t_max,
+            t_min=None,
+            t_max=None,
         )
         if normalized:
             # Preserve a browser label such as Dragged Tag 1, but mark source safely.
@@ -975,6 +1101,69 @@ def apply_visual_tag_from_query_params(
         st.query_params.clear()
     except Exception:
         pass
+
+
+
+def _normalized_time_identity(start_value, end_value) -> tuple[str, str] | None:
+    """Return normalized start/end text for comparing saved hit rows to saved tags."""
+    try:
+        start_ts = pd.Timestamp(start_value)
+        end_ts = pd.Timestamp(end_value)
+    except Exception:
+        return None
+
+    if pd.isna(start_ts) or pd.isna(end_ts) or end_ts <= start_ts:
+        return None
+
+    return (
+        start_ts.strftime("%Y-%m-%d %H:%M:%S"),
+        end_ts.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _filter_hit_result_rows_for_tags(hit_rows: list[dict], tag_intervals: list[dict]) -> list[dict]:
+    """
+    Keep only hit-result rows that correspond to saved drawn/tag intervals.
+
+    This prevents old browser localStorage hit-history rows from being saved or
+    restored when they are not present in the saved Track 4 tag set.
+    """
+    valid_tag_times = set()
+    for tag in tag_intervals or []:
+        if not isinstance(tag, dict):
+            continue
+        ident = _normalized_time_identity(tag.get("start"), tag.get("end"))
+        if ident is not None:
+            valid_tag_times.add(ident)
+
+    if not valid_tag_times:
+        return []
+
+    filtered: list[dict] = []
+    seen = set()
+
+    for row in hit_rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        ident = _normalized_time_identity(row.get("tag_start"), row.get("tag_end"))
+        if ident not in valid_tag_times:
+            continue
+
+        row_key = (
+            str(row.get("well", "")),
+            str(row.get("section", "")),
+            str(row.get("tag_label", "")),
+            ident[0],
+            ident[1],
+        )
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+        filtered.append(row)
+
+    filtered.sort(key=lambda r: str(r.get("tag_start", "")))
+    return filtered
 
 def _apply_loaded_review_to_state(
     uploaded_data: dict,
@@ -1010,11 +1199,46 @@ def _apply_loaded_review_to_state(
     restored_visual_tags = _extract_restorable_visual_tags(
         uploaded_data=uploaded_data,
         context_key=context_key,
-        t_min=t_min,
-        t_max=t_max,
+        t_min=None,
+        t_max=None,
     )
-    if restored_visual_tags:
-        st.session_state[f"visual_tag_intervals_{context_key}"] = restored_visual_tags
+
+    section_level_tags = []
+    saved_tag_candidates = []
+    saved_tag_candidates.extend(uploaded_data.get("manual_tagger_intervals", []) or [])
+    saved_tag_candidates.extend(uploaded_data.get("drawn_tag_intervals", []) or [])
+    saved_tag_candidates.extend(uploaded_data.get("tag_intervals", []) or [])
+
+    for idx, item in enumerate(saved_tag_candidates, start=1):
+        normalized = _normalize_section_tag(item, fallback_label=f"Saved Tag {idx}")
+        if normalized:
+            section_level_tags.append(normalized)
+
+    section_level_tags.extend(restored_visual_tags or [])
+
+    if section_level_tags:
+        st.session_state[f"visual_tag_intervals_{context_key}"] = _deduplicate_visual_tags(section_level_tags)
+
+    # Restore browser Hit results from saved JSON, but keep only rows that
+    # correspond to the saved Track 4 tags. Older saves/browser localStorage may
+    # contain stale rows from tags that were already removed.
+    saved_hit_results = uploaded_data.get("hit_results", []) or []
+    if not saved_hit_results:
+        saved_hit_results = (
+            (uploaded_data.get("dashboard_state", {}) or {})
+            .get("widget_state", {})
+            .get(f"hit_result_history_{context_key}", [])
+        )
+
+    if isinstance(saved_hit_results, list):
+        cleaned_hit_rows = _filter_hit_result_rows_for_tags(
+            saved_hit_results,
+            section_level_tags,
+        )
+        if cleaned_hit_rows:
+            st.session_state[f"hit_result_history_{context_key}"] = cleaned_hit_rows
+        else:
+            st.session_state.pop(f"hit_result_history_{context_key}", None)
 
     def _maybe_clamp(ts):
         if pd.isna(ts):
@@ -1038,12 +1262,10 @@ def _apply_loaded_review_to_state(
     # restored through visual_tag_intervals_<context_key> and drawn directly in
     # Track 4.
     # ------------------------------------------------------------
-    manual_tags_to_restore = uploaded_data.get("manual_tagger_intervals")
-    if manual_tags_to_restore is None:
-        manual_tags_to_restore = [
-            item for item in (uploaded_data.get("tag_intervals", []) or [])
-            if not _looks_like_chart_drag_tag(item)
-        ]
+    # Keep restored manual/saved tags as section-level absolute timestamps in
+    # visual_tag_intervals_<context_key>. Do not force them into the three sidebar
+    # text boxes, because those boxes are bounded by the current 12-hour window.
+    manual_tags_to_restore = []
 
     for i, tag in enumerate((manual_tags_to_restore or [])[:3], start=1):
         start_ts = _maybe_clamp(_parse_uploaded_datetime(tag.get("start")))
@@ -1225,6 +1447,157 @@ def render_well_section_selector(sections_by_well: dict):
     return selected_well, selected_sections
 
 
+
+
+def _clear_plot_selection_for_window_change(context_key: str, plot_context_key: str):
+    """
+    When the user moves to another 12-hour window, remove the previous curve
+    choices so the new window starts with no plotted parameters. This does not
+    touch section-level tags or agent settings.
+    """
+    active_key = f"_active_plot_context_{context_key}"
+    previous_plot_context = st.session_state.get(active_key)
+
+    if previous_plot_context == plot_context_key:
+        return
+
+    prefixes_to_clear = (
+        "track_params_",
+        "max_override_",
+        "curve_source_",
+    )
+
+    for key in list(st.session_state.keys()):
+        key_text = str(key)
+        if previous_plot_context and (
+            key_text.endswith(f"_{previous_plot_context}")
+            or f"_{previous_plot_context}_" in key_text
+        ):
+            if key_text.startswith(prefixes_to_clear):
+                try:
+                    del st.session_state[key]
+                except Exception:
+                    pass
+
+    st.session_state[active_key] = plot_context_key
+
+
+def render_window_pager(
+    time_df: pd.DataFrame,
+    context_key: str,
+    window_hours: int = 12,
+):
+    """
+    Fixed 12-hour backend window browser.
+
+    User flow:
+    - The user selects well/section only.
+    - The app loads TIME only.
+    - This pager selects the active 12-hour window.
+    - Only that window's curve data is loaded and plotted, with no downsampling.
+
+    Tags remain section-level through context_key. Plot selections are also
+    section-level now, so changing window keeps the previously selected
+    parameters and automatically plots them for the new window.
+    """
+    if time_df.empty or not isinstance(time_df.index, pd.DatetimeIndex):
+        st.sidebar.warning("No time data found for the selected section.")
+        return None
+
+    t_min = pd.Timestamp(time_df.index.min())
+    t_max = pd.Timestamp(time_df.index.max())
+
+    if pd.isna(t_min) or pd.isna(t_max) or t_max <= t_min:
+        st.sidebar.warning("No valid time range found for the selected section.")
+        return None
+
+    window_delta = pd.Timedelta(hours=int(window_hours))
+    total_sec = max((t_max - t_min).total_seconds(), 1.0)
+    n_windows = max(1, int(total_sec // window_delta.total_seconds()))
+    if t_min + n_windows * window_delta < t_max:
+        n_windows += 1
+
+    index_key = f"window_index_{context_key}"
+    if index_key not in st.session_state:
+        st.session_state[index_key] = 0
+
+    st.session_state[index_key] = max(
+        0,
+        min(int(st.session_state.get(index_key, 0)), n_windows - 1),
+    )
+
+    with st.sidebar:
+        st.subheader("Time Window")
+        st.caption("Fixed 12-hour windows. Only the active window is loaded and plotted.")
+
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            if st.button(
+                "Previous",
+                key=f"window_prev_{context_key}",
+                disabled=st.session_state[index_key] <= 0,
+            ):
+                st.session_state[index_key] = max(0, st.session_state[index_key] - 1)
+                # Tell app.py that this rerun came from window browsing.
+                # Parameter selections should be restored if Streamlit returns
+                # an empty multiselect value during the button-triggered rerun.
+                st.session_state[f"_window_changed_{context_key}"] = True
+                st.rerun()
+
+        with col2:
+            st.caption(f"{st.session_state[index_key] + 1} / {n_windows}")
+
+        with col3:
+            if st.button(
+                "Next",
+                key=f"window_next_{context_key}",
+                disabled=st.session_state[index_key] >= n_windows - 1,
+            ):
+                st.session_state[index_key] = min(n_windows - 1, st.session_state[index_key] + 1)
+                # Tell app.py that this rerun came from window browsing.
+                # Parameter selections should be restored if Streamlit returns
+                # an empty multiselect value during the button-triggered rerun.
+                st.session_state[f"_window_changed_{context_key}"] = True
+                st.rerun()
+
+        current_index = int(st.session_state[index_key])
+        selected_start = t_min + current_index * window_delta
+        selected_end = min(selected_start + window_delta, t_max)
+
+        rows_in_window = len(time_df.loc[selected_start:selected_end])
+        st.caption(
+            f"Loaded window: {selected_start.strftime('%Y-%m-%d %H:%M:%S')} → "
+            f"{selected_end.strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"{rows_in_window:,} timestamps"
+        )
+
+    # Keep plot selections stable across windows. The active window still controls
+    # which rows are loaded, but the sidebar parameter choices remain section-level.
+    plot_context_key = context_key
+
+    # Browser-only chart state is window-specific, but still unique to this
+    # Streamlit session so old localStorage tags do not reappear as false hits.
+    browser_session_key = "_browser_session_uuid"
+    if browser_session_key not in st.session_state:
+        st.session_state[browser_session_key] = uuid.uuid4().hex
+
+    # Keep browser-drawn tags and Hit results shared across all 12-hour
+    # windows of the current well/section during this Streamlit session.
+    # Do NOT include the window index here. Including the window made the Hit
+    # results table reset when browsing windows. A fresh dashboard start still
+    # gets a new browser_session_uuid, so the table starts empty from scratch.
+    st.session_state["_drag_tag_browser_session_token"] = (
+        f"{st.session_state[browser_session_key]}_{context_key}"
+    )
+
+    return {
+        "start": selected_start,
+        "end": selected_end,
+        "index": int(st.session_state[index_key]),
+        "count": int(n_windows),
+        "hours": int(window_hours),
+        "plot_context_key": plot_context_key,
+    }
 def render_track_parameter_selector(available_param_labels: list[str], context_key: str):
     with st.sidebar:
         st.subheader("Track Parameters (Tracks 1–3)")
@@ -1452,7 +1825,7 @@ def _default_activity_ui(enabled: bool = True) -> dict:
 def _default_symptom_ui(enabled: bool = False) -> dict:
     return {
         "enabled": enabled,
-        "selected_symptom": "OpenHoleLength",
+        "selected_symptom": "TRQErratic",
         "config": SymptomConfig(),
     }
 
@@ -1852,11 +2225,16 @@ def render_symptom_agent_controls(context_key: str, parent=None):
             key=f"enable_symptom_agents_{context_key}",
         )
 
+        symptom_options = ["OpenHoleLength", "TRQSpike", "TRQErratic", "PSpike", "OverPull", "TookWeight"]
+        symptom_key = f"selected_symptom_lane_{context_key}"
+        if st.session_state.get(symptom_key) not in symptom_options:
+            st.session_state[symptom_key] = "TRQErratic"
+
         selected_symptom = st.selectbox(
             "Symptom shown in Track 4 agent lane",
-            options=["OpenHoleLength", "TRQSpike", "TRQErratic", "PSpike", "OverPull", "TookWeight"],
-            index=2,
-            key=f"selected_symptom_lane_{context_key}",
+            options=symptom_options,
+            index=symptom_options.index(st.session_state.get(symptom_key, "TRQErratic")),
+            key=symptom_key,
         )
 
         with st.expander("Symptom thresholds — VT document definitions", expanded=False):
@@ -3364,45 +3742,47 @@ def render_agent_controls(
         tag_intervals = []
         manual_agent_intervals = []
 
+        # Safety cleanup: older versions had a button that could create a full
+        # loaded-window tag automatically. Remove those stale default window tags
+        # so the Hit results table starts empty until the user actually draws or
+        # enables a real manual tag.
+        for cleanup_i in range(1, 4):
+            label_key = f"tag_label_{cleanup_i}_{context_key}"
+            start_key = f"tag_start_{cleanup_i}_{context_key}"
+            end_key = f"tag_end_{cleanup_i}_{context_key}"
+            enable_key = f"enable_tag_{cleanup_i}_{context_key}"
+
+            label_text = str(st.session_state.get(label_key, ""))
+            start_text = str(st.session_state.get(start_key, ""))
+            end_text = str(st.session_state.get(end_key, ""))
+
+            # Remove stale/default full-window tags before any user action.
+            # These are the cause of the false 12-hour Hit-results row.
+            is_full_window_default_tag = (
+                start_text == _format_datetime_text(t_min)
+                and end_text == _format_datetime_text(t_max)
+                and (
+                    label_text.startswith("Window Tag")
+                    or label_text.startswith("Observation")
+                    or label_text.strip() == ""
+                )
+            )
+
+            if is_full_window_default_tag:
+                for cleanup_key in [enable_key, label_key, start_key, end_key]:
+                    try:
+                        del st.session_state[cleanup_key]
+                    except Exception:
+                        pass
+
         st.markdown("**Tagger lane**")
         st.caption(
-            "Reliable Streamlit-native tagging: use the sidebar Time Filter to zoom to "
-            "the suspicious interval, then click the button below. The selected time "
-            "window is copied into the next available Track 4 Tagger slot."
+            "Draw tags with the chart Tagging button, or enable a manual tag below. "
+            "Saved tags remain section-level and only appear in windows they overlap."
         )
 
-        if st.button(
-            "Use current selected time window as Tag",
-            key=f"use_current_window_as_tag_{context_key}",
-            help=(
-                "Copies the current sidebar time-filter window into the next available "
-                "Tagger lane slot. This avoids unreliable JavaScript-to-Streamlit iframe communication."
-            ),
-        ):
-            target_i = None
-
-            for i in range(1, 4):
-                enabled_key = f"enable_tag_{i}_{context_key}"
-                if not st.session_state.get(enabled_key, False):
-                    target_i = i
-                    break
-
-            if target_i is None:
-                target_i = 3
-
-            st.session_state[f"enable_tag_{target_i}_{context_key}"] = True
-            st.session_state[f"tag_label_{target_i}_{context_key}"] = f"Window Tag {target_i}"
-            st.session_state[f"tag_start_{target_i}_{context_key}"] = _format_datetime_text(t_min)
-            st.session_state[f"tag_end_{target_i}_{context_key}"] = _format_datetime_text(t_max)
-
-            st.success(
-                f"Created Tag {target_i} from the current selected time window: "
-                f"{_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
-            )
-            st.rerun()
-
         st.caption(
-            f"Current selected time window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
+            f"Current loaded window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
         )
 
         for i in range(1, 4):
@@ -3461,18 +3841,18 @@ def render_agent_controls(
         if isinstance(visual_items, list):
             cleaned_visual_items = []
             for visual_idx, visual_item in enumerate(visual_items, start=1):
-                normalized_visual = _normalize_restored_visual_tag(
+                normalized_visual = _normalize_section_tag(
                     visual_item,
                     fallback_label=f"Drawn Tag {visual_idx}",
-                    t_min=t_min,
-                    t_max=t_max,
                 )
                 if normalized_visual is None:
                     continue
                 cleaned_visual_items.append(normalized_visual)
-                tag_intervals.append(normalized_visual)
+                if _interval_overlaps_window(normalized_visual, t_min, t_max):
+                    tag_intervals.append(normalized_visual)
 
-            # Keep session_state clean and JSON-safe after clamping/normalization.
+            # Keep all saved/drawn tags as section-level absolute timestamps.
+            # Do not clamp tags to the current 12-hour window.
             st.session_state[visual_key] = _deduplicate_visual_tags(cleaned_visual_items)
 
         st.markdown("**Agent lane**")
@@ -3773,13 +4153,29 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
     if not widget_state:
         return
 
+    saved_track_param_labels = _normalize_track_param_labels_for_save(
+        uploaded_data.get("plot_track_param_labels")
+        or dashboard_state.get("plot_track_param_labels")
+        or widget_state.get(f"saved_track_param_labels_{context_key}")
+        or widget_state.get(f"plot_track_param_labels_{context_key}")
+    )
+
+    if any(saved_track_param_labels):
+        st.session_state[f"saved_track_param_labels_{context_key}"] = saved_track_param_labels
+        st.session_state[f"plot_track_param_labels_{context_key}"] = saved_track_param_labels
+        for idx in range(3):
+            # This runs before render_track_parameter_selector(), so assigning
+            # widget state here is safe and makes the restored plot selections
+            # visible in the sidebar after upload.
+            st.session_state[f"track_params_{idx + 1}_{context_key}"] = saved_track_param_labels[idx]
+
     early_prefixes = [
         "track_params_",
         "max_override_",
         "curve_source_",
-        "exact_time_start_",
-        "exact_time_end_",
-        "time_filter_data_signature_",
+        "window_index_",
+        "saved_track_param_labels_",
+        "plot_track_param_labels_",
     ]
 
     for key, value in widget_state.items():
@@ -3797,6 +4193,17 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
 
         if not any(key.startswith(prefix) for prefix in early_prefixes):
             continue
+
+        # Do not let older JSON files with empty track_params overwrite the
+        # explicit saved_track_param_labels restored above.
+        if key.startswith("track_params_") and any(saved_track_param_labels):
+            try:
+                track_number = int(key.split("track_params_", 1)[1].split("_", 1)[0])
+                if 1 <= track_number <= 3:
+                    st.session_state[key] = saved_track_param_labels[track_number - 1]
+                    continue
+            except Exception:
+                pass
 
         # Text inputs need strings.
         if key.startswith("exact_time_start_") or key.startswith("exact_time_end_"):
@@ -3940,7 +4347,40 @@ def _render_dashboard_session_download_with_browser_tags(
                 return deduplicate(items);
             }}
 
-            function mergePayloadWithDrawnTags(basePayload, browserDrawnTags) {{
+            function readBrowserHitResults() {{
+                if (!contextKey) return [];
+                const prefix = "hoda_hit_result_history_" + contextKey + "_";
+                let rows = [];
+                try {{
+                    for (let i = 0; i < window.localStorage.length; i++) {{
+                        const key = window.localStorage.key(i);
+                        if (!key || !key.startsWith(prefix)) continue;
+                        rows = rows.concat(readJsonList(key));
+                    }}
+                }} catch (e) {{}}
+
+                const out = [];
+                const seen = new Set();
+                rows.forEach(function(row) {{
+                    if (!row || typeof row !== "object") return;
+                    const ident = [
+                        row.well || "",
+                        row.section || "",
+                        row.tag_label || "",
+                        row.tag_start || "",
+                        row.tag_end || ""
+                    ].join("|");
+                    if (seen.has(ident)) return;
+                    seen.add(ident);
+                    out.push(row);
+                }});
+                out.sort(function(a, b) {{
+                    return (parseDateMs(a && a.tag_start) || 0) - (parseDateMs(b && b.tag_start) || 0);
+                }});
+                return out;
+            }}
+
+            function mergePayloadWithDrawnTags(basePayload, browserDrawnTags, browserHitResults) {{
                 const payload = basePayload && typeof basePayload === "object" ? basePayload : {{}};
 
                 if (!payload.dashboard_context) payload.dashboard_context = {{}};
@@ -3952,6 +4392,44 @@ def _render_dashboard_session_download_with_browser_tags(
 
                 payload.drawn_tag_intervals = allDrawn;
                 payload.dashboard_state.widget_state["visual_tag_intervals_" + contextKey] = allDrawn;
+
+                const existingHitResults = Array.isArray(payload.hit_results) ? payload.hit_results : [];
+                const combinedHitResults = existingHitResults.concat(Array.isArray(browserHitResults) ? browserHitResults : []);
+
+                // Critical: save hit-result rows only for the actual saved drawn tags.
+                // Browser localStorage can contain stale rows from previous testing or
+                // removed tags. Those rows must not enter the saved dashboard JSON.
+                const validTagTimes = new Set();
+                allDrawn.forEach(function(tag) {{
+                    if (!tag || typeof tag !== "object") return;
+                    const s = String(tag.start || "").replace("T", " ").slice(0, 19);
+                    const e = String(tag.end || "").replace("T", " ").slice(0, 19);
+                    if (s && e && s !== e) validTagTimes.add(s + "|" + e);
+                }});
+
+                const hitOut = [];
+                const hitSeen = new Set();
+                combinedHitResults.forEach(function(row) {{
+                    if (!row || typeof row !== "object") return;
+                    const tagStart = String(row.tag_start || "").replace("T", " ").slice(0, 19);
+                    const tagEnd = String(row.tag_end || "").replace("T", " ").slice(0, 19);
+                    if (!tagStart || !tagEnd || !validTagTimes.has(tagStart + "|" + tagEnd)) return;
+
+                    const ident = [
+                        row.well || "",
+                        row.section || "",
+                        row.tag_label || "",
+                        tagStart,
+                        tagEnd
+                    ].join("|");
+                    if (hitSeen.has(ident)) return;
+                    hitSeen.add(ident);
+                    row.tag_start = tagStart;
+                    row.tag_end = tagEnd;
+                    hitOut.push(row);
+                }});
+                payload.hit_results = hitOut;
+                payload.dashboard_state.widget_state["hit_result_history_" + contextKey] = hitOut;
 
                 const manual = Array.isArray(payload.manual_tagger_intervals)
                     ? payload.manual_tagger_intervals
@@ -3999,15 +4477,16 @@ def _render_dashboard_session_download_with_browser_tags(
                 }}
 
                 const browserDrawnTags = readBrowserDrawnTags();
-                const finalPayload = mergePayloadWithDrawnTags(basePayload, browserDrawnTags);
+                const browserHitResults = readBrowserHitResults();
+                const finalPayload = mergePayloadWithDrawnTags(basePayload, browserDrawnTags, browserHitResults);
                 const finalText = JSON.stringify(finalPayload, null, 2);
 
                 downloadText(finalText, fileName);
 
                 if (browserDrawnTags.length) {{
-                    setStatus("Saved with " + browserDrawnTags.length + " drawn tag(s).");
+                    setStatus("Saved with " + browserDrawnTags.length + " drawn tag(s) and " + browserHitResults.length + " hit-result row(s).");
                 }} else {{
-                    setStatus("Saved. No browser-drawn tags were found.");
+                    setStatus("Saved with " + browserHitResults.length + " hit-result row(s). No browser-drawn tags were found.");
                 }}
             }}
 
@@ -4103,3 +4582,6 @@ def render_agent_review_outputs(
             mime="text/csv",
             key=f"download_csv_{context_key}",
         )
+
+
+

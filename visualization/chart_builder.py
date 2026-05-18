@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from config import N_TRACKS, PARAMETER_CATALOG
-from utils.helpers import downsample_xy, get_display_mode, get_target_points
+from utils.helpers import get_display_mode
 from visualization.chart_agent_track import _add_agent_track
 from visualization.chart_scale import (
     _add_scale_row,
@@ -49,7 +49,6 @@ def create_multi_track_chart(
     )
 
     mode, marker_size = get_display_mode(marker_display)
-    target_points = get_target_points(zoom_percent)
     parameter_trace_indices: list[int] = []
 
     t_min_view = df.index.min() if not df.empty else None
@@ -84,11 +83,10 @@ def create_multi_track_chart(
                 parameter_ranges=parameter_ranges,
             )
 
-            x_plot, y_plot = downsample_xy(
-                x_series=x_norm_full,
-                y_series=raw_y_full,
-                n_max=target_points,
-            )
+            # No downsampling: the dataframe has already been limited to the
+            # active 12-hour window before plotting. Every loaded raw point is drawn.
+            x_plot = x_norm_full
+            y_plot = raw_y_full
 
             if x_plot.dropna().empty:
                 continue

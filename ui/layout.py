@@ -47,6 +47,9 @@ def render_result_tables(
     if symptom_cfg["intervals"]:
         symptom_rows = pd.DataFrame(symptom_cfg["intervals"])
         with st.expander("Symptom intervals", expanded=False):
+            interval_scope = symptom_cfg.get("interval_scope")
+            if interval_scope:
+                st.caption(interval_scope)
             st.dataframe(symptom_rows, width="stretch")
 
     if not activity_validation_df.empty:
@@ -187,12 +190,17 @@ def _extract_track4_tag_intervals_from_fig(fig) -> list[dict]:
         match = re.search(r"Tagger<br>([^<]+)", hovertemplate, flags=re.IGNORECASE)
         label = match.group(1).strip() if match else "Tagger tag"
 
+        meta_source = ""
+        if isinstance(meta, dict):
+            meta_source = str(meta.get("source", "") or "")
+
         intervals.append(
             {
                 "start": start.strftime("%Y-%m-%d %H:%M:%S"),
                 "end": end.strftime("%Y-%m-%d %H:%M:%S"),
                 "label": label,
                 "trace_index": idx,
+                "source": meta_source,
             }
         )
     return intervals
@@ -202,6 +210,9 @@ def render_chart(
     chart_key: str,
     visual_tag_context_key: str | None = None,
     restore_saved_browser_zoom: bool = False,
+    current_window_start=None,
+    current_window_end=None,
+    saved_hit_results: list[dict] | None = None,
 ):
     """
     Render Plotly chart with controlled zoom tools and one custom cross-track
@@ -255,6 +266,17 @@ def render_chart(
     server_agent_intervals_json = json.dumps(server_agent_intervals, ensure_ascii=False)
     server_tag_intervals = _extract_track4_tag_intervals_from_fig(fig)
     server_tag_intervals_json = json.dumps(server_tag_intervals, ensure_ascii=False)
+    saved_hit_results_json = json.dumps(saved_hit_results or [], ensure_ascii=False)
+    current_window_start_text = (
+        pd.Timestamp(current_window_start).strftime("%Y-%m-%d %H:%M:%S")
+        if current_window_start is not None and not pd.isna(pd.Timestamp(current_window_start))
+        else ""
+    )
+    current_window_end_text = (
+        pd.Timestamp(current_window_end).strftime("%Y-%m-%d %H:%M:%S")
+        if current_window_end is not None and not pd.isna(pd.Timestamp(current_window_end))
+        else ""
+    )
 
     # This token is created once per Streamlit session. It prevents browser-stored
     # dragged tags from a previous dashboard session from appearing when the
@@ -325,7 +347,7 @@ def render_chart(
                     cursor: pointer;
                     font-size: 13px;
                 " title="Remove the most recently drawn Track 4 drag tag. Keeps up to 10 removed tags for redraw.">
-                    Undo drag tag
+                    Clear last drawn tag
                 </button>
 
                 <button id="redo_client_tag_btn_{div_id}" style="
@@ -335,7 +357,7 @@ def render_chart(
                     cursor: pointer;
                     font-size: 13px;
                 " title="Redraw the most recently undone drag tag.">
-                    Redo drag tag
+                    Restore Last Drawn Tag
                 </button>
 
                 <button id="clear_client_tags_btn_{div_id}" style="
@@ -345,7 +367,7 @@ def render_chart(
                     cursor: pointer;
                     font-size: 13px;
                 " title="Clear all dragged visual tags stored in this browser">
-                    Clear drag tags
+                    Clear all drawn tags
                 </button>
 
                 <button id="sync_client_tags_btn_{div_id}" style="
@@ -537,12 +559,16 @@ def render_chart(
     let tagDragStartY_{div_id} = null;
     let tagDragCurrentY_{div_id} = null;
     let clientTagsRestored_{div_id} = false;
+    let savedHitResultsRestored_{div_id} = false;
 
     const visualTagContextKey_{div_id} = "{visual_tag_context_key or ''}";
     const browserTagSessionToken_{div_id} = "{browser_tag_session_token}";
     const restoreSavedBrowserZoom_{div_id} = { "true" if restore_saved_browser_zoom else "false" };
     const serverAgentIntervals_{div_id} = {server_agent_intervals_json};
     const serverTagIntervals_{div_id} = {server_tag_intervals_json};
+    const savedHitResultsFromServer_{div_id} = {saved_hit_results_json};
+    const currentWindowStart_{div_id} = "{current_window_start_text}";
+    const currentWindowEnd_{div_id} = "{current_window_end_text}";
 
     function deepCopy_{div_id}(obj) {{
         return JSON.parse(JSON.stringify(obj));
@@ -800,12 +826,28 @@ def render_chart(
     const clientVisualTagClearAfterSyncKey_{div_id} =
         "hoda_clear_client_visual_tags_after_sync_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
 
-    // Persist chart zoom across Streamlit reruns. This prevents the user from
-    // losing the zoom when sidebar tags or chart-drawn tags update Python state.
+    // Current-browser-session hit-result history.
+    // It is intentionally shared across all 12-hour windows of the current
+    // well/section, but it includes browserTagSessionToken so a fresh dashboard
+    // start begins with an empty Hit results table.
+    const hitResultHistoryStorageKey_{div_id} =
+        "hoda_hit_result_history_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id};
+
+    // Persist chart zoom across Streamlit reruns, but keep it window-specific.
+    // Without the window in this key, a zoom range from the previous 12-hour
+    // window can be restored after clicking Next/Previous. That makes the new
+    // window's curves look like they disappeared because the visible y/time
+    // range is still the old window.
+    const currentWindowZoomKey_{div_id} =
+        (currentWindowStart_{div_id} + "_" + currentWindowEnd_{div_id})
+            .replaceAll(" ", "T")
+            .replaceAll(":", "-")
+            .replaceAll("/", "-");
+
     const chartZoomStorageKey_{div_id} =
         restoreSavedBrowserZoom_{div_id}
-            ? ("hoda_chart_zoom_" + visualTagContextKey_{div_id})
-            : ("hoda_chart_zoom_" + visualTagContextKey_{div_id} + "_" + browserTagSessionToken_{div_id});
+            ? ("hoda_chart_zoom_" + visualTagContextKey_{div_id} + "_" + currentWindowZoomKey_{div_id})
+            : ("hoda_chart_zoom_" + visualTagContextKey_{div_id} + "_" + currentWindowZoomKey_{div_id} + "_" + browserTagSessionToken_{div_id});
 
     function saveCurrentZoomToBrowser_{div_id}() {{
         try {{
@@ -955,6 +997,25 @@ def render_chart(
         return isNaN(d.getTime()) ? null : d.getTime();
     }}
 
+    function _tagOverlapsCurrentWindow_{div_id}(tagItem) {{
+        if (!currentWindowStart_{div_id} || !currentWindowEnd_{div_id}) return true;
+        const tagStart = _dateMs_{div_id}(tagItem && tagItem.start);
+        const tagEnd = _dateMs_{div_id}(tagItem && tagItem.end);
+        const winStart = _dateMs_{div_id}(currentWindowStart_{div_id});
+        const winEnd = _dateMs_{div_id}(currentWindowEnd_{div_id});
+        if (tagStart === null || tagEnd === null || winStart === null || winEnd === null) return false;
+        const minTag = Math.min(tagStart, tagEnd);
+        const maxTag = Math.max(tagStart, tagEnd);
+        if (maxTag <= minTag) return false;
+        return minTag < winEnd && maxTag > winStart;
+    }}
+
+    function loadClientVisualTagsForCurrentWindow_{div_id}() {{
+        return loadClientVisualTags_{div_id}().filter(function(item) {{
+            return _tagOverlapsCurrentWindow_{div_id}(item);
+        }});
+    }}
+
     function _arrayLikeToArray_{div_id}(value) {{
         if (value === undefined || value === null) return [];
         if (Array.isArray(value)) return value;
@@ -1084,8 +1145,21 @@ def render_chart(
         const startMs = _dateMs_{div_id}(item.start);
         const endMs = _dateMs_{div_id}(item.end);
         if (startMs === null || endMs === null) return null;
+
+        const source = String((item && item.source) || "").toLowerCase();
+
+        // Important:
+        // Only chart-drawn/restored chart tags should feed the browser Hit results.
+        // Manual/default Track 4 tagger traces can otherwise create a false
+        // 12-hour hit row immediately after the first plot is rendered.
+        if (source !== "chart_drag" && source !== "client_drag_tag") {{
+            return null;
+        }}
+
         const minMs = Math.min(startMs, endMs);
         const maxMs = Math.max(startMs, endMs);
+        if (maxMs <= minMs) return null;
+
         return {{
             label: item.label || "Restored tag",
             start: formatDateForStreamlit_{div_id}(new Date(minMs)),
@@ -1467,7 +1541,7 @@ def render_chart(
     }}
 
     function redrawClientVisualTagsFromStorage_{div_id}() {{
-        const items = loadClientVisualTags_{div_id}();
+        const items = loadClientVisualTagsForCurrentWindow_{div_id}();
         if (!items.length) {{
             rebuildHitResultsTable_{div_id}();
             updateClientTagUndoRedoControls_{div_id}();
@@ -1487,7 +1561,7 @@ def render_chart(
     }}
 
     function restoreClientVisualTags_{div_id}() {{
-        const items = loadClientVisualTags_{div_id}();
+        const items = loadClientVisualTagsForCurrentWindow_{div_id}();
         if (!items.length) {{
             rebuildHitResultsTable_{div_id}();
             updateClientTagUndoRedoControls_{div_id}();
@@ -1517,6 +1591,15 @@ def render_chart(
         saveClientVisualTagRedoStack_{div_id}([]);
 
         addClientVisualTagTrace_{div_id}(item, true);
+
+        const newRowsForHistory = _tagResultRows_{div_id}().filter(function(row) {{
+            return row.tag_start === item.start && row.tag_end === item.end;
+        }});
+        if (newRowsForHistory.length) {{
+            saveHitResultHistory_{div_id}(
+                mergeHitResultRows_{div_id}(loadHitResultHistory_{div_id}(), newRowsForHistory)
+            );
+        }}
 
         const overlapCount = _clientOverlapIntervalsForTag_{div_id}(item).length;
         instructionText_{div_id}.innerText =
@@ -1586,6 +1669,75 @@ def render_chart(
         }});
     }}
 
+    function loadHitResultHistory_{div_id}() {{
+        if (!visualTagContextKey_{div_id}) return [];
+        try {{
+            const raw = window.localStorage.getItem(hitResultHistoryStorageKey_{div_id});
+            const parsed = JSON.parse(raw || "[]");
+            return Array.isArray(parsed) ? parsed : [];
+        }} catch (e) {{
+            return [];
+        }}
+    }}
+
+    function saveHitResultHistory_{div_id}(rows) {{
+        if (!visualTagContextKey_{div_id}) return;
+        const safeRows = Array.isArray(rows) ? rows : [];
+        try {{
+            window.localStorage.setItem(
+                hitResultHistoryStorageKey_{div_id},
+                JSON.stringify(safeRows)
+            );
+        }} catch (e) {{}}
+    }}
+
+    function _rowIdentity_{div_id}(row) {{
+        return [
+            row.well || "",
+            row.section || "",
+            row.tag_label || "",
+            row.tag_start || "",
+            row.tag_end || ""
+        ].join("|");
+    }}
+
+    function mergeHitResultRows_{div_id}(historyRows, currentRows) {{
+        const out = [];
+        const seen = new Set();
+
+        (historyRows || []).forEach(function(row) {{
+            const ident = _rowIdentity_{div_id}(row || {{}});
+            if (!ident || seen.has(ident)) return;
+            seen.add(ident);
+            out.push(row);
+        }});
+
+        (currentRows || []).forEach(function(row) {{
+            const ident = _rowIdentity_{div_id}(row || {{}});
+            if (!ident) return;
+
+            const existingIndex = out.findIndex(function(item) {{
+                return _rowIdentity_{div_id}(item || {{}}) === ident;
+            }});
+
+            if (existingIndex >= 0) {{
+                out[existingIndex] = row;
+            }} else {{
+                out.push(row);
+            }}
+
+            seen.add(ident);
+        }});
+
+        out.sort(function(a, b) {{
+            const at = _dateMs_{div_id}(a && a.tag_start) || 0;
+            const bt = _dateMs_{div_id}(b && b.tag_start) || 0;
+            return at - bt;
+        }});
+
+        return out;
+    }}
+
     function _selectedAgentNameForRows_{div_id}() {{
         const agents = _visibleAgentIntervals_{div_id}();
         if (agents.length && agents[0].label) return agents[0].label;
@@ -1629,8 +1781,47 @@ def render_chart(
             .replaceAll("'", "&#039;");
     }}
 
+    function _hitRowMatchesSavedTag_{div_id}(row, tags) {{
+        if (!row || typeof row !== "object") return false;
+        const rowStart = _dateMs_{div_id}(row.tag_start);
+        const rowEnd = _dateMs_{div_id}(row.tag_end);
+        if (rowStart === null || rowEnd === null || rowEnd <= rowStart) return false;
+
+        return (tags || []).some(function(tag) {{
+            const tagStart = _dateMs_{div_id}(tag && tag.start);
+            const tagEnd = _dateMs_{div_id}(tag && tag.end);
+            if (tagStart === null || tagEnd === null || tagEnd <= tagStart) return false;
+            return Math.abs(tagStart - rowStart) <= 1000 && Math.abs(tagEnd - rowEnd) <= 1000;
+        }});
+    }}
+
+    function initializeSavedHitResultsFromServer_{div_id}() {{
+        const existing = loadHitResultHistory_{div_id}();
+        const restored = Array.isArray(savedHitResultsFromServer_{div_id}) ? savedHitResultsFromServer_{div_id} : [];
+        if (!restored.length) return;
+
+        // Important:
+        // savedHitResultsFromServer comes from Streamlit session_state after
+        // Python has already filtered it against the saved section-level drawn
+        // tags. Do NOT filter it again against _allTagIntervalsForResults() here,
+        // because that function only sees tags in the currently loaded 12-hour
+        // window. Re-filtering here deletes valid hit rows from other windows
+        // when a saved session is uploaded.
+        saveHitResultHistory_{div_id}(
+            mergeHitResultRows_{div_id}(existing, restored)
+        );
+    }}
+
     function rebuildHitResultsTable_{div_id}() {{
-        const rows = _tagResultRows_{div_id}();
+        const currentRows = _tagResultRows_{div_id}();
+        const rows = mergeHitResultRows_{div_id}(
+            loadHitResultHistory_{div_id}(),
+            currentRows
+        );
+
+        if (currentRows.length) {{
+            saveHitResultHistory_{div_id}(rows);
+        }}
         const hitCount = rows.filter(function(r) {{ return r.result === "Hit"; }}).length;
         const missCount = rows.filter(function(r) {{ return r.result === "Miss"; }}).length;
 
@@ -1663,7 +1854,10 @@ def render_chart(
     }}
 
     function downloadHitResultsExcel_{div_id}() {{
-        const rows = _tagResultRows_{div_id}();
+        const rows = mergeHitResultRows_{div_id}(
+            loadHitResultHistory_{div_id}(),
+            _tagResultRows_{div_id}()
+        );
         if (!rows.length) {{
             alert("No dragged-tag hit results to download yet.");
             return;
@@ -1875,6 +2069,10 @@ def render_chart(
         setTimeout(function() {{
             captureInitialRangesOnce_{div_id}();
             updateTagCaptureLayer_{div_id}();
+            if (!savedHitResultsRestored_{div_id}) {{
+                savedHitResultsRestored_{div_id} = true;
+                initializeSavedHitResultsFromServer_{div_id}();
+            }}
             if (!clientTagsRestored_{div_id}) {{
                 clientTagsRestored_{div_id} = true;
                 restoreClientVisualTags_{div_id}();
@@ -1894,6 +2092,10 @@ def render_chart(
             restoreSavedZoomFromBrowser_{div_id}();
         }}, 120);
         clearClientVisualTagsAfterSyncIfRequested_{div_id}();
+        if (!savedHitResultsRestored_{div_id}) {{
+            savedHitResultsRestored_{div_id} = true;
+            initializeSavedHitResultsFromServer_{div_id}();
+        }}
         if (!clientTagsRestored_{div_id}) {{
             clientTagsRestored_{div_id} = true;
             restoreClientVisualTags_{div_id}();
@@ -2190,3 +2392,6 @@ def render_chart(
         height=chart_height + 260,
         scrolling=True,
     )
+
+
+
