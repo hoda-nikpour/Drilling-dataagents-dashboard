@@ -1547,47 +1547,21 @@ def render_window_pager(
         min(int(st.session_state.get(index_key, 0)), n_windows - 1),
     )
 
+    current_index = int(st.session_state[index_key])
+    selected_start = t_min + current_index * window_delta
+    selected_end = min(selected_start + window_delta, t_max)
+
     with st.sidebar:
         st.subheader("Time Window")
-        st.caption("Fixed 12-hour windows. Only the active window is loaded and plotted.")
-
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col1:
-            if st.button(
-                "Previous",
-                key=f"window_prev_{context_key}",
-                disabled=st.session_state[index_key] <= 0,
-            ):
-                st.session_state[index_key] = max(0, st.session_state[index_key] - 1)
-                # Tell app.py that this rerun came from window browsing.
-                # Parameter selections should be restored if Streamlit returns
-                # an empty multiselect value during the button-triggered rerun.
-                st.session_state[f"_window_changed_{context_key}"] = True
-                st.rerun()
-
-        with col2:
-            st.caption(f"{st.session_state[index_key] + 1} / {n_windows}")
-
-        with col3:
-            if st.button(
-                "Next",
-                key=f"window_next_{context_key}",
-                disabled=st.session_state[index_key] >= n_windows - 1,
-            ):
-                st.session_state[index_key] = min(n_windows - 1, st.session_state[index_key] + 1)
-                # Tell app.py that this rerun came from window browsing.
-                # Parameter selections should be restored if Streamlit returns
-                # an empty multiselect value during the button-triggered rerun.
-                st.session_state[f"_window_changed_{context_key}"] = True
-                st.rerun()
-
-        current_index = int(st.session_state[index_key])
-        selected_start = t_min + current_index * window_delta
-        selected_end = min(selected_start + window_delta, t_max)
+        st.caption(
+            "Fixed 12-hour windows. Only the active window is loaded and plotted. "
+            "Use the Previous/Next buttons below the chart to browse windows."
+        )
 
         rows_in_window = len(time_df.loc[selected_start:selected_end])
         st.caption(
-            f"Loaded window: {selected_start.strftime('%Y-%m-%d %H:%M:%S')} → "
+            f"Loaded window {current_index + 1} / {n_windows}: "
+            f"{selected_start.strftime('%Y-%m-%d %H:%M:%S')} → "
             f"{selected_end.strftime('%Y-%m-%d %H:%M:%S')} | "
             f"{rows_in_window:,} timestamps"
         )

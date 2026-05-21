@@ -2,6 +2,7 @@ import gc
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from agents.activity_agents import REQUIRED_ACTIVITY_INPUTS
 from agents.symptom_agents import REQUIRED_SYMPTOM_INPUTS
@@ -345,6 +346,121 @@ def _restore_track_params_after_window_change(
     st.session_state[changed_key] = False
     return safe_tracks
 
+
+
+def _safe_html_id(value: str) -> str:
+    """Return a browser-safe id fragment."""
+    return "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(value))
+
+
+def _render_scroll_to_chart_top_once(context_key: str):
+    """
+    After a 12-hour window navigation click, scroll the browser back to the
+    top of the newly loaded plot.
+
+    The scroll flag is set by the bottom Previous/Next buttons and consumed
+    once here after the new Streamlit run has rendered the chart anchor.
+    """
+    flag_key = f"_scroll_to_chart_top_{context_key}"
+    if not st.session_state.pop(flag_key, False):
+        return
+
+    anchor_id = f"chart_top_anchor_{_safe_html_id(context_key)}"
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            function scrollToChartTop() {{
+                try {{
+                    const parentDoc = window.parent.document;
+                    const anchor = parentDoc.getElementById({anchor_id!r});
+                    if (anchor) {{
+                        anchor.scrollIntoView({{behavior: "smooth", block: "start"}});
+                        return;
+                    }}
+
+                    const appView = parentDoc.querySelector('[data-testid="stAppViewContainer"]');
+                    if (appView && appView.scrollTo) {{
+                        appView.scrollTo({{top: 0, behavior: "smooth"}});
+                        return;
+                    }}
+                }} catch (e) {{}}
+
+                try {{
+                    window.parent.scrollTo({{top: 0, behavior: "smooth"}});
+                }} catch (e2) {{}}
+            }}
+
+            setTimeout(scrollToChartTop, 250);
+            setTimeout(scrollToChartTop, 900);
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def render_bottom_window_navigation(window_info: dict, context_key: str):
+    """
+    Show Previous/Next controls directly below the four-track chart.
+
+    The active data loading remains controlled by render_window_pager(), but
+    these bottom buttons change the same window_index_<context_key> value.
+    """
+    if not window_info:
+        return
+
+    index_key = f"window_index_{context_key}"
+    current_index = int(window_info.get("index", st.session_state.get(index_key, 0)))
+    window_count = int(window_info.get("count", 1))
+    start = pd.Timestamp(window_info.get("start"))
+    end = pd.Timestamp(window_info.get("end"))
+
+    st.markdown(
+        """
+        <style>
+            div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"]) {
+                margin-top: -0.25rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col_prev, col_status, col_next = st.columns([1.2, 2.0, 1.2])
+
+    with col_prev:
+        if st.button(
+            "⬅ Previous window",
+            key=f"bottom_window_prev_{context_key}",
+            disabled=current_index <= 0,
+            width="stretch",
+        ):
+            st.session_state[index_key] = max(0, current_index - 1)
+            st.session_state[f"_window_changed_{context_key}"] = True
+            st.session_state[f"_scroll_to_chart_top_{context_key}"] = True
+            st.rerun()
+
+    with col_status:
+        st.markdown(
+            f"<div style='text-align:center; color:#555; font-size:0.92rem; padding-top:0.45rem;'>"
+            f"Window {current_index + 1} / {window_count}: "
+            f"{start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%Y-%m-%d %H:%M')}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with col_next:
+        if st.button(
+            "Next window ➡",
+            key=f"bottom_window_next_{context_key}",
+            disabled=current_index >= window_count - 1,
+            width="stretch",
+        ):
+            st.session_state[index_key] = min(window_count - 1, current_index + 1)
+            st.session_state[f"_window_changed_{context_key}"] = True
+            st.session_state[f"_scroll_to_chart_top_{context_key}"] = True
+            st.rerun()
 
 def main():
     begin_undo_tracking()
@@ -945,6 +1061,12 @@ def main():
 
     saved_hit_results = st.session_state.get(f"hit_result_history_{context_key}", [])
 
+    chart_anchor_id = f"chart_top_anchor_{_safe_html_id(context_key)}"
+    st.markdown(
+        f'<div id="{chart_anchor_id}" style="scroll-margin-top: 0.75rem;"></div>',
+        unsafe_allow_html=True,
+    )
+
     render_chart(
         fig,
         chart_key,
@@ -954,6 +1076,9 @@ def main():
         current_window_end=selected_time_window[1],
         saved_hit_results=saved_hit_results,
     )
+
+    render_bottom_window_navigation(window_info=window_info, context_key=context_key)
+    _render_scroll_to_chart_top_once(context_key)
 
     commit_undo_tracking()
 

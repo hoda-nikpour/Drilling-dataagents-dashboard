@@ -238,7 +238,7 @@ def create_multi_track_chart(
 
     fig.update_layout(
         height=chart_height,
-        margin=dict(l=145, r=20, t=145, b=320),
+        margin=dict(l=145, r=20, t=145, b=165),
 
         # Keep normal point hover. The continuous horizontal line is not Plotly;
         # it is drawn once in layout.py as an HTML overlay.

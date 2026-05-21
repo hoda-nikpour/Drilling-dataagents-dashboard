@@ -131,23 +131,12 @@ def _add_track_selected_params_summary(
     labels: list[str],
     colors: list[str],
 ):
-    axis_name = "x domain" if track_idx == 0 else f"x{track_idx + 1} domain"
+    """
+    Intentionally no-op.
 
-    if not labels:
-        summary_text = "<span style='color:#888; font-size:10px'>No parameters selected</span>"
-    else:
-        pieces = []
-        for label, color in zip(labels, colors):
-            pieces.append(f"<span style='color:{color}; font-size:10px'>{label}</span>")
-        summary_text = " &nbsp;&nbsp;•&nbsp;&nbsp; ".join(pieces)
-
-    fig.add_annotation(
-        xref=axis_name,
-        yref="paper",
-        x=0.5,
-        y=-0.31,
-        text=summary_text,
-        showarrow=False,
-        xanchor="center",
-        font=dict(size=10, color="#666"),
-    )
+    The scale boxes already show the selected parameter names at the bottom of
+    each track. The older extra summary text below the scale boxes produced
+    duplicated labels such as "TRQ", "RPMB", and "No parameters selected"
+    and created unnecessary whitespace before the window-navigation buttons.
+    """
+    return
