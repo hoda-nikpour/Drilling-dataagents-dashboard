@@ -44,7 +44,7 @@ def render_result_tables(
         if st.session_state.get("_show_hidden_activity_summary", False):
             with st.expander("Activity summary", expanded=False):
                 st.dataframe(activity_cfg["summary_df"], width="stretch")
-    
+
     if symptom_cfg["intervals"]:
         symptom_rows = pd.DataFrame(symptom_cfg["intervals"])
         with st.expander("Symptom intervals", expanded=False):
@@ -348,7 +348,17 @@ def render_chart(
                     cursor: pointer;
                     font-size: 13px;
                 " title="Remove the most recently drawn Track 4 drag tag. Keeps up to 10 removed tags for redraw.">
-                    Clear last drawn tag
+                    Undo drag tag
+                </button>
+
+                <button id="delete_client_tag_btn_{div_id}" style="
+                    padding: 6px 10px;
+                    border: 1px solid #999;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 13px;
+                " title="Delete the currently selected drawn Track 4 tag. Double-click a drawn tag to select it first.">
+                    🗑 Delete selected tag
                 </button>
 
                 <button id="redo_client_tag_btn_{div_id}" style="
@@ -358,7 +368,7 @@ def render_chart(
                     cursor: pointer;
                     font-size: 13px;
                 " title="Redraw the most recently undone drag tag.">
-                    Restore Last Drawn Tag
+                    Redo drag tag
                 </button>
 
                 <button id="clear_client_tags_btn_{div_id}" style="
@@ -368,7 +378,7 @@ def render_chart(
                     cursor: pointer;
                     font-size: 13px;
                 " title="Clear all dragged visual tags stored in this browser">
-                    Clear all drawn tags
+                    Clear drag tags
                 </button>
 
                 <button id="sync_client_tags_btn_{div_id}" style="
@@ -434,7 +444,7 @@ def render_chart(
 
         <div id="chart_instruction_text_{div_id}" style="font-size: 12px; color: #555; margin-bottom: 6px;">
             Choose a zoom mode, then drag a rectangle inside the chart.
-            Double-click inside the chart = Undo chart zoom.
+            Double-click a drawn Track 4 tag to select/edit it. Double-click empty chart area = Undo chart zoom.
             Click Tagging, then drag vertically over an abnormal interval to create a Track 4 tag.
         </div>
 
@@ -532,6 +542,7 @@ def render_chart(
     const resetBtn_{div_id} = document.getElementById("reset_zoom_btn_{div_id}");
     const taggingBtn_{div_id} = document.getElementById("tagging_btn_{div_id}");
     const undoClientTagBtn_{div_id} = document.getElementById("undo_client_tag_btn_{div_id}");
+    const deleteClientTagBtn_{div_id} = document.getElementById("delete_client_tag_btn_{div_id}");
     const redoClientTagBtn_{div_id} = document.getElementById("redo_client_tag_btn_{div_id}");
     const clearClientTagsBtn_{div_id} = document.getElementById("clear_client_tags_btn_{div_id}");
     const syncClientTagsBtn_{div_id} = document.getElementById("sync_client_tags_btn_{div_id}");
@@ -557,6 +568,11 @@ def render_chart(
     let doubleClickLock_{div_id} = false;
 
     let taggingMode_{div_id} = false;
+    let selectedTagIdentity_{div_id} = null;
+    let selectedTagSnapshot_{div_id} = null;
+    let tagEditMode_{div_id} = false;
+    let tagResizeActive_{div_id} = false;
+    let tagResizeBoundary_{div_id} = null;
     let tagDragActive_{div_id} = false;
     let tagDragStartY_{div_id} = null;
     let tagDragCurrentY_{div_id} = null;
@@ -753,13 +769,13 @@ def render_chart(
             taggingBtn_{div_id}.style.border = "1px solid #7e22ce";
             taggingBtn_{div_id}.style.fontWeight = "700";
             instructionText_{div_id}.innerText =
-                "Tagging mode is active. Drag vertically over the chart to create a Track 4 tag interval.";
+                "Tagging mode is active. Drag vertically to draw a new Track 4 tag. Double-click an existing drawn tag to select it, then drag it to stretch/compress.";
         }} else {{
             taggingBtn_{div_id}.style.background = "white";
             taggingBtn_{div_id}.style.border = "1px solid #999";
             taggingBtn_{div_id}.style.fontWeight = "400";
             instructionText_{div_id}.innerText =
-                "Choose a zoom mode, then drag a rectangle inside the chart. Double-click inside the chart = Undo chart zoom. Click Tagging, then drag vertically over an abnormal interval to create a Track 4 tag.";
+                "Choose a zoom mode, then drag a rectangle inside the chart. Double-click a drawn Track 4 tag to select/edit it. Double-click empty chart area = Undo chart zoom. Click Tagging, then drag vertically over an abnormal interval to create a Track 4 tag.";
         }}
     }}
 
@@ -950,6 +966,264 @@ def render_chart(
         }} catch (e) {{}}
     }}
 
+
+    function _tagIdentity_{div_id}(tagItem) {{
+        if (!tagItem) return "";
+        const created = String(tagItem.created_at || "").trim();
+        if (created) return "created:" + created;
+        return [
+            String(tagItem.label || ""),
+            String(tagItem.start || ""),
+            String(tagItem.end || "")
+        ].join("|");
+    }}
+
+    function _findClientTagIndexByIdentity_{div_id}(identity) {{
+        if (!identity) return -1;
+        const items = loadClientVisualTags_{div_id}();
+        for (let i = 0; i < items.length; i++) {{
+            if (_tagIdentity_{div_id}(items[i]) === identity) return i;
+        }}
+        return -1;
+    }}
+
+    function _selectedClientTagIndex_{div_id}() {{
+        return _findClientTagIndexByIdentity_{div_id}(selectedTagIdentity_{div_id});
+    }}
+
+    function _tagStartEndPlotY_{div_id}(tagItem) {{
+        if (!tagItem) return null;
+        const fullLayout = gd_{div_id}._fullLayout;
+        if (!fullLayout || !fullLayout.yaxis) return null;
+        try {{
+            const yStart = Number(fullLayout.yaxis.d2p(tagItem.start));
+            const yEnd = Number(fullLayout.yaxis.d2p(tagItem.end));
+            if (!Number.isFinite(yStart) || !Number.isFinite(yEnd)) return null;
+            return {{startY: yStart, endY: yEnd}};
+        }} catch (e) {{
+            return null;
+        }}
+    }}
+
+    function selectNearestClientTagForEdit_{div_id}(event) {{
+        const plotY = getPlotMouseY_{div_id}(event);
+        if (plotY === null) return false;
+
+        const visibleTags = loadClientVisualTagsForCurrentWindow_{div_id}();
+        if (!visibleTags.length) return false;
+
+        let nearestTag = null;
+        let nearestDistance = Number.MAX_VALUE;
+        let insideTag = false;
+
+        visibleTags.forEach(function(tag) {{
+            const range = _tagStartEndPlotY_{div_id}(tag);
+            if (range === null) return;
+
+            const topY = Math.min(range.startY, range.endY);
+            const bottomY = Math.max(range.startY, range.endY);
+            const centerY = (topY + bottomY) / 2;
+            const distance = Math.abs(centerY - plotY);
+            const isInside = plotY >= (topY - 14) && plotY <= (bottomY + 14);
+
+            if (isInside || distance < nearestDistance) {{
+                nearestDistance = distance;
+                nearestTag = tag;
+                insideTag = isInside;
+            }}
+        }});
+
+        if (!nearestTag) return false;
+        if (!insideTag && nearestDistance > 40) return false;
+
+        const nearestIdentity = _tagIdentity_{div_id}(nearestTag);
+
+        // A second double-click on the already-selected tag deletes it.
+        if (
+            tagEditMode_{div_id} &&
+            selectedTagIdentity_{div_id} &&
+            selectedTagIdentity_{div_id} === nearestIdentity
+        ) {{
+            deleteSelectedClientTag_{div_id}();
+            return true;
+        }}
+
+        selectedTagIdentity_{div_id} = nearestIdentity;
+        selectedTagSnapshot_{div_id} = Object.assign({{}}, nearestTag);
+        tagEditMode_{div_id} = true;
+        tagResizeActive_{div_id} = false;
+        tagResizeBoundary_{div_id} = null;
+        taggingMode_{div_id} = true;
+
+        updateTagCaptureLayer_{div_id}();
+        setPlotlyPointerLockForTagging_{div_id}();
+        setTaggingButtonStyle_{div_id}();
+        updateClientTagUndoRedoControls_{div_id}();
+
+        redrawClientTagsAfterEdit_{div_id}(
+            "Selected " + (nearestTag.label || "drawn tag") +
+            ". It is shown in dark blue. Drag vertically on it to stretch/compress it, or double-click it again to delete it."
+        );
+        return true;
+    }}
+
+    function redrawClientTagsAfterEdit_{div_id}(message) {{
+        removeClientVisualTagTraces_{div_id}(function() {{
+            redrawClientVisualTagsFromStorage_{div_id}();
+            if (message) instructionText_{div_id}.innerText = message;
+        }});
+    }}
+
+    function _plotYInsideTag_{div_id}(plotY, tagItem, tolerancePx) {{
+        if (plotY === null || !tagItem) return false;
+        const range = _tagStartEndPlotY_{div_id}(tagItem);
+        if (range === null) return false;
+        const tol = Number.isFinite(Number(tolerancePx)) ? Number(tolerancePx) : 14;
+        const topY = Math.min(range.startY, range.endY) - tol;
+        const bottomY = Math.max(range.startY, range.endY) + tol;
+        return plotY >= topY && plotY <= bottomY;
+    }}
+
+    function _selectedClientTag_{div_id}() {{
+        const idx = _selectedClientTagIndex_{div_id}();
+        if (idx < 0) return null;
+        const items = loadClientVisualTags_{div_id}();
+        return items[idx] || null;
+    }}
+
+    function deselectClientTag_{div_id}(message) {{
+        if (!selectedTagIdentity_{div_id} && !tagEditMode_{div_id}) return;
+
+        selectedTagIdentity_{div_id} = null;
+        selectedTagSnapshot_{div_id} = null;
+        tagEditMode_{div_id} = false;
+        tagResizeActive_{div_id} = false;
+        tagResizeBoundary_{div_id} = null;
+
+        updateTagCaptureLayer_{div_id}();
+        setPlotlyPointerLockForTagging_{div_id}();
+        updateClientTagUndoRedoControls_{div_id}();
+
+        redrawClientTagsAfterEdit_{div_id}(
+            message || "Tag deselected. Press Tagging and double-click a drawn tag to select it again."
+        );
+    }}
+
+    function _sameTagIntervalForHistory_{div_id}(row, tagItem) {{
+        const rowStart = _dateMs_{div_id}(row && row.tag_start);
+        const rowEnd = _dateMs_{div_id}(row && row.tag_end);
+        const tagStart = _dateMs_{div_id}(tagItem && tagItem.start);
+        const tagEnd = _dateMs_{div_id}(tagItem && tagItem.end);
+        if (rowStart === null || rowEnd === null || tagStart === null || tagEnd === null) return false;
+        return Math.abs(rowStart - tagStart) <= 1000 && Math.abs(rowEnd - tagEnd) <= 1000;
+    }}
+
+    function removeHitRowsForTag_{div_id}(tagItem) {{
+        if (!tagItem) return;
+        const kept = loadHitResultHistory_{div_id}().filter(function(row) {{
+            return !_sameTagIntervalForHistory_{div_id}(row, tagItem);
+        }});
+        saveHitResultHistory_{div_id}(kept);
+    }}
+
+    function removeHitRowsForTags_{div_id}(tagItems) {{
+        const tags = Array.isArray(tagItems) ? tagItems : [];
+        if (!tags.length) return;
+        const kept = loadHitResultHistory_{div_id}().filter(function(row) {{
+            return !tags.some(function(tag) {{
+                return _sameTagIntervalForHistory_{div_id}(row, tag);
+            }});
+        }});
+        saveHitResultHistory_{div_id}(kept);
+    }}
+
+    function updateSelectedClientTagFromPlotY_{div_id}(plotY) {{
+        if (!tagEditMode_{div_id} || !selectedTagIdentity_{div_id}) return false;
+
+        const idx = _selectedClientTagIndex_{div_id}();
+        if (idx < 0) return false;
+
+        const items = loadClientVisualTags_{div_id}();
+        const selected = items[idx];
+        const currentDate = dateFromPlotY_{div_id}(plotY);
+        if (!currentDate) return false;
+
+        const oldTag = Object.assign({{}}, selected);
+        const currentText = formatDateForStreamlit_{div_id}(currentDate);
+
+        const startMs = _dateMs_{div_id}(selected.start);
+        const endMs = _dateMs_{div_id}(selected.end);
+        const currentMs = _dateMs_{div_id}(currentText);
+        if (startMs === null || endMs === null || currentMs === null) return false;
+
+        if (!tagResizeBoundary_{div_id}) {{
+            const distToStart = Math.abs(currentMs - startMs);
+            const distToEnd = Math.abs(currentMs - endMs);
+            tagResizeBoundary_{div_id} = distToStart <= distToEnd ? "start" : "end";
+        }}
+
+        if (tagResizeBoundary_{div_id} === "start") {{
+            selected.start = currentText;
+        }} else {{
+            selected.end = currentText;
+        }}
+
+        if (_dateMs_{div_id}(selected.start) > _dateMs_{div_id}(selected.end)) {{
+            const tmp = selected.start;
+            selected.start = selected.end;
+            selected.end = tmp;
+            tagResizeBoundary_{div_id} = tagResizeBoundary_{div_id} === "start" ? "end" : "start";
+        }}
+
+        items[idx] = selected;
+        removeHitRowsForTag_{div_id}(oldTag);
+        saveClientVisualTags_{div_id}(items);
+        selectedTagIdentity_{div_id} = _tagIdentity_{div_id}(selected);
+        selectedTagSnapshot_{div_id} = Object.assign({{}}, selected);
+
+        const newRows = _tagResultRows_{div_id}().filter(function(row) {{
+            return Math.abs((_dateMs_{div_id}(row.tag_start) || 0) - (_dateMs_{div_id}(selected.start) || 0)) <= 1000 &&
+                   Math.abs((_dateMs_{div_id}(row.tag_end) || 0) - (_dateMs_{div_id}(selected.end) || 0)) <= 1000;
+        }});
+        saveHitResultHistory_{div_id}(
+            mergeHitResultRows_{div_id}(loadHitResultHistory_{div_id}(), newRows)
+        );
+
+        redrawClientTagsAfterEdit_{div_id}(
+            "Edited " + (selected.label || "drawn tag") + ": " + selected.start + " → " + selected.end + "."
+        );
+        return true;
+    }}
+
+    function deleteSelectedClientTag_{div_id}() {{
+        const idx = _selectedClientTagIndex_{div_id}();
+        if (idx < 0) {{
+            instructionText_{div_id}.innerText = "Double-click a drawn Track 4 tag first, then click Delete selected tag.";
+            selectedTagIdentity_{div_id} = null;
+            selectedTagSnapshot_{div_id} = null;
+            tagEditMode_{div_id} = false;
+            updateClientTagUndoRedoControls_{div_id}();
+            return;
+        }}
+
+        const items = loadClientVisualTags_{div_id}();
+        const removed = items.splice(idx, 1)[0];
+        removeHitRowsForTag_{div_id}(removed);
+        saveClientVisualTags_{div_id}(items);
+        saveClientVisualTagRedoStack_{div_id}([]);
+
+        selectedTagIdentity_{div_id} = null;
+        selectedTagSnapshot_{div_id} = null;
+        tagEditMode_{div_id} = false;
+        tagResizeActive_{div_id} = false;
+        tagResizeBoundary_{div_id} = null;
+
+        redrawClientTagsAfterEdit_{div_id}(
+            "Deleted " + ((removed && removed.label) || "selected drawn tag") + "."
+        );
+        updateClientTagUndoRedoControls_{div_id}();
+    }}
+
     function loadClientVisualTagRedoStack_{div_id}() {{
         if (!visualTagContextKey_{div_id}) {{
             return [];
@@ -988,7 +1262,9 @@ def render_chart(
     function updateClientTagUndoRedoControls_{div_id}() {{
         const activeTags = loadClientVisualTags_{div_id}();
         const redoTags = loadClientVisualTagRedoStack_{div_id}();
+        const hasSelectedTag = _selectedClientTagIndex_{div_id}() >= 0;
         _setButtonEnabled_{div_id}(undoClientTagBtn_{div_id}, activeTags.length > 0);
+        _setButtonEnabled_{div_id}(deleteClientTagBtn_{div_id}, hasSelectedTag);
         _setButtonEnabled_{div_id}(redoClientTagBtn_{div_id}, redoTags.length > 0);
         _setButtonEnabled_{div_id}(clearClientTagsBtn_{div_id}, activeTags.length > 0 || redoTags.length > 0);
         _setButtonEnabled_{div_id}(syncClientTagsBtn_{div_id}, activeTags.length > 0);
@@ -1488,6 +1764,11 @@ def render_chart(
         const endText = formatDateForStreamlit_{div_id}(endDate);
         const label = tagItem.label || "Dragged tag";
 
+        const isSelectedTag = (
+            selectedTagIdentity_{div_id} &&
+            _tagIdentity_{div_id}(tagItem) === selectedTagIdentity_{div_id}
+        );
+
         const trace = {{
             x: Array(24).fill(0.24),
             y: buildDateLine_{div_id}(startDate, endDate, 24),
@@ -1496,8 +1777,8 @@ def render_chart(
             xaxis: "x4",
             yaxis: "y4",
             line: {{
-                color: "rgba(128, 0, 128, 0.95)",
-                width: 7
+                color: isSelectedTag ? "rgba(0, 45, 130, 0.98)" : "rgba(128, 0, 128, 0.95)",
+                width: isSelectedTag ? 11 : 7
             }},
             showlegend: false,
             hovertemplate:
@@ -1696,34 +1977,6 @@ def render_chart(
         }} catch (e) {{}}
     }}
 
-    function _sameTagIntervalForHistory_{div_id}(row, tagItem) {{
-        const rowStart = _dateMs_{div_id}(row && row.tag_start);
-        const rowEnd = _dateMs_{div_id}(row && row.tag_end);
-        const tagStart = _dateMs_{div_id}(tagItem && tagItem.start);
-        const tagEnd = _dateMs_{div_id}(tagItem && tagItem.end);
-        if (rowStart === null || rowEnd === null || tagStart === null || tagEnd === null) return false;
-        return Math.abs(rowStart - tagStart) <= 1000 && Math.abs(rowEnd - tagEnd) <= 1000;
-    }}
-
-    function removeHitRowsForTag_{div_id}(tagItem) {{
-        if (!tagItem) return;
-        const kept = loadHitResultHistory_{div_id}().filter(function(row) {{
-            return !_sameTagIntervalForHistory_{div_id}(row, tagItem);
-        }});
-        saveHitResultHistory_{div_id}(kept);
-    }}
-
-    function removeHitRowsForTags_{div_id}(tagItems) {{
-        const tags = Array.isArray(tagItems) ? tagItems : [];
-        if (!tags.length) return;
-        const kept = loadHitResultHistory_{div_id}().filter(function(row) {{
-            return !tags.some(function(tag) {{
-                return _sameTagIntervalForHistory_{div_id}(row, tag);
-            }});
-        }});
-        saveHitResultHistory_{div_id}(kept);
-    }}
-
     function _rowIdentity_{div_id}(row) {{
         return [
             row.well || "",
@@ -1814,35 +2067,11 @@ def render_chart(
             .replaceAll("'", "&#039;");
     }}
 
-    function _hitRowMatchesSavedTag_{div_id}(row, tags) {{
-        if (!row || typeof row !== "object") return false;
-        const rowStart = _dateMs_{div_id}(row.tag_start);
-        const rowEnd = _dateMs_{div_id}(row.tag_end);
-        if (rowStart === null || rowEnd === null || rowEnd <= rowStart) return false;
-
-        return (tags || []).some(function(tag) {{
-            const tagStart = _dateMs_{div_id}(tag && tag.start);
-            const tagEnd = _dateMs_{div_id}(tag && tag.end);
-            if (tagStart === null || tagEnd === null || tagEnd <= tagStart) return false;
-            return Math.abs(tagStart - rowStart) <= 1000 && Math.abs(tagEnd - rowEnd) <= 1000;
-        }});
-    }}
-
     function initializeSavedHitResultsFromServer_{div_id}() {{
         const existing = loadHitResultHistory_{div_id}();
         const restored = Array.isArray(savedHitResultsFromServer_{div_id}) ? savedHitResultsFromServer_{div_id} : [];
         if (!restored.length) return;
-
-        // Critical: saved hit rows must belong to the saved Track 4 tags. Old
-        // browser history can contain stale rows from tags that were removed;
-        // those should not reappear after uploading a saved session.
-        const savedTags = _allTagIntervalsForResults_{div_id}();
-        const filtered = restored.filter(function(row) {{
-            return _hitRowMatchesSavedTag_{div_id}(row, savedTags);
-        }});
-        if (!filtered.length) return;
-
-        saveHitResultHistory_{div_id}(mergeHitResultRows_{div_id}(existing, filtered));
+        saveHitResultHistory_{div_id}(mergeHitResultRows_{div_id}(existing, restored));
     }}
 
     function rebuildHitResultsTable_{div_id}() {{
@@ -1960,7 +2189,7 @@ def render_chart(
         tagCaptureLayer_{div_id}.style.top = size.t + "px";
         tagCaptureLayer_{div_id}.style.width = size.w + "px";
         tagCaptureLayer_{div_id}.style.height = size.h + "px";
-        tagCaptureLayer_{div_id}.style.display = taggingMode_{div_id} ? "block" : "none";
+        tagCaptureLayer_{div_id}.style.display = (taggingMode_{div_id} || tagEditMode_{div_id}) ? "block" : "none";
     }}
 
     function setPlotlyPointerLockForTagging_{div_id}() {{
@@ -1970,12 +2199,12 @@ def render_chart(
         // These two lines are extra protection against Plotly zoom handlers
         // still reacting during tagging mode.
         if (fullLayout && fullLayout._draggers) {{
-            try {{ fullLayout._draggers.style("pointer-events", taggingMode_{div_id} ? "none" : "all"); }} catch (e) {{}}
+            try {{ fullLayout._draggers.style("pointer-events", (taggingMode_{div_id} || tagEditMode_{div_id}) ? "none" : "all"); }} catch (e) {{}}
         }}
 
         const dragLayer = gd_{div_id}.querySelector(".draglayer");
         if (dragLayer) {{
-            dragLayer.style.pointerEvents = taggingMode_{div_id} ? "none" : "auto";
+            dragLayer.style.pointerEvents = (taggingMode_{div_id} || tagEditMode_{div_id}) ? "none" : "auto";
         }}
     }}
 
@@ -2006,6 +2235,11 @@ def render_chart(
 
     function setZoomMode_{div_id}(mode) {{
         taggingMode_{div_id} = false;
+        selectedTagIdentity_{div_id} = null;
+        selectedTagSnapshot_{div_id} = null;
+        tagEditMode_{div_id} = false;
+        tagResizeActive_{div_id} = false;
+        tagResizeBoundary_{div_id} = null;
         tagDragActive_{div_id} = false;
         hideTagSelectionBox_{div_id}();
         updateTagCaptureLayer_{div_id}();
@@ -2046,6 +2280,11 @@ def render_chart(
 
     taggingBtn_{div_id}.onclick = function() {{
         taggingMode_{div_id} = !taggingMode_{div_id};
+        tagEditMode_{div_id} = false;
+        tagResizeActive_{div_id} = false;
+        tagResizeBoundary_{div_id} = null;
+        selectedTagIdentity_{div_id} = null;
+        selectedTagSnapshot_{div_id} = null;
         setTaggingButtonStyle_{div_id}();
 
         if (taggingMode_{div_id}) {{
@@ -2070,6 +2309,12 @@ def render_chart(
     if (undoClientTagBtn_{div_id}) {{
         undoClientTagBtn_{div_id}.onclick = function() {{
             undoLastClientVisualTag_{div_id}();
+        }};
+    }};
+
+    if (deleteClientTagBtn_{div_id}) {{
+        deleteClientTagBtn_{div_id}.onclick = function() {{
+            deleteSelectedClientTag_{div_id}();
         }};
     }};
 
@@ -2161,7 +2406,10 @@ def render_chart(
         resetChartZoom_{div_id}();
     }};
 
-    gd_{div_id}.on("plotly_doubleclick", function() {{
+    gd_{div_id}.on("plotly_doubleclick", function(eventData) {{
+        // In normal zoom mode, double-click keeps its old behavior: undo chart zoom.
+        // Tag selection is intentionally NOT allowed here. To edit a drawn tag,
+        // first press the Tagging button, then double-click the drawn tag.
         if (doubleClickLock_{div_id}) {{
             return false;
         }}
@@ -2209,29 +2457,6 @@ def render_chart(
         return num.toFixed(1);
     }}
 
-    function getPointRawValue_{div_id}(point) {{
-        if (!point) return "";
-
-        if (point.customdata !== undefined && point.customdata !== null) {{
-            if (Array.isArray(point.customdata) && point.customdata.length > 0) {{
-                return point.customdata[0];
-            }}
-            return point.customdata;
-        }}
-
-        try {{
-            const cd = point.data && point.data.customdata ? point.data.customdata : null;
-            const idx = point.pointIndex !== undefined ? point.pointIndex : point.pointNumber;
-            if (cd && idx !== undefined && cd[idx] !== undefined) {{
-                const row = cd[idx];
-                if (Array.isArray(row) && row.length > 0) return row[0];
-                return row;
-            }}
-        }} catch (e) {{}}
-
-        return point.x;
-    }}
-
     function showCustomHoverBox_{div_id}(eventData) {{
         if (!eventData || !eventData.points || eventData.points.length === 0) {{
             return;
@@ -2256,7 +2481,13 @@ def render_chart(
             parameterName = "Value";
         }}
 
-        let value = formatValue_{div_id}(getPointRawValue_{div_id}(point));
+        let value = "";
+
+        if (point.customdata && point.customdata.length > 0) {{
+            value = formatValue_{div_id}(point.customdata[0]);
+        }} else if (point.x !== undefined && point.x !== null) {{
+            value = formatValue_{div_id}(point.x);
+        }}
 
         const unit = meta.unit ? " " + meta.unit : "";
         const timeText = formatTimeOnly_{div_id}(point.y);
@@ -2366,14 +2597,72 @@ def render_chart(
         hideCustomHoverBox_{div_id}();
     }});
 
-    tagCaptureLayer_{div_id}.addEventListener("mousedown", function(event) {{
+    tagCaptureLayer_{div_id}.addEventListener("dblclick", function(event) {{
+        // The transparent tag-capture layer sits above Plotly while Tagging is ON.
+        // Therefore tag selection must be handled here, not through Plotly's
+        // plotly_doubleclick event. Selection/editing is intentionally available
+        // only while the Tagging button is active.
         if (!taggingMode_{div_id}) {{
+            return;
+        }}
+
+        if (doubleClickLock_{div_id}) {{
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }}
+
+        doubleClickLock_{div_id} = true;
+
+        const selected = selectNearestClientTagForEdit_{div_id}(event);
+
+        if (!selected) {{
+            instructionText_{div_id}.innerText =
+                "No drawn Track 4 tag was selected. Double-click directly on an existing purple drawn tag while Tagging is active.";
+        }}
+
+        setTimeout(function() {{
+            doubleClickLock_{div_id} = false;
+        }}, 450);
+
+        event.preventDefault();
+        event.stopPropagation();
+    }}, true);
+
+    tagCaptureLayer_{div_id}.addEventListener("mousedown", function(event) {{
+        if (!taggingMode_{div_id} && !tagEditMode_{div_id}) {{
             return;
         }}
 
         const plotY = getPlotMouseY_{div_id}(event);
 
         if (plotY === null) {{
+            return;
+        }}
+
+        if (tagEditMode_{div_id} && selectedTagIdentity_{div_id}) {{
+            const selectedTag = _selectedClientTag_{div_id}();
+
+            // If the user clicks anywhere in the chart except the selected tag,
+            // deselect it and turn it back to normal purple. Important: after
+            // deselecting, return immediately so the same click does NOT start
+            // drawing a new tag.
+            if (!_plotYInsideTag_{div_id}(plotY, selectedTag, 18)) {{
+                deselectClientTag_{div_id}("Tag deselected.");
+                hideTagSelectionBox_{div_id}();
+                tagDragActive_{div_id} = false;
+                tagDragStartY_{div_id} = null;
+                tagDragCurrentY_{div_id} = null;
+                event.preventDefault();
+                event.stopPropagation();
+                return;
+            }}
+
+            tagResizeActive_{div_id} = true;
+            tagResizeBoundary_{div_id} = null;
+            updateSelectedClientTagFromPlotY_{div_id}(plotY);
+            event.preventDefault();
+            event.stopPropagation();
             return;
         }}
 
@@ -2388,6 +2677,16 @@ def render_chart(
     }}, true);
 
     tagCaptureLayer_{div_id}.addEventListener("mousemove", function(event) {{
+        if (tagEditMode_{div_id} && tagResizeActive_{div_id} && selectedTagIdentity_{div_id}) {{
+            const plotY = getPlotMouseY_{div_id}(event);
+            if (plotY !== null) {{
+                updateSelectedClientTagFromPlotY_{div_id}(plotY);
+            }}
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }}
+
         if (!taggingMode_{div_id} || !tagDragActive_{div_id}) {{
             return;
         }}
@@ -2406,6 +2705,16 @@ def render_chart(
     }}, true);
 
     tagCaptureLayer_{div_id}.addEventListener("mouseup", function(event) {{
+        if (tagEditMode_{div_id} && tagResizeActive_{div_id}) {{
+            tagResizeActive_{div_id} = false;
+            tagResizeBoundary_{div_id} = null;
+            rebuildHitResultsTable_{div_id}();
+            updateClientTagUndoRedoControls_{div_id}();
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }}
+
         if (!taggingMode_{div_id} || !tagDragActive_{div_id}) {{
             return;
         }}
@@ -2431,6 +2740,16 @@ def render_chart(
         event.stopPropagation();
     }}, true);
 
+
+    document.addEventListener("mousedown", function(event) {{
+        // If a tag is selected and the user clicks elsewhere on the page
+        // outside this chart wrapper, clear the selection. Clicks inside the
+        // chart are handled by tagCaptureLayer above so tag editing remains safe.
+        if (!tagEditMode_{div_id} || !selectedTagIdentity_{div_id}) return;
+        if (wrapper_{div_id} && wrapper_{div_id}.contains(event.target)) return;
+        deselectClientTag_{div_id}("Tag deselected.");
+    }}, true);
+
     updateHistoryText_{div_id}();
     setTaggingButtonStyle_{div_id}();
     updateClientTagUndoRedoControls_{div_id}();
@@ -2442,4 +2761,5 @@ def render_chart(
         height=chart_height + 260,
         scrolling=True,
     )
+
 
