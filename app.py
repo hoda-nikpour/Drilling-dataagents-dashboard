@@ -1,5 +1,6 @@
 import gc
 import hashlib
+import uuid
 
 import pandas as pd
 import streamlit as st
@@ -439,10 +440,40 @@ def _virtual_dt_text(value) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _clamp_virtual_viewport_start(start, section_start, section_end, visible_hours: int = 12) -> pd.Timestamp:
+def _virtual_visible_delta(visible_hours: float = 12, visible_seconds=None) -> pd.Timedelta:
+    """Return the active virtual viewport duration.
+
+    The normal unzoomed viewport is 12 hours. After the user zooms in on the
+    time/Y axis, React sends the smaller visible span in seconds. Python then
+    loads only that zoomed span plus the configured margin, instead of snapping
+    the backend back to a 12-hour viewport.
+    """
+    if visible_seconds is not None:
+        try:
+            seconds = float(visible_seconds)
+        except Exception:
+            seconds = float(visible_hours) * 3600.0
+    else:
+        seconds = float(visible_hours) * 3600.0
+
+    max_seconds = max(float(visible_hours) * 3600.0, 30.0)
+    seconds = max(30.0, min(seconds, max_seconds))
+    return pd.Timedelta(seconds=seconds)
+
+
+def _clamp_virtual_viewport_start(
+    start,
+    section_start,
+    section_end,
+    visible_hours: float = 12,
+    visible_seconds=None,
+) -> pd.Timestamp:
     section_start = pd.Timestamp(section_start)
     section_end = pd.Timestamp(section_end)
-    visible_delta = pd.Timedelta(hours=int(visible_hours))
+    visible_delta = _virtual_visible_delta(
+        visible_hours=visible_hours,
+        visible_seconds=visible_seconds,
+    )
 
     if pd.isna(section_start) or pd.isna(section_end) or section_end <= section_start:
         return section_start
@@ -589,6 +620,32 @@ def _same_virtual_json_value(left, right) -> bool:
     return _virtual_json_safe(left) == _virtual_json_safe(right)
 
 
+def _ensure_fresh_virtual_session(context_key: str, *, loaded_dashboard_active: bool = False):
+    """Prepare per-browser-session state for the virtual React viewer.
+
+    A fresh dashboard start must not resurrect browser-local tags from an older
+    run. Saved dashboard uploads still restore their own tags through
+    visual_tag_intervals_<context_key> and saved_tags.
+    """
+    token_key = f"_virtual_browser_session_token_{context_key}"
+    if token_key not in st.session_state:
+        st.session_state[token_key] = uuid.uuid4().hex
+
+    initialized_key = f"_virtual_fresh_context_initialized_{context_key}"
+    if st.session_state.get(initialized_key):
+        return
+
+    if not loaded_dashboard_active:
+        for key in (
+            f"visual_tag_intervals_{context_key}",
+            f"hit_result_history_{context_key}",
+            f"virtual_tag_mode_{context_key}",
+        ):
+            st.session_state.pop(key, None)
+
+    st.session_state[initialized_key] = True
+
+
 def _build_virtual_window_info(
     time_df: pd.DataFrame,
     context_key: str,
@@ -611,16 +668,30 @@ def _build_virtual_window_info(
         return None
 
     viewport_key = f"virtual_viewport_start_{context_key}"
-    visible_delta = pd.Timedelta(hours=int(visible_hours))
-    margin_delta = pd.Timedelta(hours=int(margin_hours))
+    span_key = f"virtual_viewport_span_seconds_{context_key}"
+    max_visible_delta = _virtual_visible_delta(visible_hours=visible_hours)
+    max_visible_seconds = max_visible_delta.total_seconds()
+
+    try:
+        active_visible_seconds = float(st.session_state.get(span_key, max_visible_seconds))
+    except Exception:
+        active_visible_seconds = max_visible_seconds
+    active_visible_seconds = max(30.0, min(active_visible_seconds, max_visible_seconds))
+    visible_delta = _virtual_visible_delta(
+        visible_hours=visible_hours,
+        visible_seconds=active_visible_seconds,
+    )
+    margin_delta = pd.Timedelta(hours=float(margin_hours))
 
     viewport_start = _clamp_virtual_viewport_start(
         st.session_state.get(viewport_key, section_start),
         section_start,
         section_end,
         visible_hours=visible_hours,
+        visible_seconds=active_visible_seconds,
     )
     st.session_state[viewport_key] = viewport_start
+    st.session_state[span_key] = float(visible_delta.total_seconds())
 
     viewport_end = min(viewport_start + visible_delta, section_end)
     buffer_start = max(section_start, viewport_start - margin_delta)
@@ -639,8 +710,9 @@ def _build_virtual_window_info(
             f"{context_key}__virtual_"
             f"{_virtual_dt_text(viewport_start)}_{_virtual_dt_text(viewport_end)}"
         ),
-        "visible_hours": int(visible_hours),
-        "margin_hours": int(margin_hours),
+        "visible_hours": float(visible_hours),
+        "viewport_span_seconds": float(visible_delta.total_seconds()),
+        "margin_hours": float(margin_hours),
         "virtual": True,
     }
 
@@ -693,7 +765,12 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
                     chart_only=True,
                 )
             hit_key = f"hit_result_history_{context_key}"
-            safe_hit_results = _deduplicate_virtual_hit_results(hit_results, normalized_tags)
+            # React sends the current Hit results table, including both manual
+            # sidebar tags and browser-drawn tags. Do not filter this list with
+            # chart-only tags, otherwise manual-tag hit rows disappear from
+            # saved/restored sessions. React has already rebuilt the rows from
+            # the current tag set, so de-duplication is enough here.
+            safe_hit_results = _deduplicate_virtual_hit_results(hit_results, None)
             if not _same_virtual_json_value(st.session_state.get(hit_key, []), safe_hit_results):
                 st.session_state[hit_key] = safe_hit_results
                 state_changed = True
@@ -711,24 +788,45 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
 
     viewport_text = component_value.get("viewport_start")
     if viewport_text:
+        span_seconds = component_value.get("viewport_span_seconds")
+        try:
+            span_seconds = float(span_seconds)
+        except Exception:
+            span_seconds = 12 * 3600.0
+        span_seconds = max(30.0, min(span_seconds, 12 * 3600.0))
+
         viewport_start = _clamp_virtual_viewport_start(
             viewport_text,
             section_start,
             section_end,
             visible_hours=12,
+            visible_seconds=span_seconds,
         )
         key = f"virtual_viewport_start_{context_key}"
+        span_key = f"virtual_viewport_span_seconds_{context_key}"
         last_request_key = f"virtual_last_viewport_request_{context_key}"
-        request_fingerprint = _virtual_dt_text(viewport_start)
+        request_fingerprint = f"{_virtual_dt_text(viewport_start)}|{round(span_seconds, 3)}"
 
         # Do not execute the same window request repeatedly while Streamlit is
         # already processing reruns. This prevents old ScriptRunner messages from
         # creating an apparent reload loop.
-        if st.session_state.get(last_request_key) == request_fingerprint and st.session_state.get(key) == viewport_start:
+        old_span = st.session_state.get(span_key)
+        same_span = False
+        try:
+            same_span = abs(float(old_span) - float(span_seconds)) < 1.0
+        except Exception:
+            same_span = False
+
+        if (
+            st.session_state.get(last_request_key) == request_fingerprint
+            and st.session_state.get(key) == viewport_start
+            and same_span
+        ):
             return False
 
-        if st.session_state.get(key) != viewport_start:
+        if st.session_state.get(key) != viewport_start or not same_span:
             st.session_state[key] = viewport_start
+            st.session_state[span_key] = float(span_seconds)
             st.session_state[last_request_key] = request_fingerprint
             st.rerun()
 
@@ -799,12 +897,14 @@ def _render_virtual_log_component(
     )
     saved_hit_results = _deduplicate_virtual_hit_results(
         st.session_state.get(f"hit_result_history_{context_key}", []) or [],
-        [tag for tag in saved_tags if _is_virtual_chart_tag(tag)],
+        saved_tags,
     )
 
     result = render_virtual_log_viewer(
         key=f"virtual_log_viewer_{context_key}",
         context_key=context_key,
+        browser_session_token=str(st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh")),
+        restore_saved_dashboard=bool(st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)),
         selected_well=selected_well,
         selected_sections=list(selected_sections),
         section_start=_virtual_dt_text(window_info["section_start"]),
@@ -813,6 +913,7 @@ def _render_virtual_log_component(
         buffer_end=_virtual_dt_text(window_info["end"]),
         viewport_start=_virtual_dt_text(window_info["viewport_start"]),
         viewport_end=_virtual_dt_text(window_info["viewport_end"]),
+        viewport_span_seconds=float(window_info.get("viewport_span_seconds", 12 * 3600)),
         visible_hours=12,
         buffer_margin_hours=4,
         height=int(chart_height),
@@ -939,6 +1040,11 @@ def main():
         # a fresh app restart starts from the unzoomed/default view.
         st.session_state[f"_loaded_dashboard_active_{context_key}"] = True
 
+    _ensure_fresh_virtual_session(
+        context_key=context_key,
+        loaded_dashboard_active=bool(st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)),
+    )
+
     time_df = load_section_time_index(
         well=selected_well,
         sections=selected_sections,
@@ -950,8 +1056,8 @@ def main():
             value=True,
             key=f"use_virtual_log_viewer_{context_key}",
             help=(
-                "Wheel-scroll inside the plot. The browser shows a 12-hour viewport; "
-                "Python loads only that viewport plus a 4-hour margin. No downsampling."
+                "Use the left-side arrow rail to move through time. Mouse-wheel scrolls the main page only; "
+                "Python loads only the active viewport plus a 4-hour margin. No downsampling."
             ),
         )
 
@@ -1525,8 +1631,8 @@ def main():
 
     if use_virtual_log_viewer:
         st.caption(
-            "Virtual log viewer: wheel-scroll inside the plot. The browser moves through "
-            "a 12-hour viewport and asks Python for a new raw buffer near the edge. "
+            "Virtual log viewer: mouse-wheel scrolls the main page only. Hold the left-side "
+            "arrow rail to move through time and load the next raw buffer near the edge. "
             "Raw points are not downsampled."
         )
         _render_virtual_log_component(
@@ -1571,6 +1677,7 @@ if __name__ == "__main__":
         print("========== END DASHBOARD CRASH TRACEBACK ==========\n\n")
 
         raise
+
 
 
 

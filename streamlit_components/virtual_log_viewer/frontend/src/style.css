@@ -1,5 +1,5 @@
 body { margin: 0; font-family: Arial, sans-serif; }
-.vlv-root { width: 100%; }
+.vlv-root { width: 100%; outline: none; }
 .vlv-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; background:#f7f7f7; border:1px solid #d0d0d0; padding:6px 8px; }
 .vlv-toolbar button { padding: 6px 10px; border:1px solid #999; background:white; cursor:pointer; font-size:13px; }
 .vlv-toolbar button.active { background:#f3e8ff; border-color:#7e22ce; font-weight:700; }
@@ -7,7 +7,7 @@ body { margin: 0; font-family: Arial, sans-serif; }
 .vlv-toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
 .vlv-spacer { flex: 1 1 auto; min-width: 12px; }
 .vlv-caption { font-size: 12px; color:#555; margin-bottom:6px; }
-.vlv-wrap { position:relative; border:1px solid #ddd; background:white; overflow:hidden; overscroll-behavior: contain; }
+.vlv-wrap { position:relative; border:1px solid #ddd; background:white; overflow:hidden; overscroll-behavior: auto; }
 .vlv-plot { width:100%; height:100%; }
 .vlv-hover-line { position:absolute; left:0; width:100%; height:2px; background:rgba(40,40,40,.75); pointer-events:none; z-index:9999; display:none; }
 .vlv-hover-box { position:absolute; display:none; pointer-events:none; z-index:10000; background:rgba(255,255,255,.96); border:1px solid rgba(80,80,80,.35); box-shadow:0 2px 8px rgba(0,0,0,.18); padding:6px 8px; font-size:12px; line-height:1.25; color:#222; white-space:nowrap; }

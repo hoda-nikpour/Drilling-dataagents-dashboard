@@ -163,14 +163,37 @@ function stableJson(value) {
 }
 
 
-function chartTagStorageKey(contextKey) {
+function chartTagStorageKey(contextKey, sessionToken) {
+  const safeContext = String(contextKey || "default");
+  const safeSession = String(sessionToken || "fresh");
+  return `hoda_virtual_chart_tags_${safeContext}_${safeSession}`;
+}
+
+function latestChartTagStorageKey(contextKey) {
+  return `hoda_virtual_chart_tags_latest_${String(contextKey || "default")}`;
+}
+
+function legacyChartTagStorageKey(contextKey) {
   return `hoda_virtual_chart_tags_${String(contextKey || "default")}`;
 }
 
-function loadStoredChartTags(contextKey) {
+function hitResultStorageKey(contextKey, sessionToken) {
+  const safeContext = String(contextKey || "default");
+  const safeSession = String(sessionToken || "fresh");
+  return `hoda_hit_result_history_${safeContext}_${safeSession}`;
+}
+
+function latestHitResultStorageKey(contextKey) {
+  return `hoda_virtual_hit_results_latest_${String(contextKey || "default")}`;
+}
+
+function loadStoredChartTags(contextKey, sessionToken, allowLegacy = false) {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(chartTagStorageKey(contextKey));
+    let raw = window.localStorage.getItem(chartTagStorageKey(contextKey, sessionToken));
+    if (!raw && allowLegacy) {
+      raw = window.localStorage.getItem(legacyChartTagStorageKey(contextKey));
+    }
     const parsed = JSON.parse(raw || "[]");
     return dedupeTags(Array.isArray(parsed) ? parsed : []).filter(isChartTag);
   } catch (err) {
@@ -178,22 +201,48 @@ function loadStoredChartTags(contextKey) {
   }
 }
 
-function saveStoredChartTags(contextKey, items) {
+function saveStoredChartTags(contextKey, sessionToken, items) {
   if (typeof window === "undefined") return;
+  const safeChartTags = chartTagsForServer(items || []);
   try {
     window.localStorage.setItem(
-      chartTagStorageKey(contextKey),
-      JSON.stringify(chartTagsForServer(items || [])),
+      chartTagStorageKey(contextKey, sessionToken),
+      JSON.stringify(safeChartTags),
+    );
+    // Sidebar Save Dashboard Session reads this current-context latest key.
+    // It is overwritten with [] on fresh sessions, so old browser tags do not
+    // leak into a new save.
+    window.localStorage.setItem(
+      latestChartTagStorageKey(contextKey),
+      JSON.stringify(safeChartTags),
     );
   } catch (err) {
     // Browser storage failure should not break tag drawing.
   }
 }
 
-function clearStoredChartTags(contextKey) {
+function saveStoredHitRows(contextKey, sessionToken, rows) {
+  if (typeof window === "undefined") return;
+  const safeRows = Array.isArray(rows) ? rows : [];
+  try {
+    window.localStorage.setItem(
+      hitResultStorageKey(contextKey, sessionToken),
+      JSON.stringify(safeRows),
+    );
+    window.localStorage.setItem(
+      latestHitResultStorageKey(contextKey),
+      JSON.stringify(safeRows),
+    );
+  } catch (err) {
+    // Browser storage failure should not break plotting.
+  }
+}
+
+function clearStoredChartTags(contextKey, sessionToken) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.removeItem(chartTagStorageKey(contextKey));
+    window.localStorage.removeItem(chartTagStorageKey(contextKey, sessionToken));
+    window.localStorage.setItem(latestChartTagStorageKey(contextKey), "[]");
   } catch (err) {
     // Safe to ignore.
   }
@@ -282,7 +331,8 @@ function buildCurveTraces(trackData) {
         y: curve.y || [],
         xaxis: axis.xaxis,
         yaxis: axis.yaxis,
-        line: {width: 1.5, color: colors[curveIdx % colors.length]},
+        line: {width: 1.5, color: colors[curveIdx % colors.length], simplify: false},
+        connectgaps: false,
         name: `${curve.label}`,
         hoverinfo: "none",
         meta: {
@@ -323,6 +373,7 @@ function normalizeAgentIntervals(agentIntervals) {
 function App(props) {
   const args = props.args || {};
   const plotRef = useRef(null);
+  const rootRef = useRef(null);
   const wrapRef = useRef(null);
   const hoverLineRef = useRef(null);
   const hoverBoxRef = useRef(null);
@@ -359,6 +410,13 @@ function App(props) {
   const visibleHours = Number(args.visible_hours || 12);
   const marginHours = Number(args.buffer_margin_hours || 4);
   const visibleMs = visibleHours * HOUR_MS;
+  const browserSessionToken = String(args.browser_session_token || "fresh");
+  const restoreSavedDashboard = Boolean(args.restore_saved_dashboard);
+  const propViewportSpanMs = clamp(
+    Number(args.viewport_span_seconds || 0) > 0 ? Number(args.viewport_span_seconds) * 1000 : visibleMs,
+    MIN_VIEWPORT_SPAN_MS,
+    visibleMs,
+  );
 
   const sectionStartMs = toMs(args.section_start);
   const sectionEndMs = toMs(args.section_end);
@@ -367,10 +425,10 @@ function App(props) {
   const initialViewportStartMs = toMs(args.viewport_start) || bufferStartMs || sectionStartMs;
   if (initialPlotRangeRef.current == null) initialPlotRangeRef.current = initialViewportStartMs;
   if (viewportStartRef.current == null) viewportStartRef.current = initialViewportStartMs;
-  if (viewportSpanRef.current == null) viewportSpanRef.current = visibleMs;
+  if (viewportSpanRef.current == null) viewportSpanRef.current = propViewportSpanMs;
 
   const [viewportStartMs, setViewportStartMs] = useState(initialViewportStartMs);
-  const [viewportSpanMs, setViewportSpanMs] = useState(visibleMs);
+  const [viewportSpanMs, setViewportSpanMs] = useState(propViewportSpanMs);
   const [tagMode, setTagMode] = useState(Boolean(args.saved_tag_mode));
   const [zoomMode, setZoomModeState] = useState("y");
   const [zoomHistoryCount, setZoomHistoryCount] = useState(0);
@@ -378,11 +436,21 @@ function App(props) {
   const [tags, setTags] = useState(() =>
     mergeManualAndChartTags(
       Array.isArray(args.saved_tags) ? args.saved_tags : [],
-      loadStoredChartTags(args.context_key),
+      loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard),
     ),
   );
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [hitRows, setHitRows] = useState(Array.isArray(args.saved_hit_results) ? args.saved_hit_results : []);
+
+  useEffect(() => {
+    // Give the component keyboard focus on first render so T/Z work without
+    // needing the first mouse click on the Tagging button.
+    try {
+      rootRef.current?.focus?.({preventScroll: true});
+    } catch (err) {
+      // Safe to ignore in browsers that do not support focus options.
+    }
+  }, []);
 
   const clampViewport = useCallback(
     (ms, spanMs = null) => {
@@ -420,12 +488,15 @@ function App(props) {
 
     if (contextChanged) {
       const newStart = toMs(args.viewport_start) || bufferStartMs || sectionStartMs;
+      if (!restoreSavedDashboard) {
+        clearStoredChartTags(currentContextKey, browserSessionToken);
+      }
       contextKeyRef.current = currentContextKey;
       bufferKeyRef.current = currentBufferKey;
       initialPlotRangeRef.current = newStart;
       viewportStartRef.current = newStart;
-      viewportSpanRef.current = visibleMs;
-      setViewportSpanMs(visibleMs);
+      viewportSpanRef.current = propViewportSpanMs;
+      setViewportSpanMs(propViewportSpanMs);
       zoomHistoryRef.current = [];
       lastStatePayloadRef.current = "";
       suppressStateUpdateRef.current = true;
@@ -442,7 +513,7 @@ function App(props) {
       setViewportStartMs(clamped);
       requestLockRef.current = false;
     }
-  }, [args.context_key, args.viewport_start, bufferStartMs, bufferEndMs, sectionStartMs, clampViewport]);
+  }, [args.context_key, args.viewport_start, bufferStartMs, bufferEndMs, sectionStartMs, clampViewport, browserSessionToken, restoreSavedDashboard, propViewportSpanMs]);
 
   useEffect(() => {
     viewportStartRef.current = viewportStartMs;
@@ -457,12 +528,17 @@ function App(props) {
 
   useEffect(() => {
     const incomingServer = dedupeTags(Array.isArray(args.saved_tags) ? args.saved_tags : []);
-    const storedChart = loadStoredChartTags(args.context_key);
+    const storedChart = loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard);
     const incoming = mergeManualAndChartTags(incomingServer, storedChart);
 
     setTags((old) => {
       const current = dedupeTags(old);
-      const merged = mergeManualAndChartTags(incomingServer, [...storedChart, ...current.filter(isChartTag)]);
+      const merged = mergeManualAndChartTags(
+        incomingServer,
+        restoreSavedDashboard
+          ? [...storedChart, ...current.filter(isChartTag)]
+          : [...storedChart, ...current.filter(isChartTag)],
+      );
 
       if (stableJson(current) === stableJson(merged)) return old;
       suppressStateUpdateRef.current = true;
@@ -472,7 +548,7 @@ function App(props) {
       if (!oldId) return null;
       return incoming.some((tag) => tagKey(tag) === oldId || String(tag.created_at || "") === oldId) ? oldId : null;
     });
-  }, [JSON.stringify(args.saved_tags || []), args.context_key]);
+  }, [JSON.stringify(args.saved_tags || []), args.context_key, browserSessionToken, restoreSavedDashboard]);
 
   const agents = useMemo(() => normalizeAgentIntervals(args.agent_intervals), [JSON.stringify(args.agent_intervals || [])]);
 
@@ -571,10 +647,9 @@ function App(props) {
 
   const maybeRequestBuffer = useCallback(
     (startMs) => {
-      // Only the normal virtual-scroll mode is allowed to request new backend data.
-      // If the user is zooming or drawing tags, do not ask Python for new buffers.
+      // Only explicit left-side arrow scrolling is allowed to request new backend data.
+      // Tagging and zooming modes stay active while the arrow rail moves through time.
       if (requestLockRef.current || startMs == null) return;
-      if (tagModeRef.current) return;
       if (bufferStartMs == null || bufferEndMs == null) return;
 
       const activeVisibleMs = getActiveSpanMs();
@@ -595,7 +670,8 @@ function App(props) {
       if (hasUsefulTopMargin && hasUsefulBottomMargin) return;
 
       const roundedStartMs = Math.round(startMs / 1000) * 1000;
-      const bufferKey = `${fmtTime(bufferStartMs)}|${fmtTime(bufferEndMs)}|${fmtTime(roundedStartMs)}`;
+      const roundedSpanSeconds = Math.max(30, Math.round(activeVisibleMs / 1000));
+      const bufferKey = `${fmtTime(bufferStartMs)}|${fmtTime(bufferEndMs)}|${fmtTime(roundedStartMs)}|${roundedSpanSeconds}`;
       if (lastSentViewportRef.current === bufferKey) return;
 
       lastSentViewportRef.current = bufferKey;
@@ -605,6 +681,8 @@ function App(props) {
         event: "viewport_request",
         source: "arrow_scroll",
         viewport_start: fmtTime(roundedStartMs),
+        viewport_end: fmtTime(roundedStartMs + activeVisibleMs),
+        viewport_span_seconds: roundedSpanSeconds,
       });
 
       setTimeout(() => {
@@ -730,15 +808,19 @@ function App(props) {
     // stretched/compressed tags look as if the dashboard had refused the edit.
     const rows = buildHitRows(cleanTags);
     setHitRows((old) => (stableJson(old) === stableJson(rows) ? old : rows));
+    // Let the sidebar Save Dashboard Session button capture exactly the rows
+    // currently shown in the React Hit results table, including both manual
+    // sidebar tags and browser-drawn tags.
+    saveStoredHitRows(args.context_key, browserSessionToken, rows);
 
     // Critical change: drawing/editing a tag no longer calls Streamlit immediately.
     // Streamlit setComponentValue causes a rerun, which was remounting the plot and
     // starting the refresh loop. Keep chart tags local and persist them in browser
     // storage; sync them to Python only when the user presses "Save drawn tags".
-    saveStoredChartTags(args.context_key, cleanTags.filter(isChartTag));
+    saveStoredChartTags(args.context_key, browserSessionToken, cleanTags.filter(isChartTag));
     suppressStateUpdateRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(tags), args.context_key]);
+  }, [JSON.stringify(tags), args.context_key, browserSessionToken]);
 
 
 
@@ -898,10 +980,66 @@ function App(props) {
     applyZoomMode(mode);
   }
 
+  function toggleTaggingMode() {
+    setSelectedTagId(null);
+    setTagMode((current) => {
+      const next = !current;
+      tagModeRef.current = next;
+      return next;
+    });
+  }
+
   useEffect(() => {
     applyTagMode(tagMode);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tagMode]);
+
+  useEffect(() => {
+    function onKeyDown(event) {
+      if (isEditableKeyboardTarget(event.target)) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.repeat) return;
+
+      const key = String(event.key || "").toLowerCase();
+      if (key === "t") {
+        event.preventDefault();
+        event.stopPropagation?.();
+        toggleTaggingMode();
+        return;
+      }
+
+      if (key === "z") {
+        event.preventDefault();
+        event.stopPropagation?.();
+        chooseZoomMode(zoomModeRef.current || "y");
+      }
+    }
+
+    const targets = [];
+    function addKeyTarget(target) {
+      if (!target || targets.includes(target)) return;
+      try {
+        target.addEventListener("keydown", onKeyDown, true);
+        targets.push(target);
+      } catch (err) {
+        // Cross-frame access can fail in some deployments. The iframe handler below still works.
+      }
+    }
+
+    addKeyTarget(window);
+    try { addKeyTarget(window.document); } catch (err) {}
+    try { addKeyTarget(window.parent); } catch (err) {}
+    try { addKeyTarget(window.parent?.document); } catch (err) {}
+    try { addKeyTarget(window.top); } catch (err) {}
+    try { addKeyTarget(window.top?.document); } catch (err) {}
+
+    return () => {
+      targets.forEach((target) => {
+        try { target.removeEventListener("keydown", onKeyDown, true); } catch (err) {}
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function undoLastZoom() {
     const gd = plotRef.current;
@@ -1070,7 +1208,10 @@ function App(props) {
             const raw = p.customdata?.[0] ?? p.x;
             const rawNumber = Number(raw);
             const rawText = Number.isFinite(rawNumber) ? rawNumber.toFixed(1) : String(raw ?? "");
-            const time = String(p.y || "").split(" ")[1] || String(p.y || "");
+            // Use the real plotted timestamp carried in point.y. X values are
+            // normalized for track display, but Y is the true time axis. Do not
+            // derive the hover time from normalized X or truncate it to HH:MM:SS.
+            const time = String(p.y || "");
 
             box.innerHTML =
               `<b>${htmlEscape(meta.label || p.data?.name || "Value")}</b><br>` +
@@ -1179,6 +1320,27 @@ function App(props) {
     return bestDist <= 20 * 60 * 1000 ? best : null;
   }
 
+  function isClientYInsideTagId(clientY, tagId, tolerancePx = 14) {
+    const gd = plotRef.current;
+    if (!gd?._fullLayout?.yaxis || !gd?._fullLayout?._size || !tagId) return false;
+
+    const tag = tags.find((item) => tagKey(item) === tagId);
+    if (!tag || !isChartTag(tag)) return false;
+
+    try {
+      const rect = gd.getBoundingClientRect();
+      const plotY = clientY - rect.top - gd._fullLayout._size.t;
+      const startPixel = gd._fullLayout.yaxis.d2p(tag.start);
+      const endPixel = gd._fullLayout.yaxis.d2p(tag.end);
+      if (!Number.isFinite(startPixel) || !Number.isFinite(endPixel)) return false;
+      const top = Math.min(startPixel, endPixel) - tolerancePx;
+      const bottom = Math.max(startPixel, endPixel) + tolerancePx;
+      return plotY >= top && plotY <= bottom;
+    } catch (err) {
+      return false;
+    }
+  }
+
   function updateSelectBox(startY, curY) {
     const gd = plotRef.current;
     const box = selectBoxRef.current;
@@ -1227,6 +1389,81 @@ function App(props) {
     return x >= size.l && x <= size.l + size.w && y >= size.t && y <= size.t + size.h;
   }
 
+  function scrollParentPageBy(deltaY, deltaX = 0) {
+    const dy = Number(deltaY) || 0;
+    const dx = Number(deltaX) || 0;
+    if (!dy && !dx) return false;
+
+    try {
+      const parentWindow = window.parent || window.top;
+      const parentDoc = parentWindow?.document;
+
+      if (parentDoc) {
+        const frameAncestors = [];
+        try {
+          let node = window.frameElement;
+          while (node) {
+            frameAncestors.push(node);
+            node = node.parentElement;
+          }
+        } catch (err) {}
+
+        const directCandidates = [
+          ...frameAncestors,
+          parentDoc.querySelector('[data-testid="stAppViewContainer"]'),
+          parentDoc.querySelector('[data-testid="stMain"]'),
+          parentDoc.querySelector('.stApp'),
+          parentDoc.scrollingElement,
+          parentDoc.documentElement,
+          parentDoc.body,
+        ].filter(Boolean);
+
+        const allCandidates = [
+          ...directCandidates,
+          ...Array.from(parentDoc.querySelectorAll('main, section, div')).slice(0, 250),
+        ];
+
+        const scrollTarget = allCandidates.find((el) => {
+          try {
+            const style = parentWindow.getComputedStyle ? parentWindow.getComputedStyle(el) : null;
+            const canScrollY = el.scrollHeight > el.clientHeight + 2;
+            const overflowY = String(style?.overflowY || '').toLowerCase();
+            return canScrollY && overflowY !== 'hidden';
+          } catch (err) {
+            return false;
+          }
+        });
+
+        if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
+          scrollTarget.scrollBy({top: dy, left: dx, behavior: 'auto'});
+          return true;
+        }
+      }
+
+      if (parentWindow && typeof parentWindow.scrollBy === 'function') {
+        parentWindow.scrollBy({top: dy, left: dx, behavior: 'auto'});
+        return true;
+      }
+    } catch (err) {
+      // Cross-frame access can fail in some deployments. In that case, leave the
+      // event untouched so the browser can use its default scroll behavior.
+      return false;
+    }
+
+    return false;
+  }
+
+  function isEditableKeyboardTarget(target) {
+    if (!target) return false;
+    const tagName = String(target.tagName || '').toLowerCase();
+    return (
+      tagName === 'input' ||
+      tagName === 'textarea' ||
+      tagName === 'select' ||
+      Boolean(target.isContentEditable)
+    );
+  }
+
   function flushWheelScroll() {
     wheelRafRef.current = null;
 
@@ -1249,9 +1486,16 @@ function App(props) {
   }
 
   function onWheel(e) {
-    // The virtual log must never load new plot parts from mouse-wheel/page scroll.
-    // Only the explicit left-side arrow rail is allowed to move the time viewport.
-    return;
+    // Mouse wheel/trackpad scroll should scroll the main Streamlit page, even
+    // while the pointer is inside the plot iframe. It must never change the
+    // virtual time viewport or ask Python to load a new raw buffer.
+    if (e.ctrlKey || e.metaKey) return;
+
+    const forwarded = scrollParentPageBy(e.deltaY, e.deltaX);
+    if (forwarded) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
   }
 
   function stepArrowScroll(direction, dtMs = 120) {
@@ -1264,8 +1508,11 @@ function App(props) {
     const next = clampViewport(base + stepMs, activeVisibleMs);
     if (Math.abs(next - base) < 1) return;
 
+    suppressNextBufferRequestRef.current = false;
     viewportStartRef.current = next;
     setViewportStartMs(next);
+    setPlotViewport(next);
+    maybeRequestBuffer(next);
   }
 
   function arrowScrollFrame(ts) {
@@ -1281,6 +1528,8 @@ function App(props) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
     if (!direction) return;
+    try { rootRef.current?.focus?.({preventScroll: true}); } catch (err) {}
+    suppressNextBufferRequestRef.current = false;
     if (arrowScrollRef.current.rafId != null) cancelAnimationFrame(arrowScrollRef.current.rafId);
     arrowScrollRef.current = {active: true, direction, rafId: null, lastTs: 0};
     stepArrowScroll(direction, 180);
@@ -1301,9 +1550,11 @@ function App(props) {
     e.stopPropagation();
 
     if (selectedTagId) {
-      const id = nearestTagId(e.clientY);
-      if (id !== selectedTagId) {
+      if (!isClientYInsideTagId(e.clientY, selectedTagId, 18)) {
         setSelectedTagId(null);
+        hideSelectBox();
+        dragRef.current = {active: false, startY: null, currentY: null};
+        resizeRef.current = {active: false, boundary: null, tagId: null, startMs: null, endMs: null, previewStartMs: null, previewEndMs: null};
         return;
       }
 
@@ -1505,28 +1756,32 @@ function App(props) {
   const missCount = visibleRows.filter((r) => r.result === "Miss").length;
 
   return (
-    <div className="vlv-root">
+    <div className="vlv-root" ref={rootRef} tabIndex={0}>
       <div className="vlv-toolbar">
         <button disabled={zoomHistoryCount === 0} onClick={undoLastZoom}>Undo chart zoom</button>
         <button onClick={resetChartZoom}>Reset chart zoom</button>
 
         <button
           className={tagMode ? "active" : ""}
-          onClick={() => {
-            setSelectedTagId(null);
-            setTagMode((v) => {
-              const next = !v;
-              tagModeRef.current = next;
-              return next;
-            });
-          }}
+          onClick={toggleTaggingMode}
         >
           🏷 Tagging
         </button>
         <button disabled={!tags.some((tag) => String(tag.source || "") === "chart_drag")} onClick={undoLastClientTag}>Undo drag tag</button>
         <button disabled={!selectedTagId} onClick={deleteSelected}>🗑 Delete selected tag</button>
         <button disabled={!redoTags.length} onClick={redoLastClientTag}>Redo drag tag</button>
-        <button onClick={() => { clearStoredChartTags(args.context_key); setTags((old) => old.filter((tag) => !isChartTag(tag))); setSelectedTagId(null); setHitRows([]); setRedoTags([]); }}>Clear drag tags</button>
+        <button onClick={() => {
+          clearStoredChartTags(args.context_key, browserSessionToken);
+          setTags((old) => {
+            const remaining = old.filter((tag) => !isChartTag(tag));
+            const rows = buildHitRows(remaining);
+            setHitRows(rows);
+            saveStoredHitRows(args.context_key, browserSessionToken, rows);
+            return remaining;
+          });
+          setSelectedTagId(null);
+          setRedoTags([]);
+        }}>Clear drag tags</button>
         <button onClick={() => sendCurrentStateToStreamlit("manual_save")}>Save drawn tags</button>
         <button onClick={downloadHitResults}>Download hit results Excel</button>
 
@@ -1541,10 +1796,10 @@ function App(props) {
 
       <div className="vlv-caption">
         {tagMode
-          ? "Tagging is active. Drag vertically to draw a Track 4 tag. Tags stay local and the plot will not rerun while drawing. Press Save drawn tags when you want Python/session state updated."
+          ? "Tagging is active. Press Z for zoom mode. Mouse-wheel scrolls the main page only; hold the left arrow rail to move through time. Press Save drawn tags when you want Python/session state updated."
           : zoomHistoryCount > 0
-            ? "Chart is zoomed. Double-click or press Undo chart zoom to go back. Use the left arrow rail to scroll through time."
-            : "Choose X, Y, or XY zoom mode, then drag a rectangle inside the plot. Use only the left arrow rail to scroll through time; mouse-wheel/page scroll will not load plot parts."}
+            ? "Chart is zoomed. Press T for tagging or Z for zooming. Mouse-wheel scrolls the main page only; hold the left arrow rail to move through time."
+            : "Press T for tagging or Z for zooming. Mouse-wheel/page scroll will not load new plot parts; only the left arrow rail moves through time."}
       </div>
 
       <details className="vlv-hit" open>
@@ -1633,6 +1888,8 @@ function App(props) {
 
 const ConnectedApp = withStreamlitConnection(App);
 createRoot(document.getElementById("root")).render(<ConnectedApp />);
+
+
 
 
 
