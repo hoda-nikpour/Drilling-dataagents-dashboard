@@ -2,31 +2,123 @@
 # Python
 # =========================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
+
+# Python build / packaging
+build/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Python cache / test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
 
 # Virtual environments
 .venv/
 venv/
 env/
+ENV/
 .env
+.env.*
+!.env.example
+
+# =========================
+# Streamlit
+# =========================
+.streamlit/secrets.toml
+
+# Keep config if you want app settings in git
+# .streamlit/config.toml
+
+# =========================
+# React / Node / Vite frontend
+# =========================
+node_modules/
+**/node_modules/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+.vite/
+**/.vite/
+.cache/
+**/.cache/
+
+# Keep package-lock.json in git
+# package-lock.json
+
+# IMPORTANT:
+# Do NOT ignore frontend/dist yet, because your Streamlit component uses it.
+# If you later add an automatic npm build step in deployment/CI, then you can ignore:
+# streamlit_components/virtual_log_viewer/frontend/dist/
+
+# Optional old Vite build folder if generated separately
+streamlit_components/virtual_log_viewer/frontend/build/
 
 # =========================
 # System files
 # =========================
 .DS_Store
+Thumbs.db
 
 # =========================
-# Streamlit secrets
+# IDE / editor
 # =========================
-.streamlit/secrets.toml
+.vscode/
+.idea/
+*.swp
+*.swo
 
 # =========================
 # Logs
 # =========================
 *.log
+logs/
+*.out
+*.err
+
+# =========================
+# Local data / temporary exports
+# =========================
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Large/generated dashboard exports
+*.xlsx
+*.xls
+*.csv
+
+# If you have real source CSV/XLSX data that must be committed,
+# remove the two lines above or add exceptions like:
+# !data/catalog.csv
+# !data/example.xlsx
 
 # =========================
 # Local / experimental scripts
@@ -37,6 +129,11 @@ testscode.txt
 temp.txt
 
 # =========================
-# Jupyter (if you ever use it)
+# Jupyter
 # =========================
 .ipynb_checkpoints/
+
+# =========================
+# macOS / Python project extras
+# =========================
+.python-version

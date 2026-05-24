@@ -1503,23 +1503,16 @@ def _clear_plot_selection_for_window_change(context_key: str, plot_context_key: 
     st.session_state[active_key] = plot_context_key
 
 
-def render_window_pager(
+def _build_time_window_info(
     time_df: pd.DataFrame,
     context_key: str,
     window_hours: int = 12,
 ):
     """
-    Fixed 12-hour backend window browser.
+    Shared fixed-window calculation.
 
-    User flow:
-    - The user selects well/section only.
-    - The app loads TIME only.
-    - This pager selects the active 12-hour window.
-    - Only that window's curve data is loaded and plotted, with no downsampling.
-
-    Tags remain section-level through context_key. Plot selections are also
-    section-level now, so changing window keeps the previously selected
-    parameters and automatically plots them for the new window.
+    This does not render Previous/Next buttons. It only decides which 12-hour
+    window is active and returns the same structure app.py already expects.
     """
     if time_df.empty or not isinstance(time_df.index, pd.DatetimeIndex):
         st.sidebar.warning("No time data found for the selected section.")
@@ -1550,21 +1543,7 @@ def render_window_pager(
     current_index = int(st.session_state[index_key])
     selected_start = t_min + current_index * window_delta
     selected_end = min(selected_start + window_delta, t_max)
-
-    with st.sidebar:
-        st.subheader("Time Window")
-        st.caption(
-            "Fixed 12-hour windows. Only the active window is loaded and plotted. "
-            "Use the Previous/Next buttons below the chart to browse windows."
-        )
-
-        rows_in_window = len(time_df.loc[selected_start:selected_end])
-        st.caption(
-            f"Loaded window {current_index + 1} / {n_windows}: "
-            f"{selected_start.strftime('%Y-%m-%d %H:%M:%S')} → "
-            f"{selected_end.strftime('%Y-%m-%d %H:%M:%S')} | "
-            f"{rows_in_window:,} timestamps"
-        )
+    rows_in_window = len(time_df.loc[selected_start:selected_end])
 
     # Keep plot selections stable across windows. The active window still controls
     # which rows are loaded, but the sidebar parameter choices remain section-level.
@@ -1592,7 +1571,120 @@ def render_window_pager(
         "count": int(n_windows),
         "hours": int(window_hours),
         "plot_context_key": plot_context_key,
+        "rows_in_window": int(rows_in_window),
+        "index_key": index_key,
     }
+
+
+def render_window_pager(
+    time_df: pd.DataFrame,
+    context_key: str,
+    window_hours: int = 12,
+):
+    """
+    Fixed 12-hour backend window browser.
+
+    This function now renders only the compact window status in the sidebar.
+    The Previous/Next controls are rendered below the chart by
+    render_window_footer_controls(), so users can move to the next/previous
+    window after they reach the end of the four tracks.
+    """
+    window_info = _build_time_window_info(
+        time_df=time_df,
+        context_key=context_key,
+        window_hours=window_hours,
+    )
+
+    if window_info is None:
+        return None
+
+    with st.sidebar:
+        st.subheader("Time Window")
+        st.caption("Fixed 12-hour windows. Only the active window is loaded and plotted.")
+        st.caption(
+            f"Active window: {window_info['index'] + 1} / {window_info['count']}"
+        )
+        st.caption(
+            f"{window_info['start'].strftime('%Y-%m-%d %H:%M:%S')} → "
+            f"{window_info['end'].strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"{window_info['rows_in_window']:,} timestamps"
+        )
+
+    return window_info
+
+
+def render_window_footer_controls(
+    window_info: dict | None,
+    context_key: str,
+):
+    """
+    Render Previous/Next time-window controls below the chart.
+
+    The backend behavior is unchanged:
+    - only the active 12-hour window is loaded,
+    - selected parameters stay section-level,
+    - manual/chart-drawn tags and hit results remain section-level.
+    """
+    if not window_info:
+        return
+
+    current_index = int(window_info.get("index", 0))
+    n_windows = int(window_info.get("count", 1))
+    if n_windows <= 1:
+        return
+
+    st.markdown("---")
+    st.markdown("#### Continue time-window review")
+
+    st.caption(
+        f"Current 12-hour window {current_index + 1} / {n_windows}: "
+        f"{pd.Timestamp(window_info['start']).strftime('%Y-%m-%d %H:%M:%S')} → "
+        f"{pd.Timestamp(window_info['end']).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    col_prev, col_mid, col_next = st.columns([1.2, 2.2, 1.2])
+
+    index_key = str(window_info.get("index_key") or f"window_index_{context_key}")
+
+    with col_prev:
+        if st.button(
+            "← Previous 12-hour window",
+            key=f"bottom_window_prev_{context_key}",
+            disabled=current_index <= 0,
+            use_container_width=True,
+        ):
+            st.session_state[index_key] = max(0, current_index - 1)
+            st.session_state[f"_window_changed_{context_key}"] = True
+            st.rerun()
+
+    with col_mid:
+        st.markdown(
+            f"""
+            <div style="
+                text-align:center;
+                padding: 0.45rem 0.75rem;
+                border: 1px solid #ddd;
+                border-radius: 0.5rem;
+                background: #fafafa;
+                font-size: 0.92rem;
+            ">
+                Window {current_index + 1} of {n_windows}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with col_next:
+        if st.button(
+            "Next 12-hour window →",
+            key=f"bottom_window_next_{context_key}",
+            disabled=current_index >= n_windows - 1,
+            use_container_width=True,
+        ):
+            st.session_state[index_key] = min(n_windows - 1, current_index + 1)
+            st.session_state[f"_window_changed_{context_key}"] = True
+            st.rerun()
+
 def render_track_parameter_selector(available_param_labels: list[str], context_key: str):
     with st.sidebar:
         st.subheader("Track Parameters (Tracks 1–3)")
@@ -3703,13 +3795,22 @@ def render_agent_controls(
 
             st.success("Saved review restored for this well/section.")
 
-        # Review mode is intentionally not shown in the UI.
-        # Keep the setting in session_state for compatibility with saved sessions
-        # and downstream code, but always use the boss-preferred stretched view.
+        review_mode_options = ["Stretched inspection", "Standard review"]
         review_mode_key = f"review_mode_{context_key}"
-        st.session_state[review_mode_key] = "Stretched inspection"
-        review_mode = "Stretched inspection"
-        chart_height = 1400
+        if st.session_state.get(review_mode_key) not in review_mode_options:
+            st.session_state[review_mode_key] = "Stretched inspection"
+
+        review_mode = st.radio(
+            "Review mode",
+            options=review_mode_options,
+            key=review_mode_key,
+            horizontal=True,
+            help=(
+                "Stretched inspection gives a taller chart for detailed tagging. "
+                "Standard review uses a more compact chart."
+            ),
+        )
+        chart_height = 1400 if review_mode == "Stretched inspection" else 950
 
         show_reference_line = st.checkbox(
             "Show cross-track reference line",
@@ -4583,15 +4684,14 @@ def render_agent_review_outputs(
             file_name=safe_json_name,
         )
 
-        # CSV export is kept in the code but hidden from the normal UI.
-        if st.session_state.get(f"_show_hidden_csv_export_{context_key}", False):
-            st.download_button(
-                "Export tags/hits as CSV",
-                data=csv_text,
-                file_name=f"tag_review_{context_key}.csv",
-                mime="text/csv",
-                key=f"download_csv_{context_key}",
-            )
+        st.download_button(
+            "Export tags/hits as CSV",
+            data=csv_text,
+            file_name=f"tag_review_{context_key}.csv",
+            mime="text/csv",
+            key=f"download_csv_{context_key}",
+        )
+
 
 
 

@@ -1,4 +1,5 @@
 import gc
+import hashlib
 
 import pandas as pd
 import streamlit as st
@@ -31,6 +32,15 @@ from data_access.data_loader import (
     load_sections_for_columns,
     load_section_time_index,
 )
+
+from services.virtual_window_service import dataframe_to_track_payload
+
+try:
+    from streamlit_components.virtual_log_viewer import render_virtual_log_viewer
+    VIRTUAL_LOG_VIEWER_IMPORT_ERROR = None
+except Exception as e:
+    render_virtual_log_viewer = None
+    VIRTUAL_LOG_VIEWER_IMPORT_ERROR = e
 
 from services.dashboard_service import (
     build_context_parameter_aliases,
@@ -400,6 +410,433 @@ def _render_scroll_to_chart_top_once(context_key: str):
     )
 
 
+
+def _virtual_json_safe(obj):
+    """Convert Python/Pandas objects into Streamlit-component JSON-safe values."""
+    if obj is None:
+        return None
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    if isinstance(obj, pd.Timestamp):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if hasattr(obj, "strftime") and not isinstance(obj, str):
+        try:
+            return pd.Timestamp(obj).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        return {str(k): _virtual_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_virtual_json_safe(v) for v in obj]
+    return obj
+
+
+def _virtual_dt_text(value) -> str:
+    ts = pd.Timestamp(value)
+    return ts.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _clamp_virtual_viewport_start(start, section_start, section_end, visible_hours: int = 12) -> pd.Timestamp:
+    section_start = pd.Timestamp(section_start)
+    section_end = pd.Timestamp(section_end)
+    visible_delta = pd.Timedelta(hours=int(visible_hours))
+
+    if pd.isna(section_start) or pd.isna(section_end) or section_end <= section_start:
+        return section_start
+
+    latest_start = max(section_start, section_end - visible_delta)
+
+    try:
+        start = pd.Timestamp(start)
+    except Exception:
+        start = section_start
+
+    if pd.isna(start):
+        start = section_start
+    if start < section_start:
+        return section_start
+    if start > latest_start:
+        return latest_start
+    return start
+
+
+
+_CHART_DRAWN_TAG_SOURCES = {
+    "chart_drag",
+    "client_drag_tag",
+    "visual",
+    "visual_tag",
+    "dragged",
+    "server_tagger",
+}
+
+
+def _stable_virtual_tag_id(label: str, start_text: str, end_text: str, idx: int = 1) -> str:
+    """Create a deterministic id for older chart tags that do not yet have one."""
+    raw = f"{label}|{start_text}|{end_text}|{idx}".encode("utf-8", errors="ignore")
+    return "tag_" + hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _is_virtual_chart_tag(item: dict) -> bool:
+    return str(item.get("source") or "").strip() in _CHART_DRAWN_TAG_SOURCES
+
+
+def _normalize_virtual_component_tag(item, idx: int = 1, *, chart_only: bool = False) -> dict | None:
+    """Normalize a tag sent to/from the React virtual viewer."""
+    if not isinstance(item, dict):
+        return None
+
+    try:
+        start = pd.Timestamp(item.get("start"))
+        end = pd.Timestamp(item.get("end"))
+    except Exception:
+        return None
+
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return None
+
+    source = str(item.get("source") or "manual").strip() or "manual"
+    is_chart_tag = source in _CHART_DRAWN_TAG_SOURCES
+    if chart_only and not is_chart_tag:
+        return None
+
+    label = str(item.get("label") or (f"Dragged Tag {idx}" if is_chart_tag else f"Tag {idx}"))
+    start_text = _virtual_dt_text(start)
+    end_text = _virtual_dt_text(end)
+    created_at = str(item.get("created_at") or "").strip()
+    if is_chart_tag and not created_at:
+        created_at = _stable_virtual_tag_id(label, start_text, end_text, idx)
+
+    return {
+        "label": label,
+        "start": start_text,
+        "end": end_text,
+        "source": "chart_drag" if is_chart_tag else source,
+        "created_at": created_at,
+    }
+
+
+def _virtual_component_tag_identity(item: dict) -> tuple[str, str, str, str]:
+    created_at = str(item.get("created_at") or "").strip()
+    if created_at and _is_virtual_chart_tag(item):
+        return ("chart_id", created_at, "", "")
+    return (
+        str(item.get("source") or ""),
+        str(item.get("label") or ""),
+        str(item.get("start") or ""),
+        str(item.get("end") or ""),
+    )
+
+
+def _deduplicate_virtual_component_tags(items, *, chart_only: bool = False) -> list[dict]:
+    """Remove duplicate tag rows before they are saved or sent back to React."""
+    out: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    for idx, item in enumerate(items or [], start=1):
+        normalized = _normalize_virtual_component_tag(item, idx, chart_only=chart_only)
+        if normalized is None:
+            continue
+        ident = _virtual_component_tag_identity(normalized)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(normalized)
+
+    return out
+
+
+def _deduplicate_virtual_hit_results(rows, current_tags: list[dict] | None = None) -> list[dict]:
+    """Keep only one hit row per current tag interval and drop stale resize rows."""
+    safe_rows = _virtual_json_safe(rows or [])
+    if not isinstance(safe_rows, list):
+        return []
+
+    allowed = None
+    if current_tags is not None:
+        allowed = {
+            (
+                str(tag.get("label") or ""),
+                str(tag.get("start") or ""),
+                str(tag.get("end") or ""),
+            )
+            for tag in current_tags
+        }
+
+    out: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for row in safe_rows:
+        if not isinstance(row, dict):
+            continue
+        key = (
+            str(row.get("tag_label") or ""),
+            str(row.get("tag_start") or ""),
+            str(row.get("tag_end") or ""),
+        )
+        if allowed is not None and key not in allowed:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _same_virtual_json_value(left, right) -> bool:
+    return _virtual_json_safe(left) == _virtual_json_safe(right)
+
+
+def _build_virtual_window_info(
+    time_df: pd.DataFrame,
+    context_key: str,
+    visible_hours: int = 12,
+    margin_hours: int = 4,
+) -> dict | None:
+    """
+    Virtual viewer backend window.
+
+    Browser-visible range: 12 hours.
+    Python-loaded buffer: viewport plus 4 hours before/after.
+    No downsampling.
+    """
+    if time_df is None or time_df.empty:
+        return None
+
+    section_start = pd.Timestamp(time_df.index.min())
+    section_end = pd.Timestamp(time_df.index.max())
+    if pd.isna(section_start) or pd.isna(section_end) or section_end <= section_start:
+        return None
+
+    viewport_key = f"virtual_viewport_start_{context_key}"
+    visible_delta = pd.Timedelta(hours=int(visible_hours))
+    margin_delta = pd.Timedelta(hours=int(margin_hours))
+
+    viewport_start = _clamp_virtual_viewport_start(
+        st.session_state.get(viewport_key, section_start),
+        section_start,
+        section_end,
+        visible_hours=visible_hours,
+    )
+    st.session_state[viewport_key] = viewport_start
+
+    viewport_end = min(viewport_start + visible_delta, section_end)
+    buffer_start = max(section_start, viewport_start - margin_delta)
+    buffer_end = min(section_end, viewport_end + margin_delta)
+
+    return {
+        "index": 0,
+        "count": 1,
+        "start": buffer_start,
+        "end": buffer_end,
+        "viewport_start": viewport_start,
+        "viewport_end": viewport_end,
+        "section_start": section_start,
+        "section_end": section_end,
+        "plot_context_key": (
+            f"{context_key}__virtual_"
+            f"{_virtual_dt_text(viewport_start)}_{_virtual_dt_text(viewport_end)}"
+        ),
+        "visible_hours": int(visible_hours),
+        "margin_hours": int(margin_hours),
+        "virtual": True,
+    }
+
+
+def _apply_virtual_component_event(component_value, context_key: str, section_start, section_end) -> bool:
+    """Store React component changes and reload the raw buffer only when needed.
+
+    React now sends two different events:
+    - state_update: save chart-drawn tags and hit rows only.
+    - viewport_request: move the backend data window only.
+
+    Keeping these paths separate prevents tag drawing/resizing from accidentally
+    changing the virtual scroll position and triggering a rerun loop.
+    """
+    if not isinstance(component_value, dict):
+        return False
+
+    event_type = str(component_value.get("event") or "state_update").strip() or "state_update"
+    state_changed = False
+
+    if event_type == "state_update":
+        normalized_tags: list[dict] | None = None
+        tags = component_value.get("tags")
+        if isinstance(tags, list):
+            normalized_tags = _deduplicate_virtual_component_tags(tags, chart_only=True)
+            visual_key = f"visual_tag_intervals_{context_key}"
+            existing_tags = _deduplicate_virtual_component_tags(
+                st.session_state.get(visual_key, []) or [],
+                chart_only=True,
+            )
+            if not _same_virtual_json_value(existing_tags, normalized_tags):
+                st.session_state[visual_key] = normalized_tags
+                state_changed = True
+
+        # Preserve Tagging mode across the rerun caused by accepting a tag.
+        # Without this, one drawn tag remounts the component with Tagging off,
+        # so a second drag appears to be refused.
+        if "tag_mode" in component_value:
+            tag_mode_key = f"virtual_tag_mode_{context_key}"
+            new_tag_mode = bool(component_value.get("tag_mode"))
+            if st.session_state.get(tag_mode_key) != new_tag_mode:
+                st.session_state[tag_mode_key] = new_tag_mode
+                state_changed = True
+
+        hit_results = component_value.get("hit_results")
+        if isinstance(hit_results, list):
+            if normalized_tags is None:
+                normalized_tags = _deduplicate_virtual_component_tags(
+                    st.session_state.get(f"visual_tag_intervals_{context_key}", []) or [],
+                    chart_only=True,
+                )
+            hit_key = f"hit_result_history_{context_key}"
+            safe_hit_results = _deduplicate_virtual_hit_results(hit_results, normalized_tags)
+            if not _same_virtual_json_value(st.session_state.get(hit_key, []), safe_hit_results):
+                st.session_state[hit_key] = safe_hit_results
+                state_changed = True
+
+        return state_changed
+
+    if event_type != "viewport_request":
+        return False
+
+    # Accept backend window changes only from the React plot-area wheel handler.
+    # This is a server-side safety net for the browser/page-scroll mix-up: stale
+    # or accidental component values must not move the backend data window.
+    if str(component_value.get("source") or "") != "arrow_scroll":
+        return False
+
+    viewport_text = component_value.get("viewport_start")
+    if viewport_text:
+        viewport_start = _clamp_virtual_viewport_start(
+            viewport_text,
+            section_start,
+            section_end,
+            visible_hours=12,
+        )
+        key = f"virtual_viewport_start_{context_key}"
+        last_request_key = f"virtual_last_viewport_request_{context_key}"
+        request_fingerprint = _virtual_dt_text(viewport_start)
+
+        # Do not execute the same window request repeatedly while Streamlit is
+        # already processing reruns. This prevents old ScriptRunner messages from
+        # creating an apparent reload loop.
+        if st.session_state.get(last_request_key) == request_fingerprint and st.session_state.get(key) == viewport_start:
+            return False
+
+        if st.session_state.get(key) != viewport_start:
+            st.session_state[key] = viewport_start
+            st.session_state[last_request_key] = request_fingerprint
+            st.rerun()
+
+    return False
+
+
+def _parameter_units_from_catalog(labels: list[list[str]]) -> dict[str, str]:
+    units: dict[str, str] = {}
+    for track in labels:
+        for label in track:
+            units[str(label)] = str(PARAMETER_CATALOG.get(str(label), {}).get("unit", ""))
+    return units
+
+
+def _render_virtual_log_component(
+    *,
+    df: pd.DataFrame,
+    context_key: str,
+    selected_well: str,
+    selected_sections: tuple[str, ...],
+    track_params_real: list[list[str]],
+    track_param_labels: list[list[str]],
+    agent_cfg: dict,
+    window_info: dict,
+    chart_height: int,
+):
+    if render_virtual_log_viewer is None:
+        st.error(
+            "The virtual React log viewer is not available. Build the component first:\n\n"
+            "cd streamlit_components/virtual_log_viewer/frontend\n"
+            "npm install\n"
+            "npm run build"
+        )
+
+        if VIRTUAL_LOG_VIEWER_IMPORT_ERROR is not None:
+            st.exception(VIRTUAL_LOG_VIEWER_IMPORT_ERROR)
+
+        return None
+
+    track_payload = dataframe_to_track_payload(
+        df,
+        track_params_real=track_params_real[:3],
+        track_param_labels=track_param_labels[:3],
+        parameter_units=_parameter_units_from_catalog(track_param_labels[:3]),
+    )
+
+    manual_or_sidebar_tags = _deduplicate_virtual_component_tags(
+        agent_cfg.get("tag_intervals", []) or [],
+        chart_only=False,
+    )
+    visual_tags = _deduplicate_virtual_component_tags(
+        st.session_state.get(f"visual_tag_intervals_{context_key}", []) or [],
+        chart_only=True,
+    )
+
+    # agent_cfg["tag_intervals"] may already contain visual tags from the sidebar
+    # merge. Prefer the session-state visual tags because they carry the stable
+    # created_at id needed for resize/delete. Fall back to chart tags from
+    # agent_cfg only when session state has none, e.g. loaded older sessions.
+    manual_tags = [tag for tag in manual_or_sidebar_tags if not _is_virtual_chart_tag(tag)]
+    chart_tags_from_agent = [tag for tag in manual_or_sidebar_tags if _is_virtual_chart_tag(tag)]
+    chart_tags = visual_tags if visual_tags else chart_tags_from_agent
+    saved_tags = _virtual_json_safe(
+        _deduplicate_virtual_component_tags(
+            list(manual_tags) + list(chart_tags),
+            chart_only=False,
+        )
+    )
+    saved_hit_results = _deduplicate_virtual_hit_results(
+        st.session_state.get(f"hit_result_history_{context_key}", []) or [],
+        [tag for tag in saved_tags if _is_virtual_chart_tag(tag)],
+    )
+
+    result = render_virtual_log_viewer(
+        key=f"virtual_log_viewer_{context_key}",
+        context_key=context_key,
+        selected_well=selected_well,
+        selected_sections=list(selected_sections),
+        section_start=_virtual_dt_text(window_info["section_start"]),
+        section_end=_virtual_dt_text(window_info["section_end"]),
+        buffer_start=_virtual_dt_text(window_info["start"]),
+        buffer_end=_virtual_dt_text(window_info["end"]),
+        viewport_start=_virtual_dt_text(window_info["viewport_start"]),
+        viewport_end=_virtual_dt_text(window_info["viewport_end"]),
+        visible_hours=12,
+        buffer_margin_hours=4,
+        height=int(chart_height),
+        track_data=_virtual_json_safe(track_payload),
+        agent_intervals=_virtual_json_safe(agent_cfg.get("agent_intervals", []) or []),
+        saved_tags=saved_tags,
+        saved_hit_results=_virtual_json_safe(saved_hit_results),
+        saved_tag_mode=bool(st.session_state.get(f"virtual_tag_mode_{context_key}", False)),
+    )
+
+    component_state_changed = _apply_virtual_component_event(
+        result,
+        context_key=context_key,
+        section_start=window_info["section_start"],
+        section_end=window_info["section_end"],
+    )
+
+    # Do not call st.rerun() after a tag state_update. The React component keeps
+    # drawn/edited tags locally and browser-persisted, and Python stores them for
+    # later Save Dashboard Session/export use. Forcing an immediate rerun here is
+    # what made the Plotly component refresh and start the tag-disappear loop.
+    return result
+
+
 def render_bottom_window_navigation(window_info: dict, context_key: str):
     """
     Show Previous/Next controls directly below the four-track chart.
@@ -507,14 +944,33 @@ def main():
         sections=selected_sections,
     )
 
-    window_info = render_window_pager(
-        time_df=time_df,
-        context_key=context_key,
-        window_hours=12,
-    )
+    with st.sidebar:
+        use_virtual_log_viewer = st.toggle(
+            "Use smooth virtual log viewer",
+            value=True,
+            key=f"use_virtual_log_viewer_{context_key}",
+            help=(
+                "Wheel-scroll inside the plot. The browser shows a 12-hour viewport; "
+                "Python loads only that viewport plus a 4-hour margin. No downsampling."
+            ),
+        )
+
+    if use_virtual_log_viewer:
+        window_info = _build_virtual_window_info(
+            time_df=time_df,
+            context_key=context_key,
+            visible_hours=12,
+            margin_hours=4,
+        )
+    else:
+        window_info = render_window_pager(
+            time_df=time_df,
+            context_key=context_key,
+            window_hours=12,
+        )
 
     if window_info is None:
-        st.warning("No valid 12-hour time window is available for the selected section.")
+        st.warning("No valid time window is available for the selected section.")
         st.stop()
 
     selected_time_window = (window_info["start"], window_info["end"])
@@ -1067,18 +1523,36 @@ def main():
         unsafe_allow_html=True,
     )
 
-    render_chart(
-        fig,
-        chart_key,
-        visual_tag_context_key=context_key,
-        restore_saved_browser_zoom=False,
-        current_window_start=selected_time_window[0],
-        current_window_end=selected_time_window[1],
-        saved_hit_results=saved_hit_results,
-    )
+    if use_virtual_log_viewer:
+        st.caption(
+            "Virtual log viewer: wheel-scroll inside the plot. The browser moves through "
+            "a 12-hour viewport and asks Python for a new raw buffer near the edge. "
+            "Raw points are not downsampled."
+        )
+        _render_virtual_log_component(
+            df=df,
+            context_key=context_key,
+            selected_well=selected_well,
+            selected_sections=selected_sections,
+            track_params_real=track_params_real,
+            track_param_labels=track_param_labels,
+            agent_cfg=agent_cfg,
+            window_info=window_info,
+            chart_height=agent_cfg.get("chart_height", 950),
+        )
+    else:
+        render_chart(
+            fig,
+            chart_key,
+            visual_tag_context_key=context_key,
+            restore_saved_browser_zoom=False,
+            current_window_start=selected_time_window[0],
+            current_window_end=selected_time_window[1],
+            saved_hit_results=saved_hit_results,
+        )
 
-    render_bottom_window_navigation(window_info=window_info, context_key=context_key)
-    _render_scroll_to_chart_top_once(context_key)
+        render_bottom_window_navigation(window_info=window_info, context_key=context_key)
+        _render_scroll_to_chart_top_once(context_key)
 
     commit_undo_tracking()
 
@@ -1097,4 +1571,7 @@ if __name__ == "__main__":
         print("========== END DASHBOARD CRASH TRACEBACK ==========\n\n")
 
         raise
+
+
+
 

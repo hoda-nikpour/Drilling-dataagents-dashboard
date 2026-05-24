@@ -41,9 +41,8 @@ def render_result_tables(
     review_df: pd.DataFrame,
 ):
     if not activity_cfg["summary_df"].empty:
-        if st.session_state.get("_show_hidden_activity_summary", False):
-            with st.expander("Activity summary", expanded=False):
-                st.dataframe(activity_cfg["summary_df"], width="stretch")
+        with st.expander("Activity summary", expanded=False):
+            st.dataframe(activity_cfg["summary_df"], width="stretch")
 
     if symptom_cfg["intervals"]:
         symptom_rows = pd.DataFrame(symptom_cfg["intervals"])
@@ -57,8 +56,9 @@ def render_result_tables(
         with st.expander("Activity validation against manual tags", expanded=False):
             st.dataframe(activity_validation_df, width="stretch")
 
-    # Manual hit review table intentionally hidden from UI.
-    # The underlying review_df logic is still preserved in app.py.
+    if review_df is not None and not review_df.empty:
+        with st.expander("Manual hit review", expanded=False):
+            st.dataframe(review_df, width="stretch")
 
 
 
@@ -382,7 +382,6 @@ def render_chart(
                 </button>
 
                 <button id="sync_client_tags_btn_{div_id}" style="
-                    display: none;
                     padding: 6px 10px;
                     border: 1px solid #7e22ce;
                     background: #f8f0ff;

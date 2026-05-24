@@ -17,6 +17,15 @@
     `git commit -m "change"`
     `git push`
 
+    
+    `cd streamlit_components/virtual_log_viewer/frontend`
+    `rm -rf dist build`
+    `npm run build`
+
+    `cd ../../..`
+    `python3 -m streamlit run app.py`
+
+
     you should se something like this (which is showing that the project is running in local host):
     
    
