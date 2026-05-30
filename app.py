@@ -950,6 +950,8 @@ def _render_virtual_log_component(
         track_data=_virtual_json_safe(track_payload),
         agent_intervals=_virtual_json_safe(agent_cfg.get("agent_intervals", []) or []),
         show_agent_intervals=bool(agent_cfg.get("show_agent_intervals", True)),
+        selected_agent_name=str(agent_cfg.get("selected_agent", "") or ""),
+        agent_source=str(agent_cfg.get("agent_source", "") or ""),
         saved_tags=saved_tags,
         saved_hit_results=_virtual_json_safe(saved_hit_results),
         saved_tag_mode=bool(st.session_state.get(f"virtual_tag_mode_{context_key}", False)),

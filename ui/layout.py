@@ -472,7 +472,7 @@ def render_chart(
             color: #333;
         ">
             <summary style="cursor:pointer; font-weight:700; list-style-position:outside;">
-                Hit results
+                <span id="hit_results_title_{div_id}">Data agent tags and hit results</span>
                 <span id="hit_results_summary_{div_id}" style="color:#666; margin-left: 8px; font-weight:400;">No tags yet.</span>
             </summary>
             <div style="display: flex; justify-content: flex-end; gap: 8px; align-items: center; margin: 8px 0 6px 0;">
@@ -600,6 +600,35 @@ def render_chart(
     const serverAgentIntervals_{div_id} = {server_agent_intervals_json};
     const hitAgentIntervals_{div_id} = {hit_agent_intervals_json};
     const selectedAgentName_{div_id} = {selected_agent_name_json};
+
+    const hitResultsTitle_{div_id} = selectedAgentName_{div_id}
+        ? String(selectedAgentName_{div_id}) + " tags and hit results"
+        : (
+            Array.isArray(hitAgentIntervals_{div_id}) &&
+            hitAgentIntervals_{div_id}.length &&
+            hitAgentIntervals_{div_id}[0].label
+        )
+            ? String(hitAgentIntervals_{div_id}[0].label) + " tags and hit results"
+            : (
+                Array.isArray(serverAgentIntervals_{div_id}) &&
+                serverAgentIntervals_{div_id}.length &&
+                serverAgentIntervals_{div_id}[0].label
+            )
+                ? String(serverAgentIntervals_{div_id}[0].label) + " tags and hit results"
+                : "data agent tags and hit results";
+
+    const hitResultsTitleNode_{div_id} = document.getElementById("hit_results_title_{div_id}");
+    if (hitResultsTitleNode_{div_id}) {{
+        hitResultsTitleNode_{div_id}.innerText = hitResultsTitle_{div_id};
+    }}
+
+    function safeDownloadName_{div_id}(value) {{
+        return String(value || "data agent tags and hit results")
+            .replace(/[\\\\/:*?"<>|]+/g, "_")
+            .replace(/\\s+/g, " ")
+            .trim() || "data agent tags and hit results";
+    }}
+
     const serverTagIntervals_{div_id} = {server_tag_intervals_json};
     const savedHitResultsFromServer_{div_id} = {saved_hit_results_json};
     const currentWindowStart_{div_id} = "{current_window_start_text}";
@@ -2168,18 +2197,14 @@ def render_chart(
         table += "</tbody></table>";
 
         const html = "<html><head><meta charset='utf-8'></head><body>" +
-            "<h3>Data-agent tags and hit results</h3>" +
+            "<h3>" + _htmlEscape_{div_id}(hitResultsTitle_{div_id}) + "</h3>" +
             table + "</body></html>";
 
         const blob = new Blob([html], {{type: "application/vnd.ms-excel;charset=utf-8"}});
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        const agentFileName = (selectedAgentName_{div_id} || "data agent")
-            .replace(/[^A-Za-z0-9._ -]+/g, "_")
-            .replace(/\s+/g, " ")
-            .trim() || "data agent";
-        a.download = agentFileName + " tags and hit results.xls";
+        a.download = safeDownloadName_{div_id}(hitResultsTitle_{div_id}) + ".xls";
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);

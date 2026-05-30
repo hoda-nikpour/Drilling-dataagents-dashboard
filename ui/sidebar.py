@@ -4490,6 +4490,20 @@ def build_agent_cfg_from_controls(
     agent_source = controls.get("agent_source", "None")
     tag_intervals = controls.get("tag_intervals", [])
 
+    selected_agent_name = ""
+    if agent_source == "Activity agent":
+        selected_agent_name = (
+            activity_cfg.get("selected_activity")
+            or controls.get("activity_ui", {}).get("selected_activity", "")
+            or ""
+        )
+    elif agent_source == "Symptom agent":
+        selected_agent_name = (
+            symptom_cfg.get("selected_symptom")
+            or controls.get("symptom_ui", {}).get("selected_symptom", "")
+            or ""
+        )
+
     auto_agent_intervals = []
 
     if agent_source == "Activity agent" and activity_cfg and activity_cfg.get("intervals"):
@@ -4518,6 +4532,7 @@ def build_agent_cfg_from_controls(
 
     return {
         "agent_source": agent_source,
+        "selected_agent": selected_agent_name,
         "tag_intervals": tag_intervals,
         "agent_intervals": agent_intervals,
         "show_agent_intervals": bool(controls.get("show_agent_intervals", controls.get("show_data_agent_tags", True))),
@@ -5130,7 +5145,22 @@ def render_agent_review_outputs(
             context_key=context_key,
         )
 
-        default_json_name = f"tag_review_{context_key}"
+        selected_agent_name = str(agent_cfg.get("selected_agent", "") or "data_agent").strip()
+        selected_agent_name = selected_agent_name or "data_agent"
+
+        well_name = str(selected_well or "well").strip() or "well"
+        section_name = "_".join(str(sec).replace('"', "").strip() for sec in (selected_sections or []))
+        section_name = section_name or "section"
+
+        save_time_text = pd.Timestamp.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        default_json_name = (
+            f"{selected_agent_name} "
+            f"{well_name} "
+            f"{section_name} "
+            f"{save_time_text}"
+        )
+
         requested_json_name = st.text_input(
             "Dashboard session file name",
             value=default_json_name,

@@ -39,6 +39,15 @@ function htmlEscape(value) {
     .replaceAll("'", "&#039;");
 }
 
+function safeDownloadName(value, fallback = "data agent") {
+  const text = String(value || fallback)
+    .replace(/[\\/:*?"<>|]+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return text || fallback;
+}
+
 function normalize(values) {
   const nums = values.filter((v) => Number.isFinite(Number(v))).map(Number);
   if (!nums.length) return values.map(() => null);
@@ -666,6 +675,19 @@ function App(props) {
   const agents = useMemo(() => normalizeAgentIntervals(args.agent_intervals), [JSON.stringify(args.agent_intervals || [])]);
   const showAgentIntervals = args.show_agent_intervals !== false;
 
+  const selectedDataAgentName = useMemo(() => {
+    const direct = String(args.selected_agent_name || args.selected_agent || "").trim();
+    if (direct) return direct;
+
+    const firstAgent = agents.find((item) => String(item?.label || "").trim());
+    if (firstAgent) return String(firstAgent.label).trim();
+
+    return "data agent";
+  }, [args.selected_agent_name, args.selected_agent, agents]);
+
+  const hitResultsTitle = `${selectedDataAgentName} tags and hit results`;
+  
+  
   const trackFooters = useMemo(() => {
     const rows = [[], [], [], []];
     (args.track_data?.tracks || []).forEach((track) => {
@@ -2076,11 +2098,17 @@ function showTaggingHover(e) {
       table += "</tr>";
     });
     table += "</tbody></table>";
-    const blob = new Blob([`<html><body>${table}</body></html>`], {type: "application/vnd.ms-excel;charset=utf-8"});
+    const html =
+      `<html><head><meta charset="utf-8"></head><body>` +
+      `<h3>${htmlEscape(hitResultsTitle)}</h3>` +
+      table +
+      `</body></html>`;
+
+    const blob = new Blob([html], {type: "application/vnd.ms-excel;charset=utf-8"});
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "dragged_tag_hit_results.xls";
+    a.download = `${safeDownloadName(hitResultsTitle, "data agent tags and hit results")}.xls`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -2140,7 +2168,7 @@ function showTaggingHover(e) {
 
       <details className="vlv-hit" open>
         <summary style={{cursor: "pointer", fontWeight: 700}}>
-          Hit results
+          {hitResultsTitle}
           <span style={{color: "#666", marginLeft: 8, fontWeight: 400}}>
             {visibleRows.length ? `Tags: ${visibleRows.length} | Hits: ${hitCount} | Misses: ${missCount}` : "No dragged tags yet."}
           </span>
