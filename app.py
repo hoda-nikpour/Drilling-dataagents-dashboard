@@ -1103,16 +1103,20 @@ def main():
             time_df.index.max()
         ).strftime("%Y-%m-%d %H:%M:%S")
 
-    with st.sidebar:
-        use_virtual_log_viewer = st.toggle(
-            "Use smooth virtual log viewer",
-            value=True,
-            key=f"use_virtual_log_viewer_{context_key}",
-            help=(
-                "Use the left-side arrow rail to move through time. Mouse-wheel scrolls the main page only; "
-                "Python loads only the active viewport plus a 4-hour margin. No downsampling."
-            ),
-        )
+    use_virtual_log_viewer = True
+    st.session_state[f"use_virtual_log_viewer_{context_key}"] = True
+
+    if False:
+        with st.sidebar:
+            use_virtual_log_viewer = st.toggle(
+                "Use smooth virtual log viewer",
+                value=True,
+                key=f"use_virtual_log_viewer_{context_key}",
+                help=(
+                    "Use the left-side arrow rail to move through time. Mouse-wheel scrolls the main page only; "
+                    "Python loads only the active viewport plus a 4-hour margin. No downsampling."
+                ),
+            )
 
     if use_virtual_log_viewer:
         window_info = _build_virtual_window_info(
@@ -1290,15 +1294,15 @@ def main():
             f"Found numeric columns: {', '.join(discovered_params[:30])}"
         )
         st.stop()
-
-    with st.expander("Parameter catalog for review", expanded=False):
-        st.dataframe(
-            build_parameter_catalog_df(
-                label_to_column=label_to_column,
-                parameter_catalog=PARAMETER_CATALOG,
-            ),
-            width="stretch",
-        )
+    if False:
+        with st.expander("Parameter catalog for review", expanded=False):
+            st.dataframe(
+                build_parameter_catalog_df(
+                    label_to_column=label_to_column,
+                    parameter_catalog=PARAMETER_CATALOG,
+                ),
+                width="stretch",
+            )
 
     # If a saved dashboard session was uploaded and its normal track_params
     # widget values were empty in the JSON, recover the plot selections before
@@ -1603,42 +1607,42 @@ def main():
             f"{hash(str(agent_cfg.get('tag_intervals', [])))}_"
             f"{hash(str(symptom_cfg.get('intervals', [])))}"
         )
+        if False:
+            with st.expander(
+                "Presentation 1 — simple agent result summary",
+                expanded=False,
+            ):
+                st.caption(
+                    "Boss-friendly summary. One selected symptom at a time. "
+                    "This table compares manual tag intervals against selected agent intervals."
+                )
 
-        with st.expander(
-            "Presentation 1 — simple agent result summary",
-            expanded=False,
-        ):
-            st.caption(
-                "Boss-friendly summary. One selected symptom at a time. "
-                "This table compares manual tag intervals against selected agent intervals."
-            )
+                st.markdown(
+                    f"**Symptom:** {symptom_cfg.get('selected_symptom', '')}  \n"
+                    f"**Well:** {selected_well}  \n"
+                    f"**Section:** {', '.join(f'{str(sec)} in' for sec in selected_sections)}"
+                )
 
-            st.markdown(
-                f"**Symptom:** {symptom_cfg.get('selected_symptom', '')}  \n"
-                f"**Well:** {selected_well}  \n"
-                f"**Section:** {', '.join(f'{str(sec)} in' for sec in selected_sections)}"
-            )
+                st.dataframe(
+                    boss_presentation_df,
+                    width="stretch",
+                    key=boss_table_key,
+                )
 
-            st.dataframe(
-                boss_presentation_df,
-                width="stretch",
-                key=boss_table_key,
-            )
+                st.download_button(
+                    "Download Presentation 1 Excel",
+                    data=boss_excel_bytes,
+                    file_name=(
+                        f"agent_presentation_"
+                        f"{selected_well}_"
+                        f"{'_'.join(str(sec).replace('.', '_') for sec in selected_sections)}_"
+                        f"{symptom_cfg.get('selected_symptom', '')}.xlsx"
+                    ),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_boss_presentation_excel_{boss_table_key}",
+                )
 
-            st.download_button(
-                "Download Presentation 1 Excel",
-                data=boss_excel_bytes,
-                file_name=(
-                    f"agent_presentation_"
-                    f"{selected_well}_"
-                    f"{'_'.join(str(sec).replace('.', '_') for sec in selected_sections)}_"
-                    f"{symptom_cfg.get('selected_symptom', '')}.xlsx"
-                ),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"download_boss_presentation_excel_{boss_table_key}",
-            )
-
-        if not professional_review_df.empty:
+        if False and not professional_review_df.empty:
             with st.expander(
                 "Detailed evaluation table",
                 expanded=False,
@@ -1736,11 +1740,12 @@ def main():
     )
 
     if use_virtual_log_viewer:
-        st.caption(
-            "Virtual log viewer: mouse-wheel scrolls the main page only. Hold the left-side "
-            "arrow rail to move through time and load the next raw buffer near the edge. "
-            "Raw points are not downsampled."
-        )
+        if False:
+            st.caption(
+                "Virtual log viewer: mouse-wheel scrolls the main page only. Hold the left-side "
+                "arrow rail to move through time and load the next raw buffer near the edge. "
+                "Raw points are not downsampled."
+            )
         _render_virtual_log_component(
             df=df,
             context_key=context_key,

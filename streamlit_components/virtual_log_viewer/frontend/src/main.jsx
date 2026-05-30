@@ -1302,7 +1302,16 @@ function App(props) {
       displayModeBar: true,
       scrollZoom: false,
       doubleClick: false,
-      modeBarButtonsToRemove: ["lasso2d", "select2d", "zoom2d", "zoomIn2d", "zoomOut2d"],
+      modeBarButtonsToRemove: [
+        "lasso2d",
+        "select2d",
+        "zoom2d",
+        "zoomIn2d",
+        "zoomOut2d",
+        "pan2d",
+        "autoScale2d",
+        "resetScale2d",
+      ],
     };
 
     const safeLayout = {
@@ -2131,23 +2140,33 @@ function showTaggingHover(e) {
         >
           🏷 Tagging
         </button>
-        <button disabled={!tags.some((tag) => String(tag.source || "") === "chart_drag")} onClick={undoLastClientTag}>Undo drag tag</button>
+            
+
+        {false && (
+          <>
+            <button disabled={!tags.some((tag) => String(tag.source || "") === "chart_drag")} onClick={undoLastClientTag}>Undo drag tag</button>
+
+            <button disabled={!redoTags.length} onClick={redoLastClientTag}>Redo drag tag</button>
+
+            <button onClick={() => {
+              clearStoredChartTags(args.context_key, browserSessionToken);
+              setTags((old) => {
+                const remaining = old.filter((tag) => !isChartTag(tag));
+                const rows = buildHitRows(remaining);
+                setHitRows(rows);
+                saveStoredHitRows(args.context_key, browserSessionToken, rows);
+                return remaining;
+              });
+              setSelectedTagId(null);
+              setRedoTags([]);
+            }}>Clear drag tags</button>
+
+            <button onClick={() => sendCurrentStateToStreamlit("manual_save")}>Save drawn tags</button>
+          </>
+        )}
         <button disabled={!selectedTagId} onClick={deleteSelected}>🗑 Delete selected tag</button>
-        <button disabled={!redoTags.length} onClick={redoLastClientTag}>Redo drag tag</button>
-        <button onClick={() => {
-          clearStoredChartTags(args.context_key, browserSessionToken);
-          setTags((old) => {
-            const remaining = old.filter((tag) => !isChartTag(tag));
-            const rows = buildHitRows(remaining);
-            setHitRows(rows);
-            saveStoredHitRows(args.context_key, browserSessionToken, rows);
-            return remaining;
-          });
-          setSelectedTagId(null);
-          setRedoTags([]);
-        }}>Clear drag tags</button>
-        <button onClick={() => sendCurrentStateToStreamlit("manual_save")}>Save drawn tags</button>
         <button onClick={downloadHitResults}>Download hit results Excel</button>
+
 
         <span className="vlv-spacer" />
         <span style={{fontSize: 12, color: "#555"}}>Zoom mode:</span>
@@ -2157,15 +2176,15 @@ function showTaggingHover(e) {
 
         <span style={{fontSize: 12, color: "#555"}}>Chart zoom undo history: {zoomHistoryCount} / 10</span>
       </div>
-
-      <div className="vlv-caption">
-        {tagMode
-          ? "Tagging is active. Press Z for zoom mode or R to reset zoom. Hold the left arrow rail to move through time; double-click an arrow to jump 2 hours. Press Save drawn tags when you want Python/session state updated."
-          : zoomHistoryCount > 0
-            ? "Chart is zoomed. Press R to reset zoom. Press T for tagging or Z for zooming. Hold the left arrow rail to move through time; double-click an arrow to jump 2 hours."
-            : "Press T for tagging, Z for zooming, and R to reset zoom. Mouse-wheel/page scroll will not load new plot parts; hold the left arrow rail to move through time or double-click an arrow to jump 2 hours."}
-      </div>
-
+      {false && (
+        <div className="vlv-caption">
+          {tagMode
+            ? "Tagging is active. Press Z for zoom mode or R to reset zoom. Hold the left arrow rail to move through time; double-click an arrow to jump 2 hours."
+            : zoomHistoryCount > 0
+              ? "Chart is zoomed. Press R to reset zoom. Press T for tagging or Z for zooming. Hold the left arrow rail to move through time; double-click an arrow to jump 2 hours."
+              : "Press T for tagging, Z for zooming, and R to reset zoom. Mouse-wheel/page scroll will not load new plot parts; hold the left arrow rail to move through time or double-click an arrow to jump 2 hours."}
+        </div>
+      )}
       <details className="vlv-hit" open>
         <summary style={{cursor: "pointer", fontWeight: 700}}>
           {hitResultsTitle}
@@ -2245,7 +2264,7 @@ function showTaggingHover(e) {
           onDoubleClick={onDoubleClick}
         />
         <div ref={selectBoxRef} className="vlv-selection" />
-        <div ref={hoverLineRef} className="vlv-hover-line" />
+        {false && <div ref={hoverLineRef} className="vlv-hover-line" />}
         <div ref={hoverBoxRef} className="vlv-hover-box" />
       </div>
 

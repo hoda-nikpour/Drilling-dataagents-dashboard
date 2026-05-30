@@ -25,13 +25,14 @@ def render_dashboard_header(
 def render_review_caption(summary: dict):
     accepted_text = "Accepted" if summary.get("accepted", False) else "Not accepted yet"
 
-    st.caption(
-        f"Review summary — Tags: {summary.get('tag_count', 0)} | "
-        f"Hits: {summary.get('agent_count', 0)} | "
-        f"Overlap: {summary.get('overlap_count', 0)} / {summary.get('tag_count', 0)} | "
-        f"Score: {summary.get('score_percent', 0.0):.1f}% | "
-        f"Status: {accepted_text}"
-    )
+    if False:
+        st.caption(
+            f"Review summary — Tags: {summary.get('tag_count', 0)} | "
+            f"Hits: {summary.get('agent_count', 0)} | "
+            f"Overlap: {summary.get('overlap_count', 0)} / {summary.get('tag_count', 0)} | "
+            f"Score: {summary.get('score_percent', 0.0):.1f}% | "
+            f"Status: {accepted_text}"
+        )
 
 
 def render_result_tables(
@@ -263,6 +264,9 @@ def render_chart(
             "zoom2d",
             "zoomIn2d",
             "zoomOut2d",
+            "pan2d",
+            "autoScale2d",
+            "resetScale2d",
             "lasso2d",
             "select2d",
         ],
@@ -357,6 +361,7 @@ def render_chart(
                 </button>
 
                 <button id="undo_client_tag_btn_{div_id}" style="
+                    display: none;
                     padding: 6px 10px;
                     border: 1px solid #999;
                     background: white;
@@ -377,6 +382,7 @@ def render_chart(
                 </button>
 
                 <button id="redo_client_tag_btn_{div_id}" style="
+                    display: none;
                     padding: 6px 10px;
                     border: 1px solid #999;
                     background: white;
@@ -387,6 +393,7 @@ def render_chart(
                 </button>
 
                 <button id="clear_client_tags_btn_{div_id}" style="
+                    display: none;
                     padding: 6px 10px;
                     border: 1px solid #999;
                     background: white;

@@ -4220,21 +4220,22 @@ def render_data_agent_lane_and_settings(
     container = parent if parent is not None else st.sidebar
 
     with container:
-        show_agent_lane_choice = st.radio(
-            "Automatic data-agent tags in Track 4 lane",
-            options=["Show", "Hide"],
-            index=0,
-            horizontal=True,
-            key=f"show_auto_agent_tags_{context_key}",
-            help=(
-                "Show or hide the automatic data-agent intervals in the Track 4 "
-                "data-agent lane. This does not change the selected agent or hit calculations."
-            ),
-        )
+        show_agent_intervals = True
+        st.session_state[f"show_auto_agent_tags_{context_key}"] = "Show"
+        st.session_state[f"show_data_agent_tags_{context_key}"] = True
 
-        show_agent_intervals = show_agent_lane_choice == "Show"
-        st.session_state[f"show_data_agent_tags_{context_key}"] = show_agent_intervals
-
+        if False:
+            show_agent_lane_choice = st.radio(
+                "Automatic data-agent tags in Track 4 lane",
+                options=["Show", "Hide"],
+                index=0,
+                horizontal=True,
+                key=f"show_auto_agent_tags_{context_key}",
+                help="Show or hide the automatic data-agent intervals in the Track 4 data-agent lane. This does not change the selected agent or the hit calculations.",
+            )
+            show_agent_intervals = show_agent_lane_choice == "Show"
+            st.session_state[f"show_data_agent_tags_{context_key}"] = show_agent_intervals
+        
         activity_ui = _default_activity_ui(enabled=False, selected_activity="")
         symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
 
@@ -4281,7 +4282,8 @@ def render_track4_manual_tag_controls(
     container = parent if parent is not None else st.sidebar
 
     with container:
-        st.subheader("Track 4 — Review and Agent Track")
+        if False:
+            st.subheader("Track 4 — Review and Agent Track")
 
         t_min = df.index.min().to_pydatetime()
         t_max = df.index.max().to_pydatetime()
@@ -4328,28 +4330,31 @@ def render_track4_manual_tag_controls(
         review_mode = "Stretched inspection"
         chart_height = 1400
 
-        show_reference_line = st.checkbox(
-            "Show cross-track reference line",
-            value=False,
-            key=f"show_reference_line_{context_key}",
-        )
-
-        st.caption(
-            "This adds a fixed horizontal line at one timestamp across Track 1, "
-            "Track 2, Track 3, and Track 4. Use it to compare all curves and agent "
-            "events at the same time."
-        )
-
+        show_reference_line = False
         reference_time = None
-        if show_reference_line:
-            reference_time = st.slider(
-                "Reference time",
-                min_value=t_min,
-                max_value=t_max,
-                value=t_min,
-                format="YYYY-MM-DD HH:mm:ss",
-                key=f"reference_time_{context_key}",
+
+        if False:
+            show_reference_line = st.checkbox(
+                "Show cross-track reference line",
+                value=False,
+                key=f"show_reference_line_{context_key}",
             )
+
+            st.caption(
+                "This adds a fixed horizontal line at one timestamp across Track 1, "
+                "Track 2, Track 3, and Track 4. Use it to compare all curves and agent "
+                "events at the same time."
+            )
+
+            if show_reference_line:
+                reference_time = st.slider(
+                    "Reference time",
+                    min_value=t_min,
+                    max_value=t_max,
+                    value=t_min,
+                    format="YYYY-MM-DD HH:mm:ss",
+                    key=f"reference_time_{context_key}",
+                )
 
         tag_intervals = []
         manual_agent_intervals = []
@@ -5129,7 +5134,8 @@ def render_agent_review_outputs(
             )
 
         status_rows = summary["tag_status_rows"]
-        if status_rows:
+
+        if False and status_rows:
             st.markdown("**Manual review status**")
             for row in status_rows:
                 st.caption(f"{row['label']}: {row['status']}")
