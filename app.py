@@ -74,7 +74,8 @@ from ui.sidebar import (
     build_professional_symptom_review_df,
     build_trq_spike_evaluation_df,
     render_agent_picker_gate,
-    render_agent_controls,
+    render_data_agent_lane_and_settings,
+    render_track4_manual_tag_controls,
     render_agent_review_outputs,
     render_parameter_range_controls,
     render_review_loader_before_well_selector,
@@ -1200,12 +1201,12 @@ def main():
     # Create sidebar containers early, immediately after data agent is locked.
     # This allows agent settings, manual tags, and agent interval table to appear
     # before plot parameters are selected.
-    review_controls_container = st.sidebar.container()
-
-    agent_controls = render_agent_controls(
-        df=agent_df,
+    agent_controls = render_data_agent_lane_and_settings(
         context_key=context_key,
-        parent=review_controls_container,
+        agent_source=agent_gate_source,
+        selected_agent_internal=agent_gate_internal,
+        df=agent_df,
+        parent=st.sidebar,
     )
 
     activity_ui = agent_controls["activity_ui"]
@@ -1497,6 +1498,16 @@ def main():
         t_min=df.index.min(),
         t_max=df.index.max(),
     )
+
+    review_controls_container = st.sidebar.container()
+
+    track4_controls = render_track4_manual_tag_controls(
+        df=df,
+        context_key=context_key,
+        parent=review_controls_container,
+    )
+
+    agent_controls.update(track4_controls)
 
     if st.session_state.get("_show_hidden_time_sampling_window", False):
         with st.expander("Time sampling diagnostics — selected 12-hour window", expanded=False):

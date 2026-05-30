@@ -10,7 +10,14 @@
 3. After installing all libraries type below command in Terminal(cmd):
     `streamlit run app.py`
     `python -m compileall .`
-    `cd "/Users/nikpour/Desktop/PromAI/DrillMate 2026version/Dashboard/developmentcodesinpython/mudlogging-dashboard-demo_(rev02).part2_l10r chatgptprofveldandev2includedataagentsusing"`
+
+    `cd streamlit_components/virtual_log_viewer/frontend
+    rm -rf dist
+    npm install
+    npm run build
+    cd "/Users/nikpour/Desktop/PromAI/DrillMate 2026version/Dashboard/developmentcodesinpython/mudlogging-dashboard-demo_(rev02).part2_l10r chatgptprofveldandev2includedataagentsusing"
+    python3 -m compileall .
+    python3 -m streamlit run app.py`
 
     `git remote -v`
     `git status`

@@ -255,9 +255,6 @@ def _render_locked_agent_picker(context_key: str, parent=None):
 
         if agent_source != "None":
             st.success(f"Selected data agent: {display_name}")
-            st.caption(
-                "This agent choice is locked. Restart the dashboard session to choose a different data agent."
-            )
             return agent_source, display_name, internal_name
 
         agent_choice = st.selectbox(
@@ -1965,22 +1962,22 @@ def render_well_section_selector(sections_by_well: dict):
         return selected_well, locked_sections
 
 
-def render_agent_picker_gate(context_key: str):
-    with st.sidebar:
-        st.subheader("Step 3 — Choose Symptom / Activity Agent")
+# def render_agent_picker_gate(context_key: str):
+#     with st.sidebar:
+#         st.subheader("Step 3 — Choose Symptom / Activity Agent")
 
-    _apply_agent_picker_query_params(context_key)
+#     _apply_agent_picker_query_params(context_key)
 
-    agent_source, selected_agent_display, selected_agent_internal = _render_locked_agent_picker(
-        context_key=context_key,
-        parent=st.sidebar,
-    )
+#     agent_source, selected_agent_display, selected_agent_internal = _render_locked_agent_picker(
+#         context_key=context_key,
+#         parent=st.sidebar,
+#     )
 
-    if agent_source == "None":
-        with st.sidebar:
-            st.info("Choose one symptom/activity agent to open plotting and tagging options.")
+#     if agent_source == "None":
+#         with st.sidebar:
+#             st.info("Choose one symptom/activity agent to open plotting and tagging options.")
 
-    return agent_source, selected_agent_display, selected_agent_internal
+#     return agent_source, selected_agent_display, selected_agent_internal
 
 
 def render_agent_picker_gate(context_key: str):
@@ -2728,177 +2725,221 @@ def render_symptom_agent_controls(
 
         enabled = True
 
+        casing_depth_fallback = 0.0
+        open_hole_length_threshold_1 = 500.0
+        open_hole_length_threshold_2 = 750.0
+
+        trq_baseline_window = 60
+        trq_spike_ratio_level_1 = 1.25
+        trq_spike_ratio_level_2 = 1.40
+        trq_spike_zscore_min = 2.9
+        trq_spike_extreme_ratio = 1.80
+
+        trq_erratic_mean_long_window = 100
+        trq_erratic_ratio_level_1 = 1.10
+        trq_erratic_min_cycles = 3
+        trq_erratic_high_cycles = 20
+
+        pspike_baseline_window = 20
+        pspike_threshold_normal = 5.0
+        pspike_threshold_motor_on = 7.0
+        pspike_gap_fill_samples = 2
+        pspike_flow_delta_max = 50.0
+        pspike_rpm_delta_max = 3.0
+        pspike_wob_delta_max = 0.5
+
+        overpull_baseline_window = 20
+        overpull_threshold = 6.0
+        overpull_gap_fill_samples = 2
+
+        tookweight_baseline_window = 20
+        tookweight_threshold = 6.0
+        tookweight_gap_fill_samples = 2
+
+        hoisting_velocity_min = 0.15
+        hoisting_velocity_max = 1.5
+        
+
         with st.expander("Symptom thresholds — VT document definitions", expanded=False):
-            casing_depth_fallback = st.number_input(
-                "OpenHoleLength casing depth fallback (m, 0 = use Casing Depth column only)",
-                value=0.0,
-                min_value=0.0,
-                key=f"sym_ohl_casing_depth_{context_key}",
-            )
-            open_hole_length_threshold_1 = st.number_input(
-                "OpenHoleLength severity 1 (m)",
-                value=500.0,
-                key=f"sym_ohl_1_{context_key}",
-            )
-            open_hole_length_threshold_2 = st.number_input(
-                "OpenHoleLength severity 2 (m)",
-                value=750.0,
-                key=f"sym_ohl_2_{context_key}",
-            )
 
-            trq_baseline_window = st.number_input(
-                "TRQSpike mean-long window (preceding samples)",
-                min_value=10,
-                max_value=300,
-                value=60,
-                key=f"sym_trq_window_{context_key}",
-            )
-            trq_spike_ratio_level_1 = st.number_input(
-                "TRQSpike level 1 ratio",
-                value=1.25,
-                key=f"sym_trq_l1_{context_key}",
-            )
-            trq_spike_ratio_level_2 = st.number_input(
-                "TRQSpike level 2 ratio",
-                value=1.40,
-                key=f"sym_trq_l2_{context_key}",
-            )
+            if selected_symptom == "OpenHoleLength":
+                casing_depth_fallback = st.number_input(
+                    "OpenHoleLength casing depth fallback (m, 0 = use Casing Depth column only)",
+                    value=0.0,
+                    min_value=0.0,
+                    key=f"sym_ohl_casing_depth_{context_key}",
+                )
+                open_hole_length_threshold_1 = st.number_input(
+                    "OpenHoleLength severity 1 (m)",
+                    value=500.0,
+                    key=f"sym_ohl_1_{context_key}",
+                )
+                open_hole_length_threshold_2 = st.number_input(
+                    "OpenHoleLength severity 2 (m)",
+                    value=750.0,
+                    key=f"sym_ohl_2_{context_key}",
+                )
 
-            trq_spike_zscore_min = st.number_input(
-                "TRQSpike minimum z-value",
-                value=2.9,
-                key=f"sym_trq_zscore_min_{context_key}",
-                help="Minimum TRQ z-value required for normal TRQSpike detection.",
-            )
+            elif selected_symptom == "TRQSpike":
+                trq_baseline_window = st.number_input(
+                    "TRQSpike mean-long window (preceding samples)",
+                    min_value=10,
+                    max_value=300,
+                    value=60,
+                    key=f"sym_trq_window_{context_key}",
+                )
+                trq_spike_ratio_level_1 = st.number_input(
+                    "TRQSpike level 1 ratio",
+                    value=1.25,
+                    key=f"sym_trq_l1_{context_key}",
+                )
+                trq_spike_ratio_level_2 = st.number_input(
+                    "TRQSpike level 2 ratio",
+                    value=1.40,
+                    key=f"sym_trq_l2_{context_key}",
+                )
+                trq_spike_zscore_min = st.number_input(
+                    "TRQSpike minimum z-value",
+                    value=2.9,
+                    key=f"sym_trq_zscore_min_{context_key}",
+                )
+                trq_spike_extreme_ratio = st.number_input(
+                    "TRQSpike extreme ratio",
+                    value=1.80,
+                    key=f"sym_trq_extreme_ratio_{context_key}",
+                )
 
-            trq_spike_extreme_ratio = st.number_input(
-                "TRQSpike extreme ratio",
-                value=1.80,
-                key=f"sym_trq_extreme_ratio_{context_key}",
-                help="If TRQ ratio exceeds this value, the spike can pass even without the normal z-shape rule.",
-            )
+            elif selected_symptom == "TRQErratic":
+                trq_erratic_mean_long_window = st.number_input(
+                    "TRQErratic mean-long window",
+                    min_value=20,
+                    max_value=300,
+                    value=100,
+                    key=f"sym_trqerr_window_{context_key}",
+                )
+                trq_erratic_ratio_level_1 = st.number_input(
+                    "TRQErratic amplitude ratio",
+                    value=1.10,
+                    key=f"sym_trqerr_ratio_{context_key}",
+                )
+                trq_erratic_min_cycles = st.number_input(
+                    "TRQErratic minimum cycles",
+                    min_value=2,
+                    max_value=20,
+                    value=3,
+                    key=f"sym_trqerr_min_cycles_{context_key}",
+                )
+                trq_erratic_high_cycles = st.number_input(
+                    "TRQErratic high severity cycles",
+                    min_value=5,
+                    max_value=100,
+                    value=20,
+                    key=f"sym_trqerr_high_cycles_{context_key}",
+                )
 
-            trq_erratic_mean_long_window = st.number_input(
-                "TRQErratic mean-long window",
-                min_value=20,
-                max_value=300,
-                value=100,
-                key=f"sym_trqerr_window_{context_key}",
-            )
+            elif selected_symptom == "PSpike":
+                pspike_baseline_window = st.number_input(
+                    "PSpike baseline window",
+                    min_value=5,
+                    max_value=100,
+                    value=20,
+                    key=f"sym_ps_window_{context_key}",
+                )
+                pspike_threshold_normal = st.number_input(
+                    "PSpike threshold normal",
+                    value=5.0,
+                    key=f"sym_ps_norm_{context_key}",
+                )
+                pspike_threshold_motor_on = st.number_input(
+                    "PSpike threshold motor-on",
+                    value=7.0,
+                    key=f"sym_ps_motor_{context_key}",
+                )
+                pspike_gap_fill_samples = st.number_input(
+                    "PSpike gap fill (samples)",
+                    min_value=0,
+                    max_value=10,
+                    value=2,
+                    key=f"sym_ps_gap_{context_key}",
+                )
+                pspike_flow_delta_max = st.number_input(
+                    "PSpike max ΔMFI",
+                    value=50.0,
+                    key=f"sym_ps_dmfi_{context_key}",
+                )
+                pspike_rpm_delta_max = st.number_input(
+                    "PSpike max ΔRPM",
+                    value=3.0,
+                    key=f"sym_ps_drpm_{context_key}",
+                )
+                pspike_wob_delta_max = st.number_input(
+                    "PSpike max ΔWOB",
+                    value=0.5,
+                    key=f"sym_ps_dwob_{context_key}",
+                )
 
-            trq_erratic_ratio_level_1 = st.number_input(
-                "TRQErratic amplitude ratio",
-                value=1.10,
-                key=f"sym_trqerr_ratio_{context_key}",
-            )
+            elif selected_symptom == "OverPull":
+                overpull_baseline_window = st.number_input(
+                    "OverPull HKL baseline window",
+                    min_value=5,
+                    max_value=200,
+                    value=20,
+                    key=f"sym_op_window_{context_key}",
+                )
+                overpull_threshold = st.number_input(
+                    "OverPull HKL increase threshold",
+                    value=6.0,
+                    key=f"sym_op_thr_{context_key}",
+                )
+                overpull_gap_fill_samples = st.number_input(
+                    "OverPull gap fill",
+                    min_value=0,
+                    max_value=10,
+                    value=2,
+                    key=f"sym_op_gap_{context_key}",
+                )
+                hoisting_velocity_min = st.number_input(
+                    "Min hoisting velocity",
+                    value=0.15,
+                    key=f"sym_hoist_min_{context_key}",
+                )
+                hoisting_velocity_max = st.number_input(
+                    "Max hoisting velocity",
+                    value=1.5,
+                    key=f"sym_hoist_max_{context_key}",
+                )
 
-            trq_erratic_min_cycles = st.number_input(
-                "TRQErratic minimum cycles",
-                min_value=2,
-                max_value=20,
-                value=3,
-                key=f"sym_trqerr_min_cycles_{context_key}",
-            )
-
-            trq_erratic_high_cycles = st.number_input(
-                "TRQErratic high severity cycles",
-                min_value=5,
-                max_value=100,
-                value=20,
-                key=f"sym_trqerr_high_cycles_{context_key}",
-            )
-
-            pspike_baseline_window = st.number_input(
-                "PSpike baseline window",
-                min_value=5,
-                max_value=100,
-                value=20,
-                key=f"sym_ps_window_{context_key}",
-            )
-            pspike_threshold_normal = st.number_input(
-                "PSpike threshold normal",
-                value=5.0,
-                key=f"sym_ps_norm_{context_key}",
-            )
-            pspike_threshold_motor_on = st.number_input(
-                "PSpike threshold motor-on",
-                value=7.0,
-                key=f"sym_ps_motor_{context_key}",
-            )
-            pspike_gap_fill_samples = st.number_input(
-                "PSpike gap fill (samples)",
-                min_value=0,
-                max_value=10,
-                value=2,
-                key=f"sym_ps_gap_{context_key}",
-            )
-            pspike_flow_delta_max = st.number_input(
-                "PSpike max ΔMFI",
-                value=50.0,
-                key=f"sym_ps_dmfi_{context_key}",
-            )
-            pspike_rpm_delta_max = st.number_input(
-                "PSpike max ΔRPM",
-                value=3.0,
-                key=f"sym_ps_drpm_{context_key}",
-            )
-            pspike_wob_delta_max = st.number_input(
-                "PSpike max ΔWOB",
-                value=0.5,
-                key=f"sym_ps_dwob_{context_key}",
-            )
-
-            overpull_baseline_window = st.number_input(
-                "OverPull HKL baseline window",
-                min_value=5,
-                max_value=200,
-                value=20,
-                key=f"sym_op_window_{context_key}",
-            )
-            overpull_threshold = st.number_input(
-                "OverPull HKL increase threshold",
-                value=6.0,
-                key=f"sym_op_thr_{context_key}",
-            )
-            overpull_gap_fill_samples = st.number_input(
-                "OverPull gap fill",
-                min_value=0,
-                max_value=10,
-                value=2,
-                key=f"sym_op_gap_{context_key}",
-            )
-
-            tookweight_baseline_window = st.number_input(
-                "TookWeight HKL baseline window",
-                min_value=5,
-                max_value=200,
-                value=20,
-                key=f"sym_tw_window_{context_key}",
-            )
-            tookweight_threshold = st.number_input(
-                "TookWeight HKL drop threshold",
-                value=6.0,
-                key=f"sym_tw_thr_{context_key}",
-            )
-            tookweight_gap_fill_samples = st.number_input(
-                "TookWeight gap fill",
-                min_value=0,
-                max_value=10,
-                value=2,
-                key=f"sym_tw_gap_{context_key}",
-            )
-
-            hoisting_velocity_min = st.number_input(
-                "Min hoisting velocity",
-                value=0.15,
-                key=f"sym_hoist_min_{context_key}",
-            )
-            hoisting_velocity_max = st.number_input(
-                "Max hoisting velocity",
-                value=1.5,
-                key=f"sym_hoist_max_{context_key}",
-            )
-
+            elif selected_symptom == "TookWeight":
+                tookweight_baseline_window = st.number_input(
+                    "TookWeight HKL baseline window",
+                    min_value=5,
+                    max_value=200,
+                    value=20,
+                    key=f"sym_tw_window_{context_key}",
+                )
+                tookweight_threshold = st.number_input(
+                    "TookWeight HKL drop threshold",
+                    value=6.0,
+                    key=f"sym_tw_thr_{context_key}",
+                )
+                tookweight_gap_fill_samples = st.number_input(
+                    "TookWeight gap fill",
+                    min_value=0,
+                    max_value=10,
+                    value=2,
+                    key=f"sym_tw_gap_{context_key}",
+                )
+                hoisting_velocity_min = st.number_input(
+                    "Min hoisting velocity",
+                    value=0.15,
+                    key=f"sym_hoist_min_{context_key}",
+                )
+                hoisting_velocity_max = st.number_input(
+                    "Max hoisting velocity",
+                    value=1.5,
+                    key=f"sym_hoist_max_{context_key}",
+                )
+   
         cfg = SymptomConfig(
             casing_depth=None if float(casing_depth_fallback) <= 0 else float(casing_depth_fallback),
             open_hole_length_threshold_1=float(open_hole_length_threshold_1),
@@ -4169,8 +4210,70 @@ def build_boss_symptom_presentation_excel(
 
     return output.getvalue()
 
+def render_data_agent_lane_and_settings(
+    context_key: str,
+    agent_source: str,
+    selected_agent_internal: str,
+    df=None,
+    parent=None,
+):
+    container = parent if parent is not None else st.sidebar
 
-def render_agent_controls(
+    with container:
+        show_agent_lane_choice = st.radio(
+            "Automatic data-agent tags in Track 4 lane",
+            options=["Show", "Hide"],
+            index=0,
+            horizontal=True,
+            key=f"show_auto_agent_tags_{context_key}",
+            help=(
+                "Show or hide the automatic data-agent intervals in the Track 4 "
+                "data-agent lane. This does not change the selected agent or hit calculations."
+            ),
+        )
+
+        show_agent_intervals = show_agent_lane_choice == "Show"
+        st.session_state[f"show_data_agent_tags_{context_key}"] = show_agent_intervals
+
+        activity_ui = _default_activity_ui(enabled=False, selected_activity="")
+        symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
+
+        if agent_source == "Activity agent":
+            settings_container = st.expander("Activity Agent Settings", expanded=False)
+            activity_ui = render_activity_agent_controls(
+                context_key=context_key,
+                selected_activity=selected_agent_internal,
+                df=df,
+                parent=settings_container,
+            )
+            symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
+
+        elif agent_source == "Symptom agent":
+            activity_ui = _default_activity_ui(
+                enabled=True,
+                selected_activity="All activities",
+            )
+
+            settings_container = st.expander("Symptom Agent Settings", expanded=False)
+            symptom_ui = render_symptom_agent_controls(
+                context_key=context_key,
+                selected_symptom=selected_agent_internal,
+                parent=settings_container,
+            )
+
+    return {
+        "agent_source": agent_source,
+        "tag_intervals": [],
+        "manual_agent_intervals": [],
+        "show_agent_intervals": show_agent_intervals,
+        "show_data_agent_tags": show_agent_intervals,
+        "activity_ui": activity_ui,
+        "symptom_ui": symptom_ui,
+    }
+
+
+
+def render_track4_manual_tag_controls(
     df,
     context_key: str,
     parent=None,
@@ -4368,62 +4471,11 @@ def render_agent_controls(
             # Do not clamp tags to the current 12-hour window.
             st.session_state[visual_key] = _deduplicate_visual_tags(cleaned_visual_items)
 
-        st.markdown("**Agent lane**")
-
-        _apply_agent_picker_query_params(context_key)
-        agent_source, selected_agent_display, selected_agent_internal = _render_locked_agent_picker(
-            context_key=context_key,
-            parent=container,
-        )
-
-        show_agent_lane_choice = st.radio(
-            "Automatic data-agent tags in Track 4 lane",
-            options=["Show", "Hide"],
-            index=0,
-            horizontal=True,
-            key=f"show_auto_agent_tags_{context_key}",
-            help="Show or hide the automatic data-agent intervals in the Track 4 data-agent lane. This does not change the selected agent or the hit calculations.",
-        )
-        show_agent_intervals = show_agent_lane_choice == "Show"
-        st.session_state[f"show_data_agent_tags_{context_key}"] = show_agent_intervals
-
-        activity_ui = _default_activity_ui(enabled=False, selected_activity="")
-        symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
-        manual_agent_intervals = []
-
-        if agent_source == "Activity agent":
-            settings_container = st.expander("Activity Agent Settings", expanded=False)
-            activity_ui = render_activity_agent_controls(
-                context_key=context_key,
-                selected_activity=selected_agent_internal,
-                df=df,
-                parent=settings_container,
-            )
-            symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
-
-        elif agent_source == "Symptom agent":
-            # Symptom agents need activity labels/features internally, so the
-            # Activity Agent still runs in the background. It is not a second
-            # selected/lane-visible agent.
-            activity_ui = _default_activity_ui(enabled=True, selected_activity="All activities")
-
-            settings_container = st.expander("Symptom Agent Settings", expanded=False)
-            symptom_ui = render_symptom_agent_controls(
-                context_key=context_key,
-                selected_symptom=selected_agent_internal,
-                parent=settings_container,
-            )
-        else:
-            st.caption("No data agent selected yet.")
+        
 
     return {
-        "agent_source": agent_source,
         "tag_intervals": tag_intervals,
         "manual_agent_intervals": [],
-        "show_agent_intervals": show_agent_intervals,
-        "show_data_agent_tags": show_agent_intervals,
-        "activity_ui": activity_ui,
-        "symptom_ui": symptom_ui,
         "show_reference_line": show_reference_line,
         "reference_time": reference_time,
         "chart_height": chart_height,
@@ -5052,16 +5104,6 @@ def render_agent_review_outputs(
         threshold_text = f"{summary['acceptance_threshold_percent']:.0f}%"
         acceptance_text = "Accepted" if summary["accepted"] else "Not accepted yet"
 
-        st.caption(
-            f"Summary — Tags: {summary['tag_count']} | "
-            f"Hits: {summary['agent_count']} | "
-            f"Overlap: {summary['overlap_count']} / {summary['tag_count']}"
-        )
-
-        st.caption(
-            f"Score: {score_text} | Acceptance threshold: {threshold_text} | "
-            f"Status: {acceptance_text}"
-        )
 
         if manual_activity_tags:
             st.caption(
