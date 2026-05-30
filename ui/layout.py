@@ -41,24 +41,35 @@ def render_result_tables(
     review_df: pd.DataFrame,
 ):
     if not activity_cfg["summary_df"].empty:
-        with st.expander("Activity summary", expanded=False):
-            st.dataframe(activity_cfg["summary_df"], width="stretch")
+        if st.session_state.get("_show_hidden_activity_summary", False):
+            with st.expander("Activity summary", expanded=False):
+                st.dataframe(activity_cfg["summary_df"], width="stretch")
 
-    if symptom_cfg["intervals"]:
-        symptom_rows = pd.DataFrame(symptom_cfg["intervals"])
-        with st.expander("Symptom intervals", expanded=False):
+    interval_rows = symptom_cfg.get("intervals", []) or []
+    selected_agent = symptom_cfg.get("selected_agent", "")
+    agent_source = symptom_cfg.get("agent_source", "None")
+    should_show_agent_table = bool(interval_rows) or bool(selected_agent) or agent_source != "None"
+
+    if should_show_agent_table:
+        symptom_rows = pd.DataFrame(interval_rows)
+        table_title = symptom_cfg.get("interval_table_title", "Agent intervals")
+        with st.expander(table_title, expanded=False):
+            if selected_agent:
+                st.caption(f"Selected agent: {selected_agent}")
             interval_scope = symptom_cfg.get("interval_scope")
             if interval_scope:
                 st.caption(interval_scope)
-            st.dataframe(symptom_rows, width="stretch")
+            if symptom_rows.empty:
+                st.info("No intervals were detected for the selected data agent in the selected section.")
+            else:
+                st.dataframe(symptom_rows, width="stretch")
 
     if not activity_validation_df.empty:
         with st.expander("Activity validation against manual tags", expanded=False):
             st.dataframe(activity_validation_df, width="stretch")
 
-    if review_df is not None and not review_df.empty:
-        with st.expander("Manual hit review", expanded=False):
-            st.dataframe(review_df, width="stretch")
+    # Manual hit review table intentionally hidden from UI.
+    # The underlying review_df logic is still preserved in app.py.
 
 
 
@@ -214,6 +225,8 @@ def render_chart(
     current_window_start=None,
     current_window_end=None,
     saved_hit_results: list[dict] | None = None,
+    hit_agent_intervals: list[dict] | None = None,
+    selected_agent_name: str | None = None,
 ):
     """
     Render Plotly chart with controlled zoom tools and one custom cross-track
@@ -264,6 +277,8 @@ def render_chart(
 
     chart_height = int(fig.layout.height or 950)
     server_agent_intervals = _extract_track4_agent_intervals_from_fig(fig)
+    hit_agent_intervals_json = json.dumps(hit_agent_intervals or server_agent_intervals, ensure_ascii=False)
+    selected_agent_name_json = json.dumps(str(selected_agent_name or ""), ensure_ascii=False)
     server_agent_intervals_json = json.dumps(server_agent_intervals, ensure_ascii=False)
     server_tag_intervals = _extract_track4_tag_intervals_from_fig(fig)
     server_tag_intervals_json = json.dumps(server_tag_intervals, ensure_ascii=False)
@@ -382,6 +397,7 @@ def render_chart(
                 </button>
 
                 <button id="sync_client_tags_btn_{div_id}" style="
+                    display: none;
                     padding: 6px 10px;
                     border: 1px solid #7e22ce;
                     background: #f8f0ff;
@@ -457,7 +473,7 @@ def render_chart(
         ">
             <summary style="cursor:pointer; font-weight:700; list-style-position:outside;">
                 Hit results
-                <span id="hit_results_summary_{div_id}" style="color:#666; margin-left: 8px; font-weight:400;">No dragged tags yet.</span>
+                <span id="hit_results_summary_{div_id}" style="color:#666; margin-left: 8px; font-weight:400;">No tags yet.</span>
             </summary>
             <div style="display: flex; justify-content: flex-end; gap: 8px; align-items: center; margin: 8px 0 6px 0;">
                 <button id="download_hit_results_btn_{div_id}" style="
@@ -470,7 +486,7 @@ def render_chart(
                     Download hit results Excel
                 </button>
             </div>
-            <div id="hit_results_table_{div_id}" style="overflow-x:auto; margin-top: 6px;"></div>
+            <div id="hit_results_table_{div_id}" style="overflow-x:auto; overflow-y:auto; max-height:168px; margin-top: 6px;"></div>
         </details>
 
         <div id="{wrapper_id}" style="position: relative;">
@@ -582,6 +598,8 @@ def render_chart(
     const browserTagSessionToken_{div_id} = "{browser_tag_session_token}";
     const restoreSavedBrowserZoom_{div_id} = { "true" if restore_saved_browser_zoom else "false" };
     const serverAgentIntervals_{div_id} = {server_agent_intervals_json};
+    const hitAgentIntervals_{div_id} = {hit_agent_intervals_json};
+    const selectedAgentName_{div_id} = {selected_agent_name_json};
     const serverTagIntervals_{div_id} = {server_tag_intervals_json};
     const savedHitResultsFromServer_{div_id} = {saved_hit_results_json};
     const currentWindowStart_{div_id} = "{current_window_start_text}";
@@ -1417,6 +1435,16 @@ def render_chart(
         return _visibleAgentIntervalsFromPlotTraces_{div_id}();
     }}
 
+    function _hitAgentIntervals_{div_id}() {{
+        const agents = [];
+        (hitAgentIntervals_{div_id} || []).forEach(function(item) {{
+            const normalized = _normalizeServerAgentInterval_{div_id}(item || {{}});
+            if (normalized) agents.push(normalized);
+        }});
+        if (agents.length) return agents;
+        return _visibleAgentIntervals_{div_id}();
+    }}
+
 
     function _normalizeServerTagInterval_{div_id}(item) {{
         const startMs = _dateMs_{div_id}(item.start);
@@ -1425,11 +1453,10 @@ def render_chart(
 
         const source = String((item && item.source) || "").toLowerCase();
 
-        // Important:
-        // Only chart-drawn/restored chart tags should feed the browser Hit results.
-        // Manual/default Track 4 tagger traces can otherwise create a false
-        // 12-hour hit row immediately after the first plot is rendered.
-        if (source !== "chart_drag" && source !== "client_drag_tag") {{
+        // Only real user tags should feed the browser Hit results.
+        // Empty-source legacy/default traces are ignored, but section-level
+        // manual sidebar tags and chart-drawn tags are both valid.
+        if (!["manual", "chart_drag", "client_drag_tag"].includes(source)) {{
             return null;
         }}
 
@@ -1650,7 +1677,7 @@ def render_chart(
         const matchMax = tagMax + matchToleranceMs;
         const rawOverlaps = [];
 
-        _visibleAgentIntervals_{div_id}().forEach(function(agent) {{
+        _hitAgentIntervals_{div_id}().forEach(function(agent) {{
             const ovStart = Math.max(tagMin, agent.startMs);
             const ovEnd = Math.min(tagMax, agent.endMs);
 
@@ -2024,9 +2051,10 @@ def render_chart(
     }}
 
     function _selectedAgentNameForRows_{div_id}() {{
-        const agents = _visibleAgentIntervals_{div_id}();
+        if (selectedAgentName_{div_id}) return selectedAgentName_{div_id};
+        const agents = _hitAgentIntervals_{div_id}();
         if (agents.length && agents[0].label) return agents[0].label;
-        return "Agent hit";
+        return "Data agent";
     }}
 
     function _tagResultRows_{div_id}() {{
@@ -2040,6 +2068,7 @@ def render_chart(
             const percentValue = best ? (best.total_percent ?? best.percent ?? 0.0) : 0.0;
             rows.push({{
                 symptom: best ? (best.agent_name || defaultSymptom) : defaultSymptom,
+                data_agent: best ? (best.agent_name || defaultSymptom) : defaultSymptom,
                 well: visualTagContextKey_{div_id}.split("__")[0] || "",
                 section: (visualTagContextKey_{div_id}.split("__")[1] || "").replaceAll("_", " + "),
                 date: tagItem.start ? tagItem.start.split(" ")[0] : "",
@@ -2088,23 +2117,23 @@ def render_chart(
 
         hitResultsSummary_{div_id}.innerText = rows.length
             ? ("Tags: " + rows.length + " | Hits: " + hitCount + " | Misses: " + missCount)
-            : "No dragged tags yet.";
+            : "No tags yet.";
 
         if (!rows.length) {{
-            hitResultsTable_{div_id}.innerHTML = "<span style='color:#777'>Draw a tag on the chart to create the first hit-result row.</span>";
+            hitResultsTable_{div_id}.innerHTML = "<span style='color:#777'>Create a manual or drawn tag to show the first hit-result row.</span>";
             return;
         }}
 
         let html = "<table style='border-collapse:collapse;width:100%;font-size:12px;background:white'>";
         html += "<thead><tr>";
-        ["Symptom", "Well", "Section", "Date", "Tag Start", "Tag End", "Agent Start", "Agent End", "Result", "Percent"].forEach(function(col) {{
+        ["Data agent", "Well", "Section", "Date", "Tag Start", "Tag End", "Agent Start", "Agent End", "Result", "Percent"].forEach(function(col) {{
             html += "<th style='border:1px solid #ddd;padding:4px 6px;text-align:left;background:#f2f2f2'>" + col + "</th>";
         }});
         html += "</tr></thead><tbody>";
 
         rows.forEach(function(r) {{
             html += "<tr>";
-            [r.symptom, r.well, r.section, r.date, r.tag_start, r.tag_end, r.agent_start, r.agent_end, r.result, r.percent].forEach(function(value) {{
+            [r.data_agent || r.symptom, r.well, r.section, r.date, r.tag_start, r.tag_end, r.agent_start, r.agent_end, r.result, r.percent].forEach(function(value) {{
                 html += "<td style='border:1px solid #ddd;padding:4px 6px'>" + _htmlEscape_{div_id}(value) + "</td>";
             }});
             html += "</tr>";
@@ -2120,18 +2149,18 @@ def render_chart(
             _tagResultRows_{div_id}()
         );
         if (!rows.length) {{
-            alert("No dragged-tag hit results to download yet.");
+            alert("No tag hit results to download yet.");
             return;
         }}
 
         let table = "<table><thead><tr>";
-        ["Symptom", "Well", "Section", "Date", "Tag Start", "Tag End", "Agent Start", "Agent End", "Result", "Percent"].forEach(function(col) {{
+        ["Data agent", "Well", "Section", "Date", "Tag Start", "Tag End", "Agent Start", "Agent End", "Result", "Percent"].forEach(function(col) {{
             table += "<th>" + _htmlEscape_{div_id}(col) + "</th>";
         }});
         table += "</tr></thead><tbody>";
         rows.forEach(function(r) {{
             table += "<tr>";
-            [r.symptom, r.well, r.section, r.date, r.tag_start, r.tag_end, r.agent_start, r.agent_end, r.result, r.percent].forEach(function(value) {{
+            [r.data_agent || r.symptom, r.well, r.section, r.date, r.tag_start, r.tag_end, r.agent_start, r.agent_end, r.result, r.percent].forEach(function(value) {{
                 table += "<td>" + _htmlEscape_{div_id}(value) + "</td>";
             }});
             table += "</tr>";
@@ -2139,14 +2168,18 @@ def render_chart(
         table += "</tbody></table>";
 
         const html = "<html><head><meta charset='utf-8'></head><body>" +
-            "<h3>Presentation 1 — Agent hit results from dragged tags</h3>" +
+            "<h3>Data-agent tags and hit results</h3>" +
             table + "</body></html>";
 
         const blob = new Blob([html], {{type: "application/vnd.ms-excel;charset=utf-8"}});
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "dragged_tag_hit_results.xls";
+        const agentFileName = (selectedAgentName_{div_id} || "data agent")
+            .replace(/[^A-Za-z0-9._ -]+/g, "_")
+            .replace(/\s+/g, " ")
+            .trim() || "data agent";
+        a.download = agentFileName + " tags and hit results.xls";
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -2760,5 +2793,3 @@ def render_chart(
         height=chart_height + 260,
         scrolling=True,
     )
-
-

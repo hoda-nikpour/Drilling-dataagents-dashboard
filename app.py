@@ -1,3 +1,4 @@
+
 import gc
 import hashlib
 import uuid
@@ -72,6 +73,7 @@ from ui.sidebar import (
     build_manual_review_df,
     build_professional_symptom_review_df,
     build_trq_spike_evaluation_df,
+    render_agent_picker_gate,
     render_agent_controls,
     render_agent_review_outputs,
     render_parameter_range_controls,
@@ -127,7 +129,7 @@ def _build_fixed_time_windows_from_index(time_index, window_hours: int = 12) -> 
     return windows
 
 
-@st.cache_data(show_spinner="Computing section-wide symptom intervals …", max_entries=4)
+@st.cache_data(show_spinner="Computing section-wide agent intervals …", max_entries=4)
 def build_section_wide_symptom_intervals(
     well: str,
     sections: tuple[str, ...],
@@ -145,14 +147,26 @@ def build_section_wide_symptom_intervals(
     symptom_config,
 ) -> list[dict]:
     """
-    Compute selected symptom-agent intervals for the whole section without
+    Compute the selected data-agent intervals for the whole section without
     keeping the full section dataframe in memory.
 
-    The function loops through the same 12-hour windows, loads one window,
-    runs cleaning + activity + symptom agents, stores only interval rows, then
-    deletes the dataframe before moving to the next window.
+    Activity agents:
+    - loop through 12-hour windows
+    - load one temporary window
+    - run the selected activity classifier
+    - keep only interval rows for the selected activity
+    - delete the temporary dataframe
+
+    Symptom agents:
+    - loop through 12-hour windows
+    - run activity features in the background
+    - run the selected symptom agent
+    - keep only symptom interval rows
+    - delete the temporary dataframe
+
+    No raw section-wide dataframe is kept after each window is processed.
     """
-    if not activity_enabled or not symptom_enabled or not windows:
+    if not activity_enabled or not windows:
         return []
 
     all_intervals: list[dict] = []
@@ -194,22 +208,37 @@ def build_section_wide_symptom_intervals(
             activity_ui=activity_ui,
         )
 
-        symptom_cfg_part = run_symptom_agent(
-            df=df_part,
-            label_to_column=clean_label_to_column_part,
-            symptom_ui=symptom_ui,
-            activity_ui=activity_ui,
-            activity_cfg=activity_cfg_part,
-        )
+        if symptom_enabled:
+            symptom_cfg_part = run_symptom_agent(
+                df=df_part,
+                label_to_column=clean_label_to_column_part,
+                symptom_ui=symptom_ui,
+                activity_ui=activity_ui,
+                activity_cfg=activity_cfg_part,
+            )
+            interval_source = symptom_cfg_part.get("intervals", []) or []
+        else:
+            interval_source = activity_cfg_part.get("intervals", []) or []
+            if selected_activity and selected_activity != "All activities":
+                interval_source = [
+                    item for item in interval_source
+                    if str(item.get("label", "")) == str(selected_activity)
+                ]
 
-        for item in symptom_cfg_part.get("intervals", []) or []:
+        for item in interval_source:
             row = dict(item)
             row["window"] = win_idx
             row["window_start"] = start_text
             row["window_end"] = end_text
             all_intervals.append(row)
 
-        del df_part, activity_cfg_part, symptom_cfg_part
+        # Release the temporary loaded raw window before reading the next one.
+        if symptom_enabled:
+            try:
+                del symptom_cfg_part
+            except UnboundLocalError:
+                pass
+        del df_part, activity_cfg_part, interval_source
         gc.collect()
 
     all_intervals.sort(key=lambda x: pd.Timestamp(x.get("start")))
@@ -919,6 +948,7 @@ def _render_virtual_log_component(
         height=int(chart_height),
         track_data=_virtual_json_safe(track_payload),
         agent_intervals=_virtual_json_safe(agent_cfg.get("agent_intervals", []) or []),
+        show_agent_intervals=bool(agent_cfg.get("show_agent_intervals", True)),
         saved_tags=saved_tags,
         saved_hit_results=_virtual_json_safe(saved_hit_results),
         saved_tag_mode=bool(st.session_state.get(f"virtual_tag_mode_{context_key}", False)),
@@ -1013,13 +1043,17 @@ def main():
     loaded_review_payload = render_review_loader_before_well_selector()
 
     selected_well, selected_sections = render_well_section_selector(sections_by_well)
-    
+
+    if not selected_well:
+        st.stop()
+
     if not selected_sections:
-        st.warning("Please select at least one section from the sidebar.")
         st.stop()
 
     selected_sections = tuple(sorted(selected_sections, key=float))
     context_key = make_context_key(selected_well, selected_sections)
+
+    
 
     if loaded_review_payload is not None:
         pending_payload_key = f"_pending_loaded_review_payload_{context_key}"
@@ -1045,10 +1079,26 @@ def main():
         loaded_dashboard_active=bool(st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)),
     )
 
+    agent_gate_source, agent_gate_display, agent_gate_internal = render_agent_picker_gate(
+        context_key=context_key,
+    )
+
+    if agent_gate_source == "None":
+        st.stop()
+
+
     time_df = load_section_time_index(
         well=selected_well,
         sections=selected_sections,
     )
+
+    if time_df is not None and not time_df.empty:
+        st.session_state[f"_section_time_start_{context_key}"] = pd.Timestamp(
+            time_df.index.min()
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state[f"_section_time_end_{context_key}"] = pd.Timestamp(
+            time_df.index.max()
+        ).strftime("%Y-%m-%d %H:%M:%S")
 
     with st.sidebar:
         use_virtual_log_viewer = st.toggle(
@@ -1109,11 +1159,124 @@ def main():
     # Columns needed to compute data-agent intervals. This is intentionally
     # separate from plot/diagnostic columns so the section-wide interval table
     # can be built window-by-window without loading unnecessary plot columns.
+    
+    context_cleaning_rules = build_context_cleaning_rules(
+        selected_well=selected_well,
+        selected_sections=selected_sections,
+        global_rules=CLEANING_RULES,
+        well_rules=WELL_CLEANING_RULES,
+        section_rules=SECTION_CLEANING_RULES,
+    )
+    
     section_agent_requested_columns = build_requested_columns(
         selected_labels=[],
         required_activity_labels=required_activity_labels,
         required_symptom_labels=required_symptom_labels,
         label_to_column=label_to_column,
+    )
+
+    # Agent controls and agent intervals must be available immediately after
+    # the data agent is locked, before plot parameters are selected.
+    agent_df = load_sections_for_columns(
+        well=selected_well,
+        sections=selected_sections,
+        requested_columns=tuple(section_agent_requested_columns),
+        time_start=selected_time_window[0],
+        time_end=selected_time_window[1],
+    )
+
+    if agent_df.empty:
+        st.error("No data loaded for the selected agent inputs.")
+        st.stop()
+
+    agent_df, agent_clean_label_to_column, agent_cleaning_summary_df = apply_cleaning_layer(
+        df=agent_df,
+        label_to_column=label_to_column,
+        cleaning_rules=context_cleaning_rules,
+        required_activity_labels=required_activity_labels,
+        required_symptom_labels=required_symptom_labels,
+    )
+
+    # Create sidebar containers early, immediately after data agent is locked.
+    # This allows agent settings, manual tags, and agent interval table to appear
+    # before plot parameters are selected.
+    review_controls_container = st.sidebar.container()
+
+    agent_controls = render_agent_controls(
+        df=agent_df,
+        context_key=context_key,
+        parent=review_controls_container,
+    )
+
+    activity_ui = agent_controls["activity_ui"]
+    symptom_ui = agent_controls["symptom_ui"]
+
+    activity_cfg = run_activity_agent(
+        df=agent_df,
+        label_to_column=agent_clean_label_to_column,
+        activity_ui=activity_ui,
+    )
+
+    if activity_ui["enabled"] and not activity_cfg["labels"].empty:
+        agent_df["activity"] = activity_cfg["labels"]
+
+    symptom_cfg = run_symptom_agent(
+        df=agent_df,
+        label_to_column=agent_clean_label_to_column,
+        symptom_ui=symptom_ui,
+        activity_ui=activity_ui,
+        activity_cfg=activity_cfg,
+    )
+
+    section_windows = _build_fixed_time_windows_from_index(
+        time_df.index,
+        window_hours=12,
+    )
+
+    section_window_tuple = tuple(
+        (
+            item["start"].strftime("%Y-%m-%d %H:%M:%S"),
+            item["end"].strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        for item in section_windows
+    )
+
+    section_wide_agent_intervals = build_section_wide_symptom_intervals(
+        well=selected_well,
+        sections=selected_sections,
+        windows=section_window_tuple,
+        requested_columns=tuple(section_agent_requested_columns),
+        label_to_column=label_to_column,
+        cleaning_rules=context_cleaning_rules,
+        required_activity_labels=tuple(required_activity_labels),
+        required_symptom_labels=tuple(required_symptom_labels),
+        activity_enabled=bool(activity_ui.get("enabled", False)),
+        selected_activity=str(activity_ui.get("selected_activity", "All activities")),
+        activity_config=activity_ui.get("config"),
+        symptom_enabled=bool(symptom_ui.get("enabled", False)),
+        selected_symptom=str(symptom_ui.get("selected_symptom", "")),
+        symptom_config=symptom_ui.get("config"),
+    )
+
+    selected_agent_label = ""
+    if agent_controls.get("agent_source") == "Activity agent":
+        selected_agent_label = str(activity_ui.get("selected_activity", ""))
+    elif agent_controls.get("agent_source") == "Symptom agent":
+        selected_agent_label = str(symptom_ui.get("selected_symptom", ""))
+
+    agent_interval_table_cfg = {
+        "intervals": section_wide_agent_intervals,
+        "interval_scope": "Full selected section, computed window-by-window; each loaded window is released after interval extraction.",
+        "interval_table_title": "Agent intervals",
+        "selected_agent": selected_agent_label,
+        "agent_source": agent_controls.get("agent_source", "None"),
+    }
+
+    render_result_tables(
+        activity_cfg=activity_cfg,
+        symptom_cfg=agent_interval_table_cfg,
+        activity_validation_df=pd.DataFrame(),
+        review_df=pd.DataFrame(),
     )
 
     available_param_labels = list(dict.fromkeys(list(label_to_column.keys())))
@@ -1242,13 +1405,7 @@ def main():
                         "If the chart still looks sparse, it is probably a plotting scale/downsampling issue."
                     )
     
-    context_cleaning_rules = build_context_cleaning_rules(
-        selected_well=selected_well,
-        selected_sections=selected_sections,
-        global_rules=CLEANING_RULES,
-        well_rules=WELL_CLEANING_RULES,
-        section_rules=SECTION_CLEANING_RULES,
-    )
+    
 
     df, clean_label_to_column, cleaning_summary_df = apply_cleaning_layer(
         df=df,
@@ -1352,73 +1509,7 @@ def main():
             )
     
     
-    # Create sidebar containers in the visual order we want.
-    # Track 4 will appear before the agent settings, even though the
-    # agent settings are read first internally.
-    review_controls_container = st.sidebar.container()
 
-    agent_controls = render_agent_controls(
-        df=df,
-        context_key=context_key,
-        parent=review_controls_container,
-    )
-
-    activity_ui = agent_controls["activity_ui"]
-    symptom_ui = agent_controls["symptom_ui"]
-
-    activity_cfg = run_activity_agent(
-        df=df,
-        label_to_column=clean_label_to_column,
-        activity_ui=activity_ui,
-    )
-
-    if activity_ui["enabled"] and not activity_cfg["labels"].empty:
-        df["activity"] = activity_cfg["labels"]
-
-    symptom_cfg = run_symptom_agent(
-        df=df,
-        label_to_column=clean_label_to_column,
-        symptom_ui=symptom_ui,
-        activity_ui=activity_ui,
-        activity_cfg=activity_cfg,
-    )
-
-    # Build section-wide selected symptom intervals for the table only.
-    # This does NOT change Track 4 and does NOT load/plot the whole section.
-    # It loops over 12-hour windows, stores only interval rows, and releases
-    # each temporary dataframe before moving to the next window.
-    section_windows = _build_fixed_time_windows_from_index(
-        time_df.index,
-        window_hours=12,
-    )
-    section_window_tuple = tuple(
-        (
-            item["start"].strftime("%Y-%m-%d %H:%M:%S"),
-            item["end"].strftime("%Y-%m-%d %H:%M:%S"),
-        )
-        for item in section_windows
-    )
-
-    section_wide_symptom_intervals = build_section_wide_symptom_intervals(
-        well=selected_well,
-        sections=selected_sections,
-        windows=section_window_tuple,
-        requested_columns=tuple(section_agent_requested_columns),
-        label_to_column=label_to_column,
-        cleaning_rules=context_cleaning_rules,
-        required_activity_labels=tuple(required_activity_labels),
-        required_symptom_labels=tuple(required_symptom_labels),
-        activity_enabled=bool(activity_ui.get("enabled", False)),
-        selected_activity=str(activity_ui.get("selected_activity", "All activities")),
-        activity_config=activity_ui.get("config"),
-        symptom_enabled=bool(symptom_ui.get("enabled", False)),
-        selected_symptom=str(symptom_ui.get("selected_symptom", "")),
-        symptom_config=symptom_ui.get("config"),
-    )
-
-    symptom_table_cfg = dict(symptom_cfg)
-    symptom_table_cfg["intervals"] = section_wide_symptom_intervals
-    symptom_table_cfg["interval_scope"] = "Full selected section, computed window-by-window"
 
     # This is visually placed above the agent settings because it is rendered
     # into review_controls_container, which was created first.
@@ -1453,14 +1544,16 @@ def main():
 
     render_result_tables(
         activity_cfg=activity_cfg,
-        symptom_cfg=symptom_table_cfg,
+        symptom_cfg={
+            "intervals": [],
+            "selected_agent": "",
+            "agent_source": "None",
+        },
         activity_validation_df=activity_validation_df,
         review_df=review_df,
     )
 
-    # Show the miss-reason table only for a fresh Symptom Agent review.
-    # This prevents the table from carrying old agent results when the dashboard opens
-    # or when the user is using Manual interval / Activity agent.
+    # Show the miss-reason table only when a Symptom Agent is selected.
     show_symptom_miss_reason_table = (
         agent_cfg.get("agent_source") == "Symptom agent"
         and symptom_ui.get("enabled", False)
@@ -1677,8 +1770,3 @@ if __name__ == "__main__":
         print("========== END DASHBOARD CRASH TRACEBACK ==========\n\n")
 
         raise
-
-
-
-
-

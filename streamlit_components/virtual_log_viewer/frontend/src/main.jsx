@@ -1,3 +1,4 @@
+
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import Plotly from "plotly.js-dist-min";
@@ -47,6 +48,33 @@ function normalize(values) {
   return values.map((v) => (v == null || !Number.isFinite(Number(v)) ? null : (Number(v) - mn) / (mx - mn)));
 }
 
+function formatLimitValue(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  const abs = Math.abs(n);
+  if ((abs >= 1000 || abs < 0.01) && abs !== 0) return n.toExponential(2);
+  if (abs >= 100) return n.toFixed(0);
+  if (abs >= 10) return n.toFixed(1);
+  return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function curveLimitsText(curve) {
+  const label = String(curve?.label || curve?.raw_col || "Parameter").trim();
+  const unit = String(curve?.unit || "").trim();
+  const nums = (Array.isArray(curve?.x) ? curve.x : [])
+    .map(Number)
+    .filter((value) => Number.isFinite(value));
+
+  if (!nums.length) {
+    return unit ? `${label}: no valid data (${unit})` : `${label}: no valid data`;
+  }
+
+  const mn = Math.min(...nums);
+  const mx = Math.max(...nums);
+  const limits = `${formatLimitValue(mn)} – ${formatLimitValue(mx)}`;
+  return unit ? `${label}: ${limits} ${unit}` : `${label}: ${limits}`;
+}
+
 function rowIdentity(row) {
   return [
     row.well || "",
@@ -73,6 +101,23 @@ function mergeRows(a, b) {
   out.sort((r1, r2) => (toMs(r1.tag_start) || 0) - (toMs(r2.tag_start) || 0));
   return out;
 }
+function normalizeRowsForServer(rows) {
+  const out = [];
+  const seen = new Set();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    if (!row || typeof row !== "object") return;
+    const start = row.tag_start ? fmtTime(toMs(row.tag_start)) : "";
+    const end = row.tag_end ? fmtTime(toMs(row.tag_end)) : "";
+    if (!start || !end || start === end) return;
+    const key = [row.well || "", row.section || "", start, end].join("|");
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({...row, tag_start: start, tag_end: end});
+  });
+  out.sort((a, b) => (toMs(a.tag_start) || 0) - (toMs(b.tag_start) || 0));
+  return out;
+}
+
 
 
 const CHART_TAG_SOURCES = ["chart_drag", "client_drag_tag", "visual", "visual_tag", "dragged", "server_tagger"];
@@ -92,17 +137,29 @@ function stableTagIdFromParts(label, start, end, idx = 0) {
 }
 
 function tagKey(tag) {
-  const createdAt = String(tag?.created_at || "").trim();
-  if (createdAt && isChartTag(tag)) return `chart_id|${createdAt}`;
+  const source = isChartTag(tag) ? "chart_drag" : (String(tag?.source || "manual").trim() || "manual");
   const label = String(tag?.label || "").trim();
-  const start = String(tag?.start || "").trim();
-  const end = String(tag?.end || "").trim();
-  const source = String(tag?.source || "manual").trim() || "manual";
+  const startMs = toMs(tag?.start);
+  const endMs = toMs(tag?.end);
+  const start = startMs == null ? String(tag?.start || "").trim() : fmtTime(startMs);
+  const end = endMs == null ? String(tag?.end || "").trim() : fmtTime(endMs);
+
+  // v7: chart-drawn tags are identical when their interval is identical.
+  // Do not use created_at. Previous code produced two ids for the same hit
+  // interval: a browser Date.now id and a stable tag_ id.
+  if (source === "chart_drag") return `${source}|${start}|${end}`;
+
   return `${source}|${label}|${start}|${end}`;
 }
 
 function isChartTag(tag) {
   return isChartSource(tag?.source);
+}
+
+function isEditableTrackTag(tag) {
+  const s = toMs(tag?.start);
+  const e = toMs(tag?.end);
+  return s != null && e != null && e > s;
 }
 
 function normalizeTag(tag, idx = 0) {
@@ -116,7 +173,7 @@ function normalizeTag(tag, idx = 0) {
   const start = fmtTime(startMs);
   const end = fmtTime(endMs);
   const label = String(tag.label || (chartTag ? `Dragged Tag ${idx + 1}` : `Tag ${idx + 1}`)).trim();
-  const createdAt = String(tag.created_at || "").trim() || (chartTag ? stableTagIdFromParts(label, start, end, idx) : "");
+  const createdAt = chartTag ? stableTagIdFromParts(label, start, end, 0) : "";
 
   return {
     ...tag,
@@ -145,13 +202,18 @@ function dedupeTags(items) {
 function chartTagsForServer(items) {
   return dedupeTags(items)
     .filter(isChartTag)
-    .map((tag, idx) => ({
-      label: tag.label || `Dragged Tag ${idx + 1}`,
-      start: tag.start,
-      end: tag.end,
-      source: "chart_drag",
-      created_at: String(tag.created_at || ""),
-    }));
+    .map((tag, idx) => {
+      const start = fmtTime(toMs(tag.start));
+      const end = fmtTime(toMs(tag.end));
+      const label = tag.label || `Dragged Tag ${idx + 1}`;
+      return {
+        label,
+        start,
+        end,
+        source: "chart_drag",
+        created_at: stableTagIdFromParts(label, start, end, 0),
+      };
+    });
 }
 
 function stableJson(value) {
@@ -187,12 +249,38 @@ function latestHitResultStorageKey(contextKey) {
   return `hoda_virtual_hit_results_latest_${String(contextKey || "default")}`;
 }
 
+function allTagStorageKey(contextKey, sessionToken) {
+  const safeContext = String(contextKey || "default");
+  const safeSession = String(sessionToken || "fresh");
+  return `hoda_virtual_all_tags_${safeContext}_${safeSession}`;
+}
+
+function latestAllTagStorageKey(contextKey) {
+  return `hoda_virtual_all_tags_latest_${String(contextKey || "default")}`;
+}
+
+function saveStoredAllTags(contextKey, sessionToken, items) {
+  if (typeof window === "undefined") return;
+  const payload = dedupeTags(items || []);
+  const text = JSON.stringify(payload);
+
+  try {
+    window.sessionStorage.setItem(allTagStorageKey(contextKey, sessionToken), text);
+    window.sessionStorage.setItem(latestAllTagStorageKey(contextKey), text);
+  } catch (err) {}
+
+  try {
+    window.localStorage.setItem(latestAllTagStorageKey(contextKey), text);
+  } catch (err) {}
+}
+
 function loadStoredChartTags(contextKey, sessionToken, allowLegacy = false) {
   if (typeof window === "undefined") return [];
   try {
-    let raw = window.localStorage.getItem(chartTagStorageKey(contextKey, sessionToken));
+    let raw = window.sessionStorage.getItem(chartTagStorageKey(contextKey, sessionToken));
+    if (!raw) raw = window.localStorage.getItem(chartTagStorageKey(contextKey, sessionToken));
     if (!raw && allowLegacy) {
-      raw = window.localStorage.getItem(legacyChartTagStorageKey(contextKey));
+      raw = window.sessionStorage.getItem(legacyChartTagStorageKey(contextKey));
     }
     const parsed = JSON.parse(raw || "[]");
     return dedupeTags(Array.isArray(parsed) ? parsed : []).filter(isChartTag);
@@ -205,17 +293,15 @@ function saveStoredChartTags(contextKey, sessionToken, items) {
   if (typeof window === "undefined") return;
   const safeChartTags = chartTagsForServer(items || []);
   try {
-    window.localStorage.setItem(
-      chartTagStorageKey(contextKey, sessionToken),
-      JSON.stringify(safeChartTags),
-    );
-    // Sidebar Save Dashboard Session reads this current-context latest key.
-    // It is overwritten with [] on fresh sessions, so old browser tags do not
-    // leak into a new save.
-    window.localStorage.setItem(
-      latestChartTagStorageKey(contextKey),
-      JSON.stringify(safeChartTags),
-    );
+    const payload = JSON.stringify(safeChartTags);
+    const sessionKey = chartTagStorageKey(contextKey, sessionToken);
+    const latestKey = latestChartTagStorageKey(contextKey);
+
+    // v7: current-tab sessionStorage is the source of truth. The latest localStorage
+    // key is overwritten with the cleaned list only for sidebar Save Dashboard Session.
+    window.sessionStorage.setItem(sessionKey, payload);
+    window.sessionStorage.setItem(latestKey, payload);
+    window.localStorage.setItem(latestKey, payload);
   } catch (err) {
     // Browser storage failure should not break tag drawing.
   }
@@ -223,7 +309,7 @@ function saveStoredChartTags(contextKey, sessionToken, items) {
 
 function saveStoredHitRows(contextKey, sessionToken, rows) {
   if (typeof window === "undefined") return;
-  const safeRows = Array.isArray(rows) ? rows : [];
+  const safeRows = normalizeRowsForServer(rows);
   try {
     window.localStorage.setItem(
       hitResultStorageKey(contextKey, sessionToken),
@@ -241,6 +327,8 @@ function saveStoredHitRows(contextKey, sessionToken, rows) {
 function clearStoredChartTags(contextKey, sessionToken) {
   if (typeof window === "undefined") return;
   try {
+    window.sessionStorage.removeItem(chartTagStorageKey(contextKey, sessionToken));
+    window.sessionStorage.setItem(latestChartTagStorageKey(contextKey), "[]");
     window.localStorage.removeItem(chartTagStorageKey(contextKey, sessionToken));
     window.localStorage.setItem(latestChartTagStorageKey(contextKey), "[]");
   } catch (err) {
@@ -304,10 +392,10 @@ function buildDomains() {
   });
 
   return {
-    xaxis: gridAxis([0.00, 0.23], "Track 1"),
-    xaxis2: gridAxis([0.255, 0.485], "Track 2"),
-    xaxis3: gridAxis([0.51, 0.74], "Track 3"),
-    xaxis4: gridAxis([0.775, 1.0], "Track 4"),
+    xaxis: gridAxis([0.00, 0.23], ""),
+    xaxis2: gridAxis([0.255, 0.485], ""),
+    xaxis3: gridAxis([0.51, 0.74], ""),
+    xaxis4: gridAxis([0.775, 1.0], ""),
   };
 }
 
@@ -346,6 +434,31 @@ function buildCurveTraces(trackData) {
     });
   });
   return traces;
+}
+
+function buildGridKeepaliveTraces(rangeStartMs, rangeEndMs) {
+  const start = Number.isFinite(Number(rangeStartMs)) ? Number(rangeStartMs) : Date.now();
+  const end = Number.isFinite(Number(rangeEndMs)) && Number(rangeEndMs) > start
+    ? Number(rangeEndMs)
+    : start + 12 * HOUR_MS;
+
+  return [1, 2, 3, 4].map((trackNo) => {
+    const axis = traceAxis(trackNo);
+    return {
+      type: "scatter",
+      mode: "lines",
+      x: [0, 1],
+      y: [fmtTime(start), fmtTime(end)],
+      xaxis: axis.xaxis,
+      yaxis: axis.yaxis,
+      line: {width: 0, color: "rgba(0,0,0,0)"},
+      marker: {opacity: 0},
+      hoverinfo: "skip",
+      showlegend: false,
+      meta: {source: "dense_grid_keepalive"},
+      name: `Track ${trackNo} grid`,
+    };
+  });
 }
 
 function normalizeAgentIntervals(agentIntervals) {
@@ -551,6 +664,17 @@ function App(props) {
   }, [JSON.stringify(args.saved_tags || []), args.context_key, browserSessionToken, restoreSavedDashboard]);
 
   const agents = useMemo(() => normalizeAgentIntervals(args.agent_intervals), [JSON.stringify(args.agent_intervals || [])]);
+  const showAgentIntervals = args.show_agent_intervals !== false;
+
+  const trackFooters = useMemo(() => {
+    const rows = [[], [], [], []];
+    (args.track_data?.tracks || []).forEach((track) => {
+      const trackNo = Math.max(1, Math.min(4, Number(track.track || 1)));
+      rows[trackNo - 1] = (track.curves || []).map(curveLimitsText).filter(Boolean);
+    });
+    if (!rows[3].length) rows[3] = ["Tagger | Overlap | Agent"];
+    return rows;
+  }, [JSON.stringify(args.track_data?.tracks || [])]);
 
   const viewportEndMs = useMemo(() => {
     if (viewportStartMs == null) return null;
@@ -693,22 +817,27 @@ function App(props) {
   );
 
   const traces = useMemo(() => {
-    const base = buildCurveTraces(args.track_data);
-    agents.forEach((a) => {
-      base.push({
-        type: "scatter",
-        mode: "lines",
-        x: Array(20).fill(0.76),
-        y: Array.from({length: 20}, (_, i) => fmtTime(a.startMs + ((a.endMs - a.startMs) * i) / 19)),
-        xaxis: "x4",
-        yaxis: "y4",
-        line: {color: "rgba(120,0,0,.98)", width: 9},
-        showlegend: false,
-        hoverinfo: "none",
-        meta: {source: "agent", label: a.label},
-        name: a.label,
+    const gridStart = viewportStartMs || bufferStartMs || sectionStartMs || Date.now();
+    const gridEnd = viewportEndMs || Math.min(gridStart + visibleMs, sectionEndMs || gridStart + visibleMs);
+    const base = buildGridKeepaliveTraces(gridStart, gridEnd);
+    base.push(...buildCurveTraces(args.track_data));
+    if (showAgentIntervals) {
+      agents.forEach((a) => {
+        base.push({
+          type: "scatter",
+          mode: "lines",
+          x: Array(20).fill(0.76),
+          y: Array.from({length: 20}, (_, i) => fmtTime(a.startMs + ((a.endMs - a.startMs) * i) / 19)),
+          xaxis: "x4",
+          yaxis: "y4",
+          line: {color: "rgba(120,0,0,.98)", width: 9},
+          showlegend: false,
+          hoverinfo: "none",
+          meta: {source: "agent", label: a.label},
+          name: a.label,
+        });
       });
-    });
+    }
 
     tags.forEach((tag, idx) => {
       const s = toMs(tag.start);
@@ -746,7 +875,19 @@ function App(props) {
       });
     });
     return base;
-  }, [args.track_data, agents, tags, selectedTagId]);
+  }, [
+    args.track_data,
+    agents,
+    tags,
+    selectedTagId,
+    showAgentIntervals,
+    viewportStartMs,
+    viewportEndMs,
+    bufferStartMs,
+    sectionStartMs,
+    sectionEndMs,
+    visibleMs,
+  ]);
 
   function bestOverlapsForTag(tag) {
     const s = toMs(tag.start);
@@ -771,13 +912,15 @@ function App(props) {
   }
 
   function buildHitRows(currentTags = tags) {
+    const effectiveTags = dedupeTags(currentTags || []);
     const defaultSymptom = agents[0]?.label || "Agent hit";
-    return (currentTags || []).map((tag) => {
+    return effectiveTags.map((tag) => {
       const overlaps = bestOverlapsForTag(tag);
       const best = overlaps[0] || null;
       const percent = best ? best.percent : 0;
       return {
         symptom: best ? best.agent.label : defaultSymptom,
+        data_agent: best ? best.agent.label : defaultSymptom,
         well: String(args.selected_well || String(args.context_key || "").split("__")[0] || ""),
         section: (args.selected_sections || []).join(" + "),
         date: tag.start ? String(tag.start).split(" ")[0] : "",
@@ -806,8 +949,8 @@ function App(props) {
     // Hit rows must be the current projection of the current tags only.
     // Merging old rows here keeps previous resize positions forever, which made
     // stretched/compressed tags look as if the dashboard had refused the edit.
-    const rows = buildHitRows(cleanTags);
-    setHitRows((old) => (stableJson(old) === stableJson(rows) ? old : rows));
+    const rows = normalizeRowsForServer(buildHitRows(cleanTags));
+    setHitRows((old) => (stableJson(normalizeRowsForServer(old)) === stableJson(rows) ? old : rows));
     // Let the sidebar Save Dashboard Session button capture exactly the rows
     // currently shown in the React Hit results table, including both manual
     // sidebar tags and browser-drawn tags.
@@ -818,6 +961,7 @@ function App(props) {
     // starting the refresh loop. Keep chart tags local and persist them in browser
     // storage; sync them to Python only when the user presses "Save drawn tags".
     saveStoredChartTags(args.context_key, browserSessionToken, cleanTags.filter(isChartTag));
+    saveStoredAllTags(args.context_key, browserSessionToken, cleanTags);
     suppressStateUpdateRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(tags), args.context_key, browserSessionToken]);
@@ -827,7 +971,7 @@ function App(props) {
   function sendCurrentStateToStreamlit(reason = "manual_save") {
     const cleanTags = dedupeTags(tags);
     const outgoingChartTags = chartTagsForServer(cleanTags);
-    const rows = buildHitRows(cleanTags);
+    const rows = normalizeRowsForServer(buildHitRows(cleanTags));
     const payload = {
       event: "state_update",
       reason,
@@ -1012,6 +1156,13 @@ function App(props) {
         event.preventDefault();
         event.stopPropagation?.();
         chooseZoomMode(zoomModeRef.current || "y");
+        return;
+      }
+
+      if (key === "r") {
+        event.preventDefault();
+        event.stopPropagation?.();
+        resetChartZoom();
       }
     }
 
@@ -1304,7 +1455,7 @@ function App(props) {
     let best = null;
     let bestDist = Infinity;
     tags.forEach((tag, idx) => {
-      if (!isChartTag(tag)) return;
+      if (!isEditableTrackTag(tag)) return;
       const s = toMs(tag.start);
       const e = toMs(tag.end);
       if (s == null || e == null) return;
@@ -1325,7 +1476,7 @@ function App(props) {
     if (!gd?._fullLayout?.yaxis || !gd?._fullLayout?._size || !tagId) return false;
 
     const tag = tags.find((item) => tagKey(item) === tagId);
-    if (!tag || !isChartTag(tag)) return false;
+    if (!tag || !isEditableTrackTag(tag)) return false;
 
     try {
       const rect = gd.getBoundingClientRect();
@@ -1359,6 +1510,143 @@ function App(props) {
   function hideSelectBox() {
     if (selectBoxRef.current) selectBoxRef.current.style.display = "none";
   }
+
+function trackAxisName(trackNo) {
+  return trackNo === 1 ? "xaxis" : `xaxis${trackNo}`;
+}
+
+function getMouseTrackNo(e) {
+  const gd = plotRef.current;
+  const full = gd?._fullLayout;
+  if (!gd || !full?._size) return null;
+
+  const gdRect = gd.getBoundingClientRect();
+  const size = full._size;
+  const plotX = clamp(e.clientX - gdRect.left - size.l, 0, size.w);
+  const fracX = size.w > 0 ? plotX / size.w : 0;
+
+  for (let trackNo = 1; trackNo <= 3; trackNo += 1) {
+    const axis = full[trackAxisName(trackNo)];
+    const domain = axis?.domain || [];
+    if (domain.length === 2 && fracX >= domain[0] && fracX <= domain[1]) {
+      return trackNo;
+    }
+  }
+
+  return null;
+}
+
+function getTaggingHoverCurvePoint(e, timeMs) {
+  if (timeMs == null) return null;
+
+  const gd = plotRef.current;
+  const full = gd?._fullLayout;
+  if (!gd || !full?._size) return null;
+
+  const trackNo = getMouseTrackNo(e);
+  if (!trackNo) return null;
+
+  const track = (args.track_data?.tracks || []).find(
+    (item) => Number(item.track || 1) === trackNo,
+  );
+  if (!track || !Array.isArray(track.curves) || !track.curves.length) return null;
+
+  const gdRect = gd.getBoundingClientRect();
+  const size = full._size;
+  const plotX = clamp(e.clientX - gdRect.left - size.l, 0, size.w);
+  const fracX = size.w > 0 ? plotX / size.w : 0;
+
+  const xAxis = full[trackAxisName(trackNo)];
+  const domain = xAxis?.domain || [0, 1];
+  const localX = domain[1] > domain[0]
+    ? clamp((fracX - domain[0]) / (domain[1] - domain[0]), 0, 1)
+    : 0.5;
+
+  let best = null;
+
+  track.curves.forEach((curve) => {
+    const ys = Array.isArray(curve.y) ? curve.y : [];
+    const rawValues = Array.isArray(curve.x) ? curve.x : [];
+    const normalizedValues = normalize(rawValues);
+
+    ys.forEach((timeText, idx) => {
+      const pointMs = toMs(timeText);
+      if (pointMs == null) return;
+
+      const rawValue = Number(rawValues[idx]);
+      if (!Number.isFinite(rawValue)) return;
+
+      const normX = Number(normalizedValues[idx]);
+      const xPenalty = Number.isFinite(normX) ? Math.abs(normX - localX) * 5 * 60 * 1000 : 0;
+      const timePenalty = Math.abs(pointMs - timeMs);
+      const score = timePenalty + xPenalty;
+
+      if (!best || score < best.score) {
+        best = {
+          score,
+          label: String(curve.label || curve.raw_col || "Value"),
+          unit: String(curve.unit || ""),
+          value: rawValue,
+          timeText: fmtTime(pointMs),
+        };
+      }
+    });
+  });
+
+  return best;
+}
+
+function showTaggingHover(e) {
+  const gd = plotRef.current;
+  const wrap = wrapRef.current;
+  if (!gd?._fullLayout?.yaxis || !gd?._fullLayout?._size || !wrap) return;
+
+  try {
+    const gdRect = gd.getBoundingClientRect();
+    const wrapRect = wrap.getBoundingClientRect();
+    const size = gd._fullLayout._size;
+    const plotY = clamp(e.clientY - gdRect.top - size.t, 0, size.h);
+    const top = gdRect.top - wrapRect.top + size.t + plotY;
+    const ms = pixelToTime(e.clientY);
+    const timeText = ms == null ? "" : fmtTime(ms);
+    const curvePoint = getTaggingHoverCurvePoint(e, ms);
+
+    if (hoverLineRef.current) {
+      hoverLineRef.current.style.left = "0px";
+      hoverLineRef.current.style.width = "100%";
+      hoverLineRef.current.style.top = `${top}px`;
+      hoverLineRef.current.style.display = "block";
+    }
+
+    if (hoverBoxRef.current) {
+      if (curvePoint) {
+        hoverBoxRef.current.innerHTML =
+          `<b>${htmlEscape(curvePoint.label)}</b><br>` +
+          `${htmlEscape(formatLimitValue(curvePoint.value))} ${htmlEscape(curvePoint.unit)}<br>` +
+          `Time: ${htmlEscape(curvePoint.timeText)}`;
+      } else {
+        hoverBoxRef.current.innerHTML =
+          `<b>Tagging mode</b><br>` +
+          (timeText ? `Time: ${htmlEscape(timeText)}<br>` : "") +
+          `Drag vertically to create/edit a Track 4 tag`;
+      }
+
+      hoverBoxRef.current.style.left =
+        `${Math.max(8, Math.min(e.clientX - wrapRect.left + 12, wrapRect.width - 245))}px`;
+
+      hoverBoxRef.current.style.display = "block";
+
+      // 2 cm above the mouse cursor. 2 cm is about 76 CSS pixels.
+      const noteGapPx = 76;
+      const boxHeight = hoverBoxRef.current.offsetHeight || 72;
+      const desiredTop = e.clientY - wrapRect.top - noteGapPx - boxHeight;
+      hoverBoxRef.current.style.top =
+        `${Math.max(8, Math.min(desiredTop, wrapRect.height - boxHeight - 8))}px`;
+    }
+  } catch (err) {
+    // Hover overlay failure should not break tagging.
+  }
+}
 
   function updateResizePreview(startMs, endMs) {
     const gd = plotRef.current;
@@ -1536,6 +1824,29 @@ function App(props) {
     arrowScrollRef.current.rafId = requestAnimationFrame(arrowScrollFrame);
   }
 
+  function jumpArrowScroll(direction, event) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (!direction) return;
+
+    const state = arrowScrollRef.current;
+    if (state.rafId != null) cancelAnimationFrame(state.rafId);
+    arrowScrollRef.current = {active: false, direction: 0, rafId: null, lastTs: 0};
+
+    const base = viewportStartRef.current ?? viewportStartMs ?? sectionStartMs;
+    if (base == null) return;
+
+    const activeVisibleMs = getActiveSpanMs();
+    const next = clampViewport(base + direction * 2 * HOUR_MS, activeVisibleMs);
+    if (Math.abs(next - base) < 1) return;
+
+    suppressNextBufferRequestRef.current = false;
+    viewportStartRef.current = next;
+    setViewportStartMs(next);
+    setPlotViewport(next);
+    maybeRequestBuffer(next);
+  }
+
   function stopArrowScroll(event) {
     event?.preventDefault?.();
     event?.stopPropagation?.();
@@ -1548,6 +1859,7 @@ function App(props) {
     if (!tagModeRef.current) return;
     e.preventDefault();
     e.stopPropagation();
+    showTaggingHover(e);
 
     if (selectedTagId) {
       if (!isClientYInsideTagId(e.clientY, selectedTagId, 18)) {
@@ -1584,6 +1896,7 @@ function App(props) {
     if (!tagModeRef.current) return;
     e.preventDefault();
     e.stopPropagation();
+    showTaggingHover(e);
 
     if (resizeRef.current.active && selectedTagId) {
       const ms = pixelToTime(e.clientY);
@@ -1626,7 +1939,21 @@ function App(props) {
           old.map((tag) => {
             const id = tagKey(tag);
             if (id !== resize.tagId) return tag;
-            return {...tag, start: fmtTime(Math.min(ns, ne)), end: fmtTime(Math.max(ns, ne)), source: "chart_drag"};
+          const newStart = fmtTime(Math.min(ns, ne));
+          const newEnd = fmtTime(Math.max(ns, ne));
+          const oldSource = String(tag.source || "manual").trim() || "manual";
+          const newLabel = tag.label || (isChartSource(oldSource) ? "Dragged tag" : "Manual tag");
+
+          return {
+            ...tag,
+            label: newLabel,
+            start: newStart,
+            end: newEnd,
+            source: isChartSource(oldSource) ? "chart_drag" : oldSource,
+            created_at: isChartSource(oldSource)
+              ? stableTagIdFromParts(newLabel, newStart, newEnd, 0)
+              : (tag.created_at || ""),
+          };  
           }),
         ),
       );
@@ -1657,15 +1984,24 @@ function App(props) {
     if (t1 == null || t2 == null) return;
     const s = Math.min(t1, t2);
     const en = Math.max(t1, t2);
+    const label = `Dragged Tag ${chartTagsForServer(tags).length + 1}`;
+    const startText = fmtTime(s);
+    const endText = fmtTime(en);
     const item = {
-      label: `Dragged Tag ${chartTagsForServer(tags).length + 1}`,
-      start: fmtTime(s),
-      end: fmtTime(en),
-      created_at: String(Date.now()),
+      label,
+      start: startText,
+      end: endText,
+      created_at: stableTagIdFromParts(label, startText, endText, 0),
       source: "chart_drag",
     };
     setRedoTags([]);
-    setTags((old) => dedupeTags([...old, item]));
+    setTags((old) => {
+      const next = dedupeTags([...old, item]);
+      const rows = normalizeRowsForServer(buildHitRows(next));
+      saveStoredChartTags(args.context_key, browserSessionToken, chartTagsForServer(next));
+      saveStoredHitRows(args.context_key, browserSessionToken, rows);
+      return next;
+    });
   }
 
   function onDoubleClick(e) {
@@ -1796,10 +2132,10 @@ function App(props) {
 
       <div className="vlv-caption">
         {tagMode
-          ? "Tagging is active. Press Z for zoom mode. Mouse-wheel scrolls the main page only; hold the left arrow rail to move through time. Press Save drawn tags when you want Python/session state updated."
+          ? "Tagging is active. Press Z for zoom mode or R to reset zoom. Hold the left arrow rail to move through time; double-click an arrow to jump 2 hours. Press Save drawn tags when you want Python/session state updated."
           : zoomHistoryCount > 0
-            ? "Chart is zoomed. Press T for tagging or Z for zooming. Mouse-wheel scrolls the main page only; hold the left arrow rail to move through time."
-            : "Press T for tagging or Z for zooming. Mouse-wheel/page scroll will not load new plot parts; only the left arrow rail moves through time."}
+            ? "Chart is zoomed. Press R to reset zoom. Press T for tagging or Z for zooming. Hold the left arrow rail to move through time; double-click an arrow to jump 2 hours."
+            : "Press T for tagging, Z for zooming, and R to reset zoom. Mouse-wheel/page scroll will not load new plot parts; hold the left arrow rail to move through time or double-click an arrow to jump 2 hours."}
       </div>
 
       <details className="vlv-hit" open>
@@ -1848,7 +2184,8 @@ function App(props) {
         <div className="vlv-scroll-rail" aria-label="Track time scroll controls">
           <button
             className="vlv-scroll-arrow vlv-scroll-arrow-up"
-            title="Hold to scroll to earlier time"
+            title="Hold to scroll to earlier time; double-click to jump 2 hours earlier"
+            onDoubleClick={(e) => jumpArrowScroll(-1, e)}
             onMouseDown={(e) => startArrowScroll(-1, e)}
             onMouseUp={stopArrowScroll}
             onMouseLeave={stopArrowScroll}
@@ -1860,7 +2197,8 @@ function App(props) {
           <div className="vlv-scroll-line" />
           <button
             className="vlv-scroll-arrow vlv-scroll-arrow-down"
-            title="Hold to scroll to later time"
+            title="Hold to scroll to later time; double-click to jump 2 hours later"
+            onDoubleClick={(e) => jumpArrowScroll(1, e)}
             onMouseDown={(e) => startArrowScroll(1, e)}
             onMouseUp={stopArrowScroll}
             onMouseLeave={stopArrowScroll}
@@ -1882,14 +2220,21 @@ function App(props) {
         <div ref={hoverLineRef} className="vlv-hover-line" />
         <div ref={hoverBoxRef} className="vlv-hover-box" />
       </div>
+
+      <div className="vlv-track-footers" aria-label="Track plotted parameter names and limits">
+        {trackFooters.map((items, trackIdx) => (
+          <div key={trackIdx} className="vlv-track-footer">
+            {items.length ? items.map((item, itemIdx) => (
+              <div key={itemIdx} className="vlv-track-footer-item">{item}</div>
+            )) : (
+              <div className="vlv-track-footer-empty">No parameter selected</div>
+            )}
+          </div>
+        ))}
+      </div>    
     </div>
   );
 }
 
 const ConnectedApp = withStreamlitConnection(App);
 createRoot(document.getElementById("root")).render(<ConnectedApp />);
-
-
-
-
-

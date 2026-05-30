@@ -10,6 +10,7 @@
 3. After installing all libraries type below command in Terminal(cmd):
     `streamlit run app.py`
     `python -m compileall .`
+    `cd "/Users/nikpour/Desktop/PromAI/DrillMate 2026version/Dashboard/developmentcodesinpython/mudlogging-dashboard-demo_(rev02).part2_l10r chatgptprofveldandev2includedataagentsusing"`
 
     `git remote -v`
     `git status`

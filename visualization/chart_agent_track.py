@@ -231,6 +231,12 @@ def _add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
             row=row,
             col=col,
             hover_text=hover_text,
+            meta={
+                "source": tag.get("source", "manual"),
+                "label": label,
+                "start": str(tag.get("start", "")),
+                "end": str(tag.get("end", "")),
+            },
         )
 
     for overlap in overlap_intervals:
@@ -250,49 +256,59 @@ def _add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
             row=row,
             col=col,
             hover_text=hover_text,
-        )
-
-    for i, agent in enumerate(agent_intervals, start=1):
-        label = agent.get("label", f"Hit {i}")
-        severity = agent.get("severity", "Medium")
-
-        if agent.get("source") == "activity_agent":
-            color = _darker_rgba(ACTIVITY_COLOR_MAP.get(label, "rgba(110, 120, 125, 0.98)"))
-            width = _activity_line_width(label)
-            hover_text = f"Activity<br>{label}"
-        elif agent.get("source") == "symptom_agent":
-            color = _darker_rgba(SYMPTOM_COLOR_MAP.get(label, "rgba(150, 0, 0, 0.98)"))
-            width = _agent_line_width(severity)
-            hover_text = f"Symptom<br>{label}<br>Severity: {severity}"
-        else:
-            color = "rgba(120, 0, 0, 0.98)"
-            width = _agent_line_width(severity)
-            hover_text = f"Agent hit<br>{label}<br>Severity: {severity}"
-
-        _add_vertical_interval_line(
-            fig=fig,
-            x_pos=AGENT_X,
-            start_time=agent["start"],
-            end_time=agent["end"],
-            color=color,
-            width=width,
-            row=row,
-            col=col,
-            hover_text=hover_text,
             meta={
-                "source": agent.get("source", "agent_interval"),
-                "label": label,
-                "severity": severity,
-                "start": str(agent.get("start", "")),
-                "end": str(agent.get("end", "")),
+                "source": "overlap",
+                "tag_label": overlap.get("tag_label", ""),
+                "agent_label": overlap.get("agent_label", ""),
+                "start": str(overlap.get("start", "")),
+                "end": str(overlap.get("end", "")),
             },
-            min_visible_seconds=1.0 if agent.get("source") == "symptom_agent" else 0.0,
         )
 
-    activity_intervals_only = [
-        item for item in agent_intervals if item.get("source") == "activity_agent"
-    ]
-    _add_activity_summary_annotations(fig, activity_intervals_only)
+    show_agent_intervals = bool(agent_cfg.get("show_agent_intervals", True))
+
+    if show_agent_intervals:
+        for i, agent in enumerate(agent_intervals, start=1):
+            label = agent.get("label", f"Hit {i}")
+            severity = agent.get("severity", "Medium")
+
+            if agent.get("source") == "activity_agent":
+                color = _darker_rgba(ACTIVITY_COLOR_MAP.get(label, "rgba(110, 120, 125, 0.98)"))
+                width = _activity_line_width(label)
+                hover_text = f"Activity<br>{label}"
+            elif agent.get("source") == "symptom_agent":
+                color = _darker_rgba(SYMPTOM_COLOR_MAP.get(label, "rgba(150, 0, 0, 0.98)"))
+                width = _agent_line_width(severity)
+                hover_text = f"Symptom<br>{label}<br>Severity: {severity}"
+            else:
+                color = "rgba(120, 0, 0, 0.98)"
+                width = _agent_line_width(severity)
+                hover_text = f"Agent hit<br>{label}<br>Severity: {severity}"
+
+            _add_vertical_interval_line(
+                fig=fig,
+                x_pos=AGENT_X,
+                start_time=agent["start"],
+                end_time=agent["end"],
+                color=color,
+                width=width,
+                row=row,
+                col=col,
+                hover_text=hover_text,
+                meta={
+                    "source": agent.get("source", "agent_interval"),
+                    "label": label,
+                    "severity": severity,
+                    "start": str(agent.get("start", "")),
+                    "end": str(agent.get("end", "")),
+                },
+                min_visible_seconds=1.0 if agent.get("source") == "symptom_agent" else 0.0,
+            )
+
+        activity_intervals_only = [
+            item for item in agent_intervals if item.get("source") == "activity_agent"
+        ]
+        _add_activity_summary_annotations(fig, activity_intervals_only)
 
     fig.add_annotation(
         xref="x4",
@@ -349,7 +365,16 @@ def _add_agent_track(fig: go.Figure, agent_cfg: dict, row: int, col: int):
         row=row,
         col=col,
         range=list(AGENT_TRACK_XRANGE),
-        showgrid=False,
+        showgrid=True,
+        gridcolor="rgba(120,120,120,0.24)",
+        gridwidth=0.7,
+        minor=dict(
+            tick0=0,
+            dtick=0.025,
+            showgrid=True,
+            gridcolor="rgba(150,150,150,0.11)",
+            gridwidth=0.35,
+        ),
         zeroline=False,
         showticklabels=False,
         side="top",

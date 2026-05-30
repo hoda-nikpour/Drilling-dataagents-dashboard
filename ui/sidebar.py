@@ -1,3 +1,4 @@
+
 import csv
 import io
 import json
@@ -22,6 +23,274 @@ from config import (
 
 ACCEPTANCE_THRESHOLD_PERCENT = 95.0
 ACTIVITY_VALIDATION_MIN_OVERLAP_PERCENT = 50.0
+
+ACTIVITY_AGENT_CHOICES = {
+    "Drilling": "Drilling",
+    "Reaming": "Reaming",
+    "Trippingin": "TrippingIn",
+    "Trippingout": "TrippingOut",
+    "Making conection": "MakingConnection",
+    "Conditioning": "Conditioning",
+    "Circulating": "Circulating",
+}
+
+SYMPTOM_AGENT_CHOICES = {
+    "OpenHoleLength": "OpenHoleLength",
+    "TRQErratic": "TRQErratic",
+    "TRQSpice": "TRQSpike",
+    "PSpike": "PSpike",
+    "OverPull": "OverPull",
+    "TookWeight": "TookWeight",
+}
+
+ACTIVITY_AGENT_DISPLAY_BY_INTERNAL = {
+    internal: display for display, internal in ACTIVITY_AGENT_CHOICES.items()
+}
+
+SYMPTOM_AGENT_DISPLAY_BY_INTERNAL = {
+    internal: display for display, internal in SYMPTOM_AGENT_CHOICES.items()
+}
+
+AGENT_PICKER_ACTIVITY_HEADER = "__activity_agents_header__"
+AGENT_PICKER_SYMPTOM_HEADER = "__symptom_agents_header__"
+
+AGENT_PICKER_OPTIONS = (
+    [AGENT_PICKER_ACTIVITY_HEADER]
+    + [f"activity::{name}" for name in ACTIVITY_AGENT_CHOICES]
+    + [AGENT_PICKER_SYMPTOM_HEADER]
+    + [f"symptom::{name}" for name in SYMPTOM_AGENT_CHOICES]
+)
+
+
+def _format_agent_picker_option(value: str) -> str:
+    """Display grouped choices in one Streamlit selectbox."""
+    if value == AGENT_PICKER_ACTIVITY_HEADER:
+        return "𝗔𝗰𝘁𝗶𝘃𝗶𝘁𝘆 𝗔𝗴𝗲𝗻𝘁𝘀"
+    if value == AGENT_PICKER_SYMPTOM_HEADER:
+        return "𝗦𝘆𝗺𝗽𝘁𝗼𝗺 𝗔𝗴𝗲𝗻𝘁𝘀"
+    if str(value).startswith("activity::"):
+        return "   " + str(value).split("::", 1)[1]
+    if str(value).startswith("symptom::"):
+        return "   " + str(value).split("::", 1)[1]
+    return str(value)
+
+
+def _parse_agent_picker_choice(value) -> tuple[str, str, str]:
+    """
+    Return (agent_source, display_name, internal_name).
+
+    The group headers are treated as non-choices. If a user clicks a header,
+    the dashboard behaves as if no agent is selected.
+    """
+    text = str(value or "")
+    if text.startswith("activity::"):
+        display = text.split("::", 1)[1]
+        return "Activity agent", display, ACTIVITY_AGENT_CHOICES.get(display, display)
+    if text.startswith("symptom::"):
+        display = text.split("::", 1)[1]
+        return "Symptom agent", display, SYMPTOM_AGENT_CHOICES.get(display, display)
+    return "None", "", ""
+
+
+
+def _make_context_key_from_loaded_parts(selected_well, selected_sections) -> str:
+    well = str(selected_well or "").strip()
+    sections = [str(x).replace('"', "").strip() for x in (selected_sections or [])]
+    sections = [x for x in sections if x]
+
+    try:
+        sections = sorted(sections, key=float)
+    except Exception:
+        sections = sorted(sections)
+
+    if not well or not sections:
+        return ""
+
+    return f"{well}__{'_'.join(sections)}"
+
+
+def _restore_locked_agent_choice_from_payload(uploaded_data: dict | None, context_key: str) -> bool:
+    """
+    Restore the locked symptom/activity agent before render_agent_picker_gate() runs.
+
+    Without this, loaded dashboard JSON restores only well + section, then the app
+    stops at Step 3 and asks the user to choose the data agent again.
+    """
+    if not uploaded_data or not context_key:
+        return False
+
+    dashboard_context = uploaded_data.get("dashboard_context", {}) or {}
+    widget_state = (
+        (uploaded_data.get("dashboard_state", {}) or {})
+        .get("widget_state", {})
+        or {}
+    )
+
+    choice = (
+        dashboard_context.get("selected_agent_choice")
+        or dashboard_context.get("locked_selected_agent_lane")
+        or dashboard_context.get("locked_agent_choice")
+        or widget_state.get(f"locked_selected_agent_lane_{context_key}")
+        or widget_state.get(f"locked_agent_choice_{context_key}")
+        or widget_state.get(f"selected_agent_lane_{context_key}")
+        or ""
+    )
+
+    if not choice:
+        saved_symptom = (
+            dashboard_context.get("selected_symptom")
+            or widget_state.get(f"selected_symptom_lane_{context_key}")
+            or ""
+        )
+        saved_activity = (
+            dashboard_context.get("selected_activity")
+            or widget_state.get(f"selected_activity_lane_{context_key}")
+            or ""
+        )
+
+        if saved_symptom:
+            display = SYMPTOM_AGENT_DISPLAY_BY_INTERNAL.get(
+                str(saved_symptom),
+                str(saved_symptom),
+            )
+            choice = f"symptom::{display}"
+
+        elif saved_activity:
+            display = ACTIVITY_AGENT_DISPLAY_BY_INTERNAL.get(
+                str(saved_activity),
+                str(saved_activity),
+            )
+            choice = f"activity::{display}"
+
+    if choice in {AGENT_PICKER_ACTIVITY_HEADER, AGENT_PICKER_SYMPTOM_HEADER}:
+        return False
+
+    agent_source, display_name, internal_name = _parse_agent_picker_choice(choice)
+
+    if agent_source == "None":
+        return False
+
+    st.session_state[f"locked_selected_agent_lane_{context_key}"] = choice
+    st.session_state[f"locked_agent_choice_{context_key}"] = choice
+    st.session_state[f"selected_agent_lane_{context_key}"] = choice
+    st.session_state[f"agent_source_{context_key}"] = agent_source
+
+    if agent_source == "Activity agent":
+        st.session_state[f"selected_activity_lane_{context_key}"] = internal_name
+    elif agent_source == "Symptom agent":
+        st.session_state[f"selected_symptom_lane_{context_key}"] = internal_name
+
+    return True
+
+
+def _clear_agent_picker_query_params():
+    for key in ["agent_picker_context", "agent_picker_choice", "agent_picker_nonce"]:
+        try:
+            del st.query_params[key]
+        except Exception:
+            pass
+
+
+def _apply_agent_picker_query_params(context_key: str):
+    params = st.query_params
+    if params.get("agent_picker_context") != context_key:
+        return
+
+    choice = str(params.get("agent_picker_choice") or "")
+    nonce = str(params.get("agent_picker_nonce") or "")
+    nonce_key = f"_last_agent_picker_nonce_{context_key}"
+
+    if nonce and st.session_state.get(nonce_key) == nonce:
+        _clear_agent_picker_query_params()
+        return
+
+    agent_source, _, _ = _parse_agent_picker_choice(choice)
+    if agent_source != "None":
+        st.session_state[f"locked_selected_agent_lane_{context_key}"] = choice
+        st.session_state[f"selected_agent_lane_{context_key}"] = choice
+        st.session_state[f"agent_source_{context_key}"] = agent_source
+
+    if nonce:
+        st.session_state[nonce_key] = nonce
+
+    _clear_agent_picker_query_params()
+
+
+def _render_locked_agent_picker(context_key: str, parent=None):
+    """
+    Render a one-time data-agent picker.
+
+    Important repair:
+    - Use Streamlit state, not iframe/query-parameter navigation, to lock the choice.
+    - Once a valid Activity/Symptom agent is selected, no picker is rendered again.
+    - Restarting the dashboard session is the only way to choose another agent.
+    """
+    container = parent if parent is not None else st.sidebar
+
+    locked_key = f"locked_selected_agent_lane_{context_key}"
+    legacy_locked_key = f"locked_agent_choice_{context_key}"
+    selected_key = f"selected_agent_lane_{context_key}"
+    source_key = f"agent_source_{context_key}"
+    picker_key = f"agent_picker_once_{context_key}"
+
+    # Accept any valid saved/restored key, then normalize all keys so the rest of
+    # the app sees one locked choice.
+    locked_choice = (
+        st.session_state.get(locked_key)
+        or st.session_state.get(legacy_locked_key)
+        or st.session_state.get(selected_key)
+        or ""
+    )
+
+    agent_source, display_name, internal_name = _parse_agent_picker_choice(locked_choice)
+
+    if agent_source != "None":
+        st.session_state[locked_key] = locked_choice
+        st.session_state[legacy_locked_key] = locked_choice
+        st.session_state[selected_key] = locked_choice
+        st.session_state[source_key] = agent_source
+
+    with container:
+        st.markdown("**Choose Agent to Tag**")
+
+        if agent_source != "None":
+            st.success(f"Selected data agent: {display_name}")
+            st.caption(
+                "This agent choice is locked. Restart the dashboard session to choose a different data agent."
+            )
+            return agent_source, display_name, internal_name
+
+        agent_choice = st.selectbox(
+            "Agent shown in Track 4 data agent lane",
+            options=AGENT_PICKER_OPTIONS,
+            index=None,
+            key=picker_key,
+            format_func=_format_agent_picker_option,
+            placeholder="Choose one Activity or Symptom agent",
+            help="One agent can be selected only once per dashboard session.",
+        )
+
+        if agent_choice in {AGENT_PICKER_ACTIVITY_HEADER, AGENT_PICKER_SYMPTOM_HEADER}:
+            st.warning(
+                "The group headings are not selectable. Choose a concrete agent under the heading."
+            )
+            return "None", "", ""
+
+        agent_source, display_name, internal_name = _parse_agent_picker_choice(agent_choice)
+        if agent_source != "None":
+            st.session_state[locked_key] = agent_choice
+            st.session_state[legacy_locked_key] = agent_choice
+            st.session_state[selected_key] = agent_choice
+            st.session_state[source_key] = agent_source
+            # Keep older per-agent keys synchronized for saved sessions and any
+            # downstream code that still checks them.
+            if agent_source == "Activity agent":
+                st.session_state[f"selected_activity_lane_{context_key}"] = internal_name
+            elif agent_source == "Symptom agent":
+                st.session_state[f"selected_symptom_lane_{context_key}"] = internal_name
+            st.rerun()
+
+        return "None", "", ""
 
 
 def _interval_overlap(a_start, a_end, b_start, b_end):
@@ -527,19 +796,36 @@ def _build_export_payload(
         if not (isinstance(x, dict) and str(x.get("source", "")).lower() == "chart_drag")
     ]
 
+    # Canonical v7 tag set. This prevents the same hit interval from being saved
+    # once as a browser id tag and once as a stable tag_ id.
+    drawn_tag_intervals = _deduplicate_visual_tags(drawn_tag_intervals)
+    manual_tagger_intervals = _deduplicate_visual_tags(manual_tagger_intervals)
+    canonical_tag_intervals = _deduplicate_visual_tags(list(manual_tagger_intervals) + list(drawn_tag_intervals))
+
     saved_hit_results = []
     if context_key:
         saved_hit_results = _filter_hit_result_rows_for_tags(
             st.session_state.get(f"hit_result_history_{context_key}", []) or [],
-            list(manual_tagger_intervals) + list(drawn_tag_intervals),
+            canonical_tag_intervals,
         )
 
     payload = {
+        
         "dashboard_context": {
             "selected_well": selected_well,
             "selected_sections": [str(x) for x in (selected_sections or [])],
             "context_key": context_key,
+            "selected_agent_choice": (
+                st.session_state.get(f"locked_selected_agent_lane_{context_key}")
+                or st.session_state.get(f"locked_agent_choice_{context_key}")
+                or st.session_state.get(f"selected_agent_lane_{context_key}")
+                or ""
+            ),
+            "agent_source": st.session_state.get(f"agent_source_{context_key}", ""),
+            "selected_activity": st.session_state.get(f"selected_activity_lane_{context_key}", ""),
+            "selected_symptom": st.session_state.get(f"selected_symptom_lane_{context_key}", ""),
         },
+
         "dashboard_state": dashboard_state,
         "plot_track_param_labels": saved_track_param_labels,
         "manual_tagger_intervals": [
@@ -568,7 +854,7 @@ def _build_export_payload(
                 "end": _json_safe_text(x.get("end")),
                 "source": x.get("source", "manual"),
             }
-            for x in tag_intervals
+            for x in canonical_tag_intervals
         ],
         "agent_intervals": [
             {
@@ -623,7 +909,7 @@ def _build_export_payload(
     writer = csv.writer(output)
     writer.writerow(["type", "label", "start", "end", "severity", "source"])
 
-    for item in tag_intervals:
+    for item in canonical_tag_intervals:
         writer.writerow(
             [
                 "tag",
@@ -1418,12 +1704,30 @@ def render_review_loader_before_well_selector() -> dict | None:
 
             if selected_well:
                 st.session_state["selected_well"] = selected_well
+                st.session_state["locked_selected_well"] = selected_well
+                st.session_state["well_choice_locked"] = True
 
             if selected_well and selected_sections:
-                st.session_state[f"selected_sections_{selected_well}"] = [
-                    str(x) for x in selected_sections
-                ]
+                clean_sections = [str(x).replace('"', "").strip() for x in selected_sections]
+                clean_sections = [x for x in clean_sections if x]
 
+                try:
+                    clean_sections = sorted(clean_sections, key=float)
+                except Exception:
+                    clean_sections = sorted(clean_sections)
+
+                st.session_state[f"selected_sections_{selected_well}"] = clean_sections
+                st.session_state[f"locked_selected_sections_{selected_well}"] = clean_sections
+                st.session_state[f"section_choice_locked_{selected_well}"] = True
+
+                loaded_context_key = _make_context_key_from_loaded_parts(
+                    selected_well,
+                    clean_sections,
+                )
+                _restore_locked_agent_choice_from_payload(
+                    uploaded_data,
+                    loaded_context_key,
+                )
             st.success("Saved review JSON loaded.")
             st.rerun()
 
@@ -1434,51 +1738,270 @@ def render_review_loader_before_well_selector() -> dict | None:
         return None
     
 
+def _delete_session_state_prefixes(prefixes: list[str]):
+    for key in list(st.session_state.keys()):
+        key_text = str(key)
+        if any(key_text.startswith(prefix) for prefix in prefixes):
+            try:
+                del st.session_state[key]
+            except Exception:
+                pass
+
+
+def _clear_after_well_unlock_or_change():
+    _delete_session_state_prefixes(
+        [
+            "selected_sections_",
+            "locked_selected_sections_",
+            "section_choice_locked_",
+            "locked_selected_agent_lane_",
+            "locked_agent_choice_",
+            "selected_agent_lane_",
+            "agent_source_",
+            "agent_picker_once_",
+            "selected_activity_lane_",
+            "selected_symptom_lane_",
+            "track_params_",
+            "saved_track_param_labels_",
+            "plot_track_param_labels_",
+            "max_override_",
+            "curve_source_",
+            "visual_tag_intervals_",
+            "hit_result_history_",
+            "enable_tag_",
+            "tag_label_",
+            "tag_start_",
+            "tag_end_",
+            "show_data_agent_tags_",
+            "show_auto_agent_tags_",
+        ]
+    )
+
+
+def _clear_after_section_unlock_or_change():
+    _delete_session_state_prefixes(
+        [
+            "locked_selected_agent_lane_",
+            "locked_agent_choice_",
+            "selected_agent_lane_",
+            "agent_source_",
+            "agent_picker_once_",
+            "selected_activity_lane_",
+            "selected_symptom_lane_",
+            "track_params_",
+            "saved_track_param_labels_",
+            "plot_track_param_labels_",
+            "max_override_",
+            "curve_source_",
+            "visual_tag_intervals_",
+            "hit_result_history_",
+            "enable_tag_",
+            "tag_label_",
+            "tag_start_",
+            "tag_end_",
+            "show_data_agent_tags_",
+            "show_auto_agent_tags_",
+        ]
+    )
+
+def _delete_session_state_prefixes(prefixes: list[str]):
+    for key in list(st.session_state.keys()):
+        key_text = str(key)
+        if any(key_text.startswith(prefix) for prefix in prefixes):
+            try:
+                del st.session_state[key]
+            except Exception:
+                pass
+
+
+def _clear_after_auto_well_lock():
+    _delete_session_state_prefixes(
+        [
+            "selected_sections_",
+            "locked_selected_sections_",
+            "section_choice_locked_",
+            "locked_selected_agent_lane_",
+            "locked_agent_choice_",
+            "selected_agent_lane_",
+            "agent_source_",
+            "agent_picker_once_",
+            "selected_activity_lane_",
+            "selected_symptom_lane_",
+            "track_params_",
+            "saved_track_param_labels_",
+            "plot_track_param_labels_",
+            "max_override_",
+            "curve_source_",
+            "visual_tag_intervals_",
+            "hit_result_history_",
+            "enable_tag_",
+            "tag_label_",
+            "tag_start_",
+            "tag_end_",
+            "show_data_agent_tags_",
+            "show_auto_agent_tags_",
+            "_pending_loaded_review_payload_",
+            "_loaded_dashboard_active_",
+        ]
+    )
+
+
+def _clear_after_auto_section_lock():
+    _delete_session_state_prefixes(
+        [
+            "locked_selected_agent_lane_",
+            "locked_agent_choice_",
+            "selected_agent_lane_",
+            "agent_source_",
+            "agent_picker_once_",
+            "selected_activity_lane_",
+            "selected_symptom_lane_",
+            "track_params_",
+            "saved_track_param_labels_",
+            "plot_track_param_labels_",
+            "max_override_",
+            "curve_source_",
+            "visual_tag_intervals_",
+            "hit_result_history_",
+            "enable_tag_",
+            "tag_label_",
+            "tag_start_",
+            "tag_end_",
+            "show_data_agent_tags_",
+            "show_auto_agent_tags_",
+            "_pending_loaded_review_payload_",
+            "_loaded_dashboard_active_",
+        ]
+    )
+
 
 def render_well_section_selector(sections_by_well: dict):
     with st.sidebar:
-        st.subheader("Well")
+        st.subheader("Step 1 — Choose Well")
 
         wells = sorted(sections_by_well.keys())
+        if not wells:
+            st.error("No wells found in catalog.")
+            return None, []
 
-        saved_well = st.session_state.get("selected_well")
-        if saved_well not in wells:
-            saved_well = wells[0] if wells else None
-            st.session_state["selected_well"] = saved_well
+        locked_well_key = "locked_selected_well"
+        well_locked_key = "well_choice_locked"
 
-        selected_well = st.selectbox(
-            "Select Well",
-            options=wells,
-            index=wells.index(saved_well) if saved_well in wells else 0,
-            key="selected_well",
+        locked_well = st.session_state.get(locked_well_key)
+        well_is_locked = (
+            bool(st.session_state.get(well_locked_key, False))
+            and locked_well in wells
         )
 
-        available_sections = sorted(sections_by_well.get(selected_well, []), key=float)
+        if not well_is_locked:
+            chosen_well = st.selectbox(
+                "Select Well",
+                options=wells,
+                index=None,
+                key="_pending_well_choice",
+                placeholder="Choose well",
+            )
 
-        section_key = f"selected_sections_{selected_well}"
+            if chosen_well:
+                st.session_state[locked_well_key] = chosen_well
+                st.session_state[well_locked_key] = True
+                st.session_state["selected_well"] = chosen_well
+                _clear_after_auto_well_lock()
+                st.rerun()
 
-        existing_sections = st.session_state.get(section_key, [])
-        existing_sections = [
+            st.info("Choose a well to continue.")
+            return None, []
+
+        selected_well = locked_well
+        st.session_state["selected_well"] = selected_well
+        st.success(f"Locked well: {selected_well}")
+
+        st.subheader("Step 2 — Choose Section")
+
+        available_sections = sorted(
+            sections_by_well.get(selected_well, []),
+            key=float,
+        )
+
+        locked_sections_key = f"locked_selected_sections_{selected_well}"
+        section_locked_key = f"section_choice_locked_{selected_well}"
+        selected_sections_key = f"selected_sections_{selected_well}"
+
+        locked_sections = [
             str(sec)
-            for sec in existing_sections
+            for sec in st.session_state.get(locked_sections_key, [])
             if str(sec) in available_sections
         ]
 
-        if existing_sections:
-            st.session_state[section_key] = existing_sections
-
-        st.subheader("Section")
-        selected_sections = st.multiselect(
-            "Select Section(s)",
-            options=available_sections,
-            default=existing_sections,
-            format_func=lambda s: f'{s}"',
-            key=section_key,
+        section_is_locked = (
+            bool(st.session_state.get(section_locked_key, False))
+            and bool(locked_sections)
         )
 
-    return selected_well, selected_sections
+        if not section_is_locked:
+            chosen_section = st.selectbox(
+                "Select Section",
+                options=available_sections,
+                index=None,
+                key=f"_pending_section_choice_{selected_well}",
+                format_func=lambda s: f'{s}"',
+                placeholder="Choose section",
+            )
+
+            if chosen_section:
+                locked_sections = [str(chosen_section)]
+                st.session_state[locked_sections_key] = locked_sections
+                st.session_state[section_locked_key] = True
+                st.session_state[selected_sections_key] = locked_sections
+                _clear_after_auto_section_lock()
+                st.rerun()
+
+            st.info("Choose a section to continue.")
+            return selected_well, []
+
+        st.session_state[selected_sections_key] = locked_sections
+        st.success("Locked section: " + ", ".join(f'{sec}"' for sec in locked_sections))
+
+        return selected_well, locked_sections
 
 
+def render_agent_picker_gate(context_key: str):
+    with st.sidebar:
+        st.subheader("Step 3 — Choose Symptom / Activity Agent")
+
+    _apply_agent_picker_query_params(context_key)
+
+    agent_source, selected_agent_display, selected_agent_internal = _render_locked_agent_picker(
+        context_key=context_key,
+        parent=st.sidebar,
+    )
+
+    if agent_source == "None":
+        with st.sidebar:
+            st.info("Choose one symptom/activity agent to open plotting and tagging options.")
+
+    return agent_source, selected_agent_display, selected_agent_internal
+
+
+def render_agent_picker_gate(context_key: str):
+    with st.sidebar:
+        st.subheader("Step 3 — Symptom / Activity Agent")
+
+    _apply_agent_picker_query_params(context_key)
+
+    agent_source, selected_agent_display, selected_agent_internal = _render_locked_agent_picker(
+        context_key=context_key,
+        parent=st.sidebar,
+    )
+
+    if agent_source == "None":
+        with st.sidebar:
+            st.info(
+                "Choose one symptom/activity agent. After it is selected, the choice is locked "
+                "and the tagging and plotting options will open."
+            )
+
+    return agent_source, selected_agent_display, selected_agent_internal
 
 
 def _clear_plot_selection_for_window_change(context_key: str, plot_context_key: str):
@@ -1626,9 +2149,8 @@ def render_track_parameter_selector(available_param_labels: list[str], context_k
 def render_parameter_range_controls(selected_labels: list[str], context_key: str) -> dict[str, tuple[float, float]]:
     overrides = {}
 
-    with st.sidebar:
-        st.subheader("Parameter Scale Limits")
-        st.caption("You can change the maximum value of the selected parameters here.")
+    with st.sidebar.expander("Parameter Scale Limits", expanded=False):
+        st.caption("Open this section only when you want to adjust the maximum scale limits of the selected parameters.")
 
         for label in selected_labels:
             meta = PARAMETER_CATALOG.get(label, {})
@@ -1819,19 +2341,19 @@ def render_plot_marker_controls(context_key: str) -> str:
     return marker_display
 
 
-def _default_activity_ui(enabled: bool = True) -> dict:
+def _default_activity_ui(enabled: bool = True, selected_activity: str = "All activities") -> dict:
     return {
         "enabled": enabled,
-        "selected_activity": "MakingConnection",
+        "selected_activity": selected_activity,
         "config": ActivityConfig(),
         "manual_activity_tags": [],
     }
 
 
-def _default_symptom_ui(enabled: bool = False) -> dict:
+def _default_symptom_ui(enabled: bool = False, selected_symptom: str = "") -> dict:
     return {
         "enabled": enabled,
-        "selected_symptom": "TRQErratic",
+        "selected_symptom": selected_symptom,
         "config": SymptomConfig(),
     }
 
@@ -1999,48 +2521,21 @@ def render_manual_activity_validation_tags(
 
     return manual_activity_tags
 
-def render_activity_agent_controls(context_key: str, df=None, parent=None):
+def render_activity_agent_controls(
+    context_key: str,
+    selected_activity: str,
+    df=None,
+    parent=None,
+):
     container = parent if parent is not None else st.sidebar
 
     with container:
         st.subheader("Activity Agent Settings")
+        selected_activity_display = ACTIVITY_AGENT_DISPLAY_BY_INTERNAL.get(selected_activity, selected_activity)
+        st.caption(f"Selected activity agent: {selected_activity_display}")
 
-        enabled = st.checkbox(
-            "Enable automatic activity recognition",
-            value=True,
-            key=f"enable_activity_agent_{context_key}",
-        )
-
-        selected_activity = st.selectbox(
-            "Activity shown in Track 4 agent lane",
-            options=[
-                "All activities",
-                "MakingConnection",
-                "Drilling",
-                "Reaming",
-                "TrippingIn",
-                "TrippingOut",
-                "Conditioning",
-                "Circulating",
-                "Other",
-            ],
-            index=1,
-            key=f"selected_activity_lane_{context_key}",
-        )
-
+        enabled = True
         manual_activity_tags = []
-
-        if df is not None and not df.empty:
-            t_min = df.index.min().to_pydatetime()
-            t_max = df.index.max().to_pydatetime()
-
-            manual_activity_tags = render_manual_activity_validation_tags(
-                context_key=context_key,
-                t_min=t_min,
-                t_max=t_max,
-            )
-        else:
-            st.warning("No data available for manual activity validation tags.")
 
         with st.expander("Activity thresholds — VT document definitions", expanded=False):
             short_window = st.number_input(
@@ -2219,29 +2714,19 @@ def render_activity_agent_controls(context_key: str, df=None, parent=None):
         "manual_activity_tags": manual_activity_tags,
     }
 
-def render_symptom_agent_controls(context_key: str, parent=None):
+def render_symptom_agent_controls(
+    context_key: str,
+    selected_symptom: str,
+    parent=None,
+):
     container = parent if parent is not None else st.sidebar
 
     with container:
         st.subheader("Symptom Agent Settings")
+        display_symptom = SYMPTOM_AGENT_DISPLAY_BY_INTERNAL.get(selected_symptom, selected_symptom)
+        st.caption(f"Selected symptom agent: {display_symptom}")
 
-        enabled = st.checkbox(
-            "Enable symptom agents",
-            value=True,
-            key=f"enable_symptom_agents_{context_key}",
-        )
-
-        symptom_options = ["OpenHoleLength", "TRQSpike", "TRQErratic", "PSpike", "OverPull", "TookWeight"]
-        symptom_key = f"selected_symptom_lane_{context_key}"
-        if st.session_state.get(symptom_key) not in symptom_options:
-            st.session_state[symptom_key] = "TRQErratic"
-
-        selected_symptom = st.selectbox(
-            "Symptom shown in Track 4 agent lane",
-            options=symptom_options,
-            index=symptom_options.index(st.session_state.get(symptom_key, "TRQErratic")),
-            key=symptom_key,
-        )
+        enabled = True
 
         with st.expander("Symptom thresholds — VT document definitions", expanded=False):
             casing_depth_fallback = st.number_input(
@@ -3698,6 +4183,24 @@ def render_agent_controls(
         t_min = df.index.min().to_pydatetime()
         t_max = df.index.max().to_pydatetime()
 
+        
+        section_t_min = t_min
+        section_t_max = t_max
+
+        try:
+            section_t_min = pd.Timestamp(
+                st.session_state.get(f"_section_time_start_{context_key}", t_min)
+            ).to_pydatetime()
+        except Exception:
+            section_t_min = t_min
+
+        try:
+            section_t_max = pd.Timestamp(
+                st.session_state.get(f"_section_time_end_{context_key}", t_max)
+            ).to_pydatetime()
+        except Exception:
+            section_t_max = t_max
+        
         pending_payload_key = f"_pending_loaded_review_payload_{context_key}"
 
         if pending_payload_key in st.session_state:
@@ -3781,62 +4284,66 @@ def render_agent_controls(
                     except Exception:
                         pass
 
-        st.markdown("**Tagger lane**")
-        st.caption(
-            "Draw tags with the chart Tagging button, or enable a manual tag below. "
-            "Saved tags remain section-level and only appear in windows they overlap."
-        )
-
-        st.caption(
-            f"Current loaded window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
-        )
-
-        for i in range(1, 4):
-            enabled = st.checkbox(
-                f"Enable Tag {i}",
-                value=False,
-                key=f"enable_tag_{i}_{context_key}",
+        with st.expander("Manual Tag Intervals", expanded=False):
+            st.caption(
+                "Set tag start and end times manually, or draw tags directly on the chart. "
+                "Saved tags remain section-level and only appear in windows they overlap."
             )
 
-            if enabled:
-                label = st.text_input(
-                    f"Tag {i} label",
-                    value=f"Observation {i}",
-                    key=f"tag_label_{i}_{context_key}",
+            st.caption(
+                f"Current loaded window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
+            )
+            st.caption(
+                f"Manual tags can use full section range: "
+                f"{_format_datetime_text(section_t_min)} → {_format_datetime_text(section_t_max)}"
+            )
+
+            for i in range(1, 4):
+                enabled = st.checkbox(
+                    f"Enable Tag {i}",
+                    value=False,
+                    key=f"enable_tag_{i}_{context_key}",
                 )
 
-                tag_start = _safe_datetime_input(
-                    label=f"Tag {i} start time — year / month / day / hour / minute / second",
-                    key=f"tag_start_{i}_{context_key}",
-                    default_value=t_min,
-                    min_value=t_min,
-                    max_value=t_max,
-                )
-
-                tag_end = _safe_datetime_input(
-                    label=f"Tag {i} end time — year / month / day / hour / minute / second",
-                    key=f"tag_end_{i}_{context_key}",
-                    default_value=min(t_max, t_min + timedelta(minutes=30)),
-                    min_value=t_min,
-                    max_value=t_max,
-                )
-
-                if pd.Timestamp(tag_end) <= pd.Timestamp(tag_start):
-                    st.warning(
-                        f"Tag {i}: end time must be after start time. "
-                        "This tag is not added to Track 4."
+                if enabled:
+                    label = st.text_input(
+                        f"Tag {i} label",
+                        value=f"Observation {i}",
+                        key=f"tag_label_{i}_{context_key}",
                     )
-                    continue
 
-                st.caption(f"Tag interval: {tag_start} → {tag_end}")
+                    tag_start = _safe_datetime_input(
+                        label=f"Tag {i} start time — year / month / day / hour / minute / second",
+                        key=f"tag_start_{i}_{context_key}",
+                        default_value=t_min,
+                        min_value=section_t_min,
+                        max_value=section_t_max,
+                    )
 
-                tag_intervals.append(
-                    {
-                        "label": label.strip() or f"Observation {i}",
-                        "start": tag_start,
-                        "end": tag_end,
-                    }
-                )
+                    tag_end = _safe_datetime_input(
+                        label=f"Tag {i} end time — year / month / day / hour / minute / second",
+                        key=f"tag_end_{i}_{context_key}",
+                        default_value=min(section_t_max, pd.Timestamp(t_min) + timedelta(minutes=30)),
+                        min_value=section_t_min,
+                        max_value=section_t_max,
+                    )
+
+                    if pd.Timestamp(tag_end) <= pd.Timestamp(tag_start):
+                        st.warning(
+                            f"Tag {i}: end time must be after start time. "
+                            "This tag is not added to Track 4."
+                        )
+                        continue
+
+                    st.caption(f"Tag interval: {tag_start} → {tag_end}")
+
+                    tag_intervals.append(
+                        {
+                            "label": label.strip() or f"Observation {i}",
+                            "start": tag_start,
+                            "end": tag_end,
+                        }
+                    )
 
         # Chart-drawn tags restored from JSON or received from the browser are
         # stored separately from the three sidebar Tagger slots. Add them to the
@@ -3863,103 +4370,58 @@ def render_agent_controls(
 
         st.markdown("**Agent lane**")
 
-        agent_source_options = ["Manual interval", "Activity agent", "Symptom agent"]
-        agent_source_key = f"agent_source_{context_key}"
-        agent_source_default_key = f"_agent_source_default_fixed_{context_key}"
-
-        # Streamlit keeps old widget values in session_state. If this app was opened
-        # before the default changed, the radio can stay stuck on "Manual interval".
-        # Force the new default once per well/section context, then let the user choose freely.
-        if not st.session_state.get(agent_source_default_key, False):
-            if st.session_state.get(agent_source_key) in (None, "Manual interval"):
-                st.session_state[agent_source_key] = "Symptom agent"
-            st.session_state[agent_source_default_key] = True
-
-        if st.session_state.get(agent_source_key) not in agent_source_options:
-            st.session_state[agent_source_key] = "Symptom agent"
-
-        agent_source = st.radio(
-            "Agent lane source",
-            options=agent_source_options,
-            key=agent_source_key,
+        _apply_agent_picker_query_params(context_key)
+        agent_source, selected_agent_display, selected_agent_internal = _render_locked_agent_picker(
+            context_key=context_key,
+            parent=container,
         )
 
-        activity_ui = _default_activity_ui(enabled=False)
-        symptom_ui = _default_symptom_ui(enabled=False)
+        show_agent_lane_choice = st.radio(
+            "Automatic data-agent tags in Track 4 lane",
+            options=["Show", "Hide"],
+            index=0,
+            horizontal=True,
+            key=f"show_auto_agent_tags_{context_key}",
+            help="Show or hide the automatic data-agent intervals in the Track 4 data-agent lane. This does not change the selected agent or the hit calculations.",
+        )
+        show_agent_intervals = show_agent_lane_choice == "Show"
+        st.session_state[f"show_data_agent_tags_{context_key}"] = show_agent_intervals
 
-        if agent_source == "Manual interval":
-            enabled = st.checkbox(
-                "Enable Agent Hit",
-                value=True,
-                key=f"enable_agent_1_{context_key}",
-            )
+        activity_ui = _default_activity_ui(enabled=False, selected_activity="")
+        symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
+        manual_agent_intervals = []
 
-            if enabled:
-                label = st.text_input(
-                    "Agent Hit label",
-                    value="Hit 1",
-                    key=f"agent_label_1_{context_key}",
-                )
-
-                agent_interval_key = f"agent_interval_1_{context_key}"
-
-                safe_agent_interval = _safe_slider_interval_state(
-                    key=agent_interval_key,
-                    min_value=t_min,
-                    max_value=t_max,
-                    default_start=t_min,
-                    default_end=t_max,
-                )
-
-                interval = st.slider(
-                    "Agent Hit interval",
-                    min_value=t_min,
-                    max_value=t_max,
-                    value=safe_agent_interval,
-                    format="YYYY-MM-DD HH:mm:ss",
-                    key=agent_interval_key,
-                )
-
-                severity = st.selectbox(
-                    "Agent Hit severity",
-                    options=["Low", "Medium", "High"],
-                    index=1,
-                    key=f"agent_severity_1_{context_key}",
-                )
-
-                manual_agent_intervals.append(
-                    {
-                        "label": label.strip() or "Hit 1",
-                        "start": interval[0],
-                        "end": interval[1],
-                        "severity": severity,
-                        "source": "manual_agent",
-                    }
-                )
-
-        elif agent_source == "Activity agent":
+        if agent_source == "Activity agent":
+            settings_container = st.expander("Activity Agent Settings", expanded=False)
             activity_ui = render_activity_agent_controls(
                 context_key=context_key,
+                selected_activity=selected_agent_internal,
                 df=df,
-                parent=container,
+                parent=settings_container,
             )
-            symptom_ui = _default_symptom_ui(enabled=False)
+            symptom_ui = _default_symptom_ui(enabled=False, selected_symptom="")
 
         elif agent_source == "Symptom agent":
-            # Important:
-            # Symptom agents need activity labels/features internally,
-            # so Activity Agent runs in the background with default settings.
-            activity_ui = _default_activity_ui(enabled=True)
+            # Symptom agents need activity labels/features internally, so the
+            # Activity Agent still runs in the background. It is not a second
+            # selected/lane-visible agent.
+            activity_ui = _default_activity_ui(enabled=True, selected_activity="All activities")
 
+            settings_container = st.expander("Symptom Agent Settings", expanded=False)
             symptom_ui = render_symptom_agent_controls(
                 context_key=context_key,
-                parent=container,
+                selected_symptom=selected_agent_internal,
+                parent=settings_container,
             )
+        else:
+            st.caption("No data agent selected yet.")
 
     return {
         "agent_source": agent_source,
         "tag_intervals": tag_intervals,
-        "manual_agent_intervals": manual_agent_intervals,
+        "manual_agent_intervals": [],
+        "show_agent_intervals": show_agent_intervals,
+        "show_data_agent_tags": show_agent_intervals,
         "activity_ui": activity_ui,
         "symptom_ui": symptom_ui,
         "show_reference_line": show_reference_line,
@@ -3973,34 +4435,27 @@ def build_agent_cfg_from_controls(
     activity_cfg: dict,
     symptom_cfg: dict,
 ) -> dict:
-    agent_source = controls["agent_source"]
-    tag_intervals = controls["tag_intervals"]
-    manual_agent_intervals = controls["manual_agent_intervals"]
+    agent_source = controls.get("agent_source", "None")
+    tag_intervals = controls.get("tag_intervals", [])
 
     auto_agent_intervals = []
 
     if agent_source == "Activity agent" and activity_cfg and activity_cfg.get("intervals"):
-        selected_activity = activity_cfg.get("selected_activity", "All activities")
+        selected_activity = activity_cfg.get("selected_activity", "")
 
-        if selected_activity == "All activities":
-            auto_agent_intervals = activity_cfg["intervals"]
-        else:
-            auto_agent_intervals = [
-                item
-                for item in activity_cfg["intervals"]
-                if item["label"] == selected_activity
-            ]
+        auto_agent_intervals = [
+            item
+            for item in activity_cfg["intervals"]
+            if item.get("label") == selected_activity
+        ]
 
     elif agent_source == "Symptom agent" and symptom_cfg and symptom_cfg.get("intervals"):
         auto_agent_intervals = symptom_cfg["intervals"]
 
-    if agent_source == "Manual interval":
-        agent_intervals = manual_agent_intervals
-    else:
-        agent_intervals = auto_agent_intervals
+    agent_intervals = auto_agent_intervals
 
     activity_ui = controls.get("activity_ui", {})
-    manual_activity_tags = activity_ui.get("manual_activity_tags", [])
+    manual_activity_tags = []
 
     summary = _build_summary(tag_intervals, agent_intervals)
 
@@ -4013,6 +4468,8 @@ def build_agent_cfg_from_controls(
         "agent_source": agent_source,
         "tag_intervals": tag_intervals,
         "agent_intervals": agent_intervals,
+        "show_agent_intervals": bool(controls.get("show_agent_intervals", controls.get("show_data_agent_tags", True))),
+        "show_data_agent_tags": bool(controls.get("show_agent_intervals", controls.get("show_data_agent_tags", True))),
         "summary": summary,
         "show_reference_line": controls["show_reference_line"],
         "reference_time": controls["reference_time"],
@@ -4153,6 +4610,12 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
     if not uploaded_data:
         return
 
+        _restore_locked_agent_choice_from_payload(
+        uploaded_data,
+        context_key,
+    )
+    
+    
     dashboard_state = uploaded_data.get("dashboard_state", {}) or {}
     widget_state = dashboard_state.get("widget_state", {}) or {}
 
@@ -4289,16 +4752,26 @@ def _render_dashboard_session_download_with_browser_tags(
 
                 if (startMs === null || endMs === null || endMs <= startMs) return null;
 
+                const rawSource = String(item.source || item["source"] || "").toLowerCase();
+                const chartSources = ["chart_drag", "client_drag_tag", "visual", "visual_tag", "dragged", "server_tagger"];
+                const source = chartSources.includes(rawSource) ? "chart_drag" : (rawSource || "manual");
+
                 return {{
-                    label: String(item.label || item["Tag Label"] || item.tag_label || ("Drawn Tag " + idx)),
+                    label: String(item.label || item["Tag Label"] || item.tag_label || (source === "chart_drag" ? ("Drawn Tag " + idx) : ("Observation " + idx))),
                     start: String(start).replace("T", " ").slice(0, 19),
                     end: String(end).replace("T", " ").slice(0, 19),
-                    source: "chart_drag"
+                    source: source
                 }};
             }}
 
             function identity(tag) {{
-                return String(tag.label || "") + "|" + String(tag.start || "") + "|" + String(tag.end || "");
+                const source = String((tag && tag.source) || "chart_drag").toLowerCase();
+                const start = String((tag && tag.start) || "").replace("T", " ").slice(0, 19);
+                const end = String((tag && tag.end) || "").replace("T", " ").slice(0, 19);
+                if (source === "chart_drag" || source === "client_drag_tag" || source === "visual" || source === "visual_tag" || source === "dragged" || source === "server_tagger") {{
+                    return "chart_drag|" + start + "|" + end;
+                }}
+                return source + "|" + String((tag && tag.label) || "") + "|" + start + "|" + end;
             }}
 
             function deduplicate(tags) {{
@@ -4321,7 +4794,7 @@ def _render_dashboard_session_download_with_browser_tags(
 
             function readJsonList(key) {{
                 try {{
-                    const raw = window.localStorage.getItem(key);
+                    const raw = window.sessionStorage.getItem(key) || window.localStorage.getItem(key);
                     if (!raw) return [];
                     const parsed = JSON.parse(raw);
                     return Array.isArray(parsed) ? parsed : [];
@@ -4332,7 +4805,9 @@ def _render_dashboard_session_download_with_browser_tags(
 
             function readJsonListWithPresence(key) {{
                 try {{
-                    const raw = window.localStorage.getItem(key);
+                    const rawSession = window.sessionStorage.getItem(key);
+                    const rawLocal = window.localStorage.getItem(key);
+                    const raw = rawSession !== null && rawSession !== undefined ? rawSession : rawLocal;
                     if (raw === null || raw === undefined) return {{exists: false, items: []}};
                     const parsed = JSON.parse(raw || "[]");
                     return {{exists: true, items: Array.isArray(parsed) ? parsed : []}};
@@ -4344,34 +4819,24 @@ def _render_dashboard_session_download_with_browser_tags(
             function readBrowserDrawnTags() {{
                 if (!contextKey) return [];
 
-                // React virtual viewer writes this latest key on every tag/table
-                // change, including [] on a fresh session. If it exists, trust it
-                // and do not fall back to older session-token keys.
+                // v7: read only the current latest list. Do not scan old
+                // session-token browser keys; they caused old hit tags to reappear.
                 const virtualLatest = readJsonListWithPresence("hoda_virtual_chart_tags_latest_" + contextKey);
                 if (virtualLatest.exists) return deduplicate(virtualLatest.items);
 
                 const legacyLatest = readJsonListWithPresence("hoda_client_visual_tags_latest_" + contextKey);
                 if (legacyLatest.exists) return deduplicate(legacyLatest.items);
 
-                let items = [];
+                return [];
+            }}
 
-                // Fallback for dashboards opened before the latest-key fix:
-                // collect all session-token-specific keys for this context.
-                const prefixes = [
-                    "hoda_virtual_chart_tags_" + contextKey + "_",
-                    "hoda_client_visual_tags_" + contextKey + "_",
-                ];
-                try {{
-                    for (let i = 0; i < window.localStorage.length; i++) {{
-                        const key = window.localStorage.key(i);
-                        if (!key) continue;
-                        if (key.includes("_redo_")) continue;
-                        if (!prefixes.some(function(prefix) {{ return key.startsWith(prefix); }})) continue;
-                        items = items.concat(readJsonList(key));
-                    }}
-                }} catch (e) {{}}
+            function readBrowserAllTags() {{
+                if (!contextKey) return [];
 
-                return deduplicate(items);
+                const latest = readJsonListWithPresence("hoda_virtual_all_tags_latest_" + contextKey);
+                if (latest.exists) return deduplicate(latest.items);
+
+                return [];
             }}
 
             function readBrowserHitResults() {{
@@ -4401,7 +4866,6 @@ def _render_dashboard_session_download_with_browser_tags(
                     const ident = [
                         row.well || "",
                         row.section || "",
-                        row.tag_label || "",
                         row.tag_start || "",
                         row.tag_end || ""
                     ].join("|");
@@ -4467,7 +4931,6 @@ def _render_dashboard_session_download_with_browser_tags(
                     const ident = [
                         row.well || "",
                         row.section || "",
-                        row.tag_label || "",
                         tagStart,
                         tagEnd
                     ].join("|");
@@ -4511,9 +4974,30 @@ def _render_dashboard_session_download_with_browser_tags(
                     return;
                 }}
 
-                const browserDrawnTags = readBrowserDrawnTags();
+                const browserAllTags = readBrowserAllTags();
+                const browserDrawnTags = browserAllTags.length
+                    ? browserAllTags.filter(function(tag) {{
+                        return String((tag && tag.source) || "").toLowerCase() === "chart_drag";
+                    }})
+                    : readBrowserDrawnTags();
+                
                 const browserHitResults = readBrowserHitResults();
                 const finalPayload = mergePayloadWithDrawnTags(basePayload, browserDrawnTags, browserHitResults);
+
+                if (browserAllTags.length) {{
+                    const allTags = deduplicate(browserAllTags);
+                    const manualTags = allTags.filter(function(tag) {{
+                        return String((tag && tag.source) || "").toLowerCase() !== "chart_drag";
+                    }});
+                    const drawnTags = allTags.filter(function(tag) {{
+                        return String((tag && tag.source) || "").toLowerCase() === "chart_drag";
+                    }});
+
+                    finalPayload.manual_tagger_intervals = manualTags;
+                    finalPayload.drawn_tag_intervals = drawnTags;
+                    finalPayload.tag_intervals = allTags;
+                    finalPayload.dashboard_state.widget_state["visual_tag_intervals_" + contextKey] = drawnTags;
+                }}
                 const finalText = JSON.stringify(finalPayload, null, 2);
 
                 downloadText(finalText, fileName);
@@ -4632,7 +5116,3 @@ def render_agent_review_outputs(
                 mime="text/csv",
                 key=f"download_csv_{context_key}",
             )
-
-
-
-
