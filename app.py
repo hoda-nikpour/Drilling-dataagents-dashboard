@@ -882,6 +882,7 @@ def _render_virtual_log_component(
     agent_cfg: dict,
     window_info: dict,
     chart_height: int,
+    parameter_ranges: dict[str, tuple[float, float]] | None = None,
 ):
     if render_virtual_log_viewer is None:
         st.error(
@@ -901,6 +902,7 @@ def _render_virtual_log_component(
         track_params_real=track_params_real[:3],
         track_param_labels=track_param_labels[:3],
         parameter_units=_parameter_units_from_catalog(track_param_labels[:3]),
+        parameter_ranges=parameter_ranges,
     )
 
     manual_or_sidebar_tags = _deduplicate_virtual_component_tags(
@@ -1746,6 +1748,7 @@ def main():
                 "arrow rail to move through time and load the next raw buffer near the edge. "
                 "Raw points are not downsampled."
             )
+            
         _render_virtual_log_component(
             df=df,
             context_key=context_key,
@@ -1756,6 +1759,7 @@ def main():
             agent_cfg=agent_cfg,
             window_info=window_info,
             chart_height=agent_cfg.get("chart_height", 950),
+            parameter_ranges=parameter_ranges,
         )
     else:
         render_chart(

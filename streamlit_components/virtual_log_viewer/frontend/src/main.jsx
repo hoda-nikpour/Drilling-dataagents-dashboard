@@ -48,13 +48,27 @@ function safeDownloadName(value, fallback = "data agent") {
   return text || fallback;
 }
 
-function normalize(values) {
+function normalize(values, limitMin = null, limitMax = null) {
   const nums = values.filter((v) => Number.isFinite(Number(v))).map(Number);
-  if (!nums.length) return values.map(() => null);
-  const mn = Math.min(...nums);
-  const mx = Math.max(...nums);
-  if (Math.abs(mx - mn) < 1e-12) return values.map((v) => (v == null ? null : 0.5));
-  return values.map((v) => (v == null || !Number.isFinite(Number(v)) ? null : (Number(v) - mn) / (mx - mn)));
+
+  let mn = Number(limitMin);
+  let mx = Number(limitMax);
+
+  if (!Number.isFinite(mn) || !Number.isFinite(mx)) {
+    if (!nums.length) return values.map(() => null);
+    mn = Math.min(...nums);
+    mx = Math.max(...nums);
+  }
+
+  if (Math.abs(mx - mn) < 1e-12) {
+    return values.map((v) => (v == null || !Number.isFinite(Number(v)) ? null : 0.5));
+  }
+
+  return values.map((v) => {
+    if (v == null || !Number.isFinite(Number(v))) return null;
+    const clipped = clamp(Number(v), mn, mx);
+    return (clipped - mn) / (mx - mn);
+  });
 }
 
 function formatLimitValue(value) {
@@ -70,6 +84,15 @@ function formatLimitValue(value) {
 function curveLimitsText(curve) {
   const label = String(curve?.label || curve?.raw_col || "Parameter").trim();
   const unit = String(curve?.unit || "").trim();
+
+  const displayMin = Number(curve?.display_min);
+  const displayMax = Number(curve?.display_max);
+
+  if (Number.isFinite(displayMin) && Number.isFinite(displayMax)) {
+    const limits = `${formatLimitValue(displayMin)} – ${formatLimitValue(displayMax)}`;
+    return unit ? `${label}: ${limits} ${unit}` : `${label}: ${limits}`;
+  }
+
   const nums = (Array.isArray(curve?.x) ? curve.x : [])
     .map(Number)
     .filter((value) => Number.isFinite(value));
@@ -420,7 +443,7 @@ function buildCurveTraces(trackData) {
     const trackNo = Number(track.track || 1);
     const axis = traceAxis(trackNo);
     (track.curves || []).forEach((curve, curveIdx) => {
-      const xNorm = normalize(curve.x || []);
+      const xNorm = normalize(curve.x || [], curve.display_min, curve.display_max);
       traces.push({
         type: "scatter",
         mode: "lines",
@@ -1598,7 +1621,7 @@ function getTaggingHoverCurvePoint(e, timeMs) {
   track.curves.forEach((curve) => {
     const ys = Array.isArray(curve.y) ? curve.y : [];
     const rawValues = Array.isArray(curve.x) ? curve.x : [];
-    const normalizedValues = normalize(rawValues);
+    const normalizedValues = normalize(rawValues, curve.display_min, curve.display_max);
 
     ys.forEach((timeText, idx) => {
       const pointMs = toMs(timeText);

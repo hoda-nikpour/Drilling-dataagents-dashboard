@@ -9,6 +9,7 @@ def dataframe_to_track_payload(
     track_params_real: list[list[str]],
     track_param_labels: list[list[str]],
     parameter_units: dict[str, str] | None = None,
+    parameter_ranges: dict[str, tuple[float, float]] | None = None,
 ) -> dict:
     """
     Convert the currently loaded raw buffer into a compact JSON payload.
@@ -17,6 +18,7 @@ def dataframe_to_track_payload(
     React component.
     """
     parameter_units = parameter_units or {}
+    parameter_ranges = parameter_ranges or {}
 
     if df is None or df.empty:
         return {"tracks": [], "time_start": None, "time_end": None}
@@ -34,6 +36,24 @@ def dataframe_to_track_payload(
 
             label = labels[col_idx] if col_idx < len(labels) else raw_col
             s = pd.to_numeric(df[raw_col], errors="coerce")
+            s_valid = s.dropna()
+
+            display_min = None
+            display_max = None
+
+            range_item = parameter_ranges.get(str(label)) or parameter_ranges.get(str(raw_col))
+            if range_item is not None:
+                try:
+                    display_min = float(range_item[0])
+                    display_max = float(range_item[1])
+                except Exception:
+                    display_min = None
+                    display_max = None
+
+            if display_min is None or display_max is None:
+                if not s_valid.empty:
+                    display_min = float(s_valid.min())
+                    display_max = float(s_valid.max())
 
             values = []
             for v in s:
@@ -47,6 +67,8 @@ def dataframe_to_track_payload(
                     "label": str(label),
                     "raw_col": str(raw_col),
                     "unit": parameter_units.get(str(label), ""),
+                    "display_min": display_min,
+                    "display_max": display_max,
                     "x": values,
                     "y": idx_text,
                 }
