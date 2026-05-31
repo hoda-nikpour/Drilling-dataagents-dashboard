@@ -2022,7 +2022,9 @@ def render_chart(
         try {{
             const raw = window.localStorage.getItem(hitResultHistoryStorageKey_{div_id});
             const parsed = JSON.parse(raw || "[]");
-            return Array.isArray(parsed) ? parsed : [];
+            return Array.isArray(parsed)
+                ? parsed.map(function(row) {{ return _normalizeHitResultAgentName_{div_id}(row); }})
+                : [];
         }} catch (e) {{
             return [];
         }}
@@ -2030,7 +2032,9 @@ def render_chart(
 
     function saveHitResultHistory_{div_id}(rows) {{
         if (!visualTagContextKey_{div_id}) return;
-        const safeRows = Array.isArray(rows) ? rows : [];
+        const safeRows = Array.isArray(rows)
+        ? rows.map(function(row) {{ return _normalizeHitResultAgentName_{div_id}(row); }})
+        : [];
         try {{
             window.localStorage.setItem(
                 hitResultHistoryStorageKey_{div_id},
@@ -2057,7 +2061,7 @@ def render_chart(
             const ident = _rowIdentity_{div_id}(row || {{}});
             if (!ident || seen.has(ident)) return;
             seen.add(ident);
-            out.push(row);
+            out.push(_normalizeHitResultAgentName_{div_id}(row));
         }});
 
         (currentRows || []).forEach(function(row) {{
@@ -2069,9 +2073,9 @@ def render_chart(
             }});
 
             if (existingIndex >= 0) {{
-                out[existingIndex] = row;
+                out[existingIndex] = _normalizeHitResultAgentName_{div_id}(row);
             }} else {{
-                out.push(row);
+                out.push(_normalizeHitResultAgentName_{div_id}(row));
             }}
 
             seen.add(ident);
@@ -2093,6 +2097,15 @@ def render_chart(
         return "Data agent";
     }}
 
+    function _normalizeHitResultAgentName_{div_id}(row) {{
+        const clean = Object.assign({{}}, row || {{}});
+        const currentAgentName = _selectedAgentNameForRows_{div_id}();
+
+        clean.data_agent = currentAgentName;
+        clean.symptom = currentAgentName;
+        return clean;
+    }}
+
     function _tagResultRows_{div_id}() {{
         const tags = _allTagIntervalsForResults_{div_id}();
         const rows = [];
@@ -2103,8 +2116,8 @@ def render_chart(
             const best = overlaps.length ? overlaps[0] : null;
             const percentValue = best ? (best.total_percent ?? best.percent ?? 0.0) : 0.0;
             rows.push({{
-                symptom: best ? (best.agent_name || defaultSymptom) : defaultSymptom,
-                data_agent: best ? (best.agent_name || defaultSymptom) : defaultSymptom,
+                symptom: defaultSymptom,
+                data_agent: defaultSymptom,
                 well: visualTagContextKey_{div_id}.split("__")[0] || "",
                 section: (visualTagContextKey_{div_id}.split("__")[1] || "").replaceAll("_", " + "),
                 date: tagItem.start ? tagItem.start.split(" ")[0] : "",
@@ -2169,7 +2182,8 @@ def render_chart(
 
         rows.forEach(function(r) {{
             html += "<tr>";
-            [r.data_agent || r.symptom, r.well, r.section, r.date, r.tag_start, r.tag_end, r.agent_start, r.agent_end, r.result, r.percent].forEach(function(value) {{
+            const cleanRow = _normalizeHitResultAgentName_{div_id}(r);
+            [cleanRow.data_agent || cleanRow.symptom, cleanRow.well, cleanRow.section, cleanRow.date, cleanRow.tag_start, cleanRow.tag_end, cleanRow.agent_start, cleanRow.agent_end, cleanRow.result, cleanRow.percent].forEach(function(value) {{
                 html += "<td style='border:1px solid #ddd;padding:4px 6px'>" + _htmlEscape_{div_id}(value) + "</td>";
             }});
             html += "</tr>";
@@ -2196,7 +2210,8 @@ def render_chart(
         table += "</tr></thead><tbody>";
         rows.forEach(function(r) {{
             table += "<tr>";
-            [r.data_agent || r.symptom, r.well, r.section, r.date, r.tag_start, r.tag_end, r.agent_start, r.agent_end, r.result, r.percent].forEach(function(value) {{
+            const cleanRow = _normalizeHitResultAgentName_{div_id}(r);
+            [cleanRow.data_agent || cleanRow.symptom, cleanRow.well, cleanRow.section, cleanRow.date, cleanRow.tag_start, cleanRow.tag_end, cleanRow.agent_start, cleanRow.agent_end, cleanRow.result, cleanRow.percent].forEach(function(value) {{
                 table += "<td>" + _htmlEscape_{div_id}(value) + "</td>";
             }});
             table += "</tr>";

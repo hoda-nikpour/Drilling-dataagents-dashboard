@@ -74,12 +74,32 @@ function normalize(values, limitMin = null, limitMax = null) {
 function formatLimitValue(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "";
+
   const abs = Math.abs(n);
-  if ((abs >= 1000 || abs < 0.01) && abs !== 0) return n.toExponential(2);
-  if (abs >= 100) return n.toFixed(0);
-  if (abs >= 10) return n.toFixed(1);
-  return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+  if (abs >= 100) return Math.round(n).toString();
+  if (abs >= 10) return n.toFixed(1).replace(/0+$/, "").replace(/\.$/, "");
+  if (abs >= 1) return n.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+  if (abs === 0) return "0";
+  return n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
 }
+
+function fmtDateTimeLocal(ms) {
+  const d = new Date(ms);
+  if (!Number.isFinite(d.getTime())) return "";
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
+}
+
+function dateTimeLocalToMs(value) {
+  if (!value) return null;
+  return toMs(String(value).replace("T", " "));
+}
+
 
 function curveLimitsText(curve) {
   const label = String(curve?.label || curve?.raw_col || "Parameter").trim();
@@ -436,7 +456,7 @@ function traceAxis(trackNo) {
   return {xaxis: `x${trackNo}`, yaxis: `y${trackNo}`};
 }
 
-function buildCurveTraces(trackData) {
+function buildCurveTraces(trackData, markerDisplay = "Lines only") {
   const traces = [];
   const colors = ["#8e44ad", "#2f80ed", "#27ae60", "#d35400", "#7f8c8d"];
   (trackData?.tracks || []).forEach((track) => {
@@ -444,14 +464,18 @@ function buildCurveTraces(trackData) {
     const axis = traceAxis(trackNo);
     (track.curves || []).forEach((curve, curveIdx) => {
       const xNorm = normalize(curve.x || [], curve.display_min, curve.display_max);
+      const showMarkers = markerDisplay === "Small dots" || markerDisplay === "Larger dots";
+      const markerSize = markerDisplay === "Larger dots" ? 4 : 2;
+
       traces.push({
         type: "scatter",
-        mode: "lines",
+        mode: showMarkers ? "lines+markers" : "lines",
         x: xNorm,
         y: curve.y || [],
         xaxis: axis.xaxis,
         yaxis: axis.yaxis,
         line: {width: 1.5, color: colors[curveIdx % colors.length], simplify: false},
+        marker: {size: markerSize, opacity: showMarkers ? 0.75 : 0, color: colors[curveIdx % colors.length], line: {width: 0}},
         connectgaps: false,
         name: `${curve.label}`,
         hoverinfo: "none",
@@ -493,7 +517,7 @@ function buildGridKeepaliveTraces(rangeStartMs, rangeEndMs) {
   });
 }
 
-function normalizeAgentIntervals(agentIntervals) {
+function normalizeAgentIntervals(agentIntervals, selectedAgentName = "") {
   return (agentIntervals || [])
     .map((item, idx) => {
       const s = toMs(item.start);
@@ -507,7 +531,7 @@ function normalizeAgentIntervals(agentIntervals) {
         endMs,
         start: fmtTime(startMs),
         end: fmtTime(endMs),
-        label: item.label || "Agent hit",
+        label: item.label || String(selectedAgentName || "").trim() || "data agent",
         severity: item.severity || "",
         idx,
       };
@@ -586,7 +610,8 @@ function App(props) {
   );
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [hitRows, setHitRows] = useState(Array.isArray(args.saved_hit_results) ? args.saved_hit_results : []);
-
+  const [markerDisplay, setMarkerDisplay] = useState(String(args.marker_display || "Lines only"));
+  const [startDateTimeValue, setStartDateTimeValue] = useState(() => fmtDateTimeLocal(initialViewportStartMs));
   useEffect(() => {
     // Give the component keyboard focus on first render so T/Z work without
     // needing the first mouse click on the Tagging button.
@@ -695,7 +720,10 @@ function App(props) {
     });
   }, [JSON.stringify(args.saved_tags || []), args.context_key, browserSessionToken, restoreSavedDashboard]);
 
-  const agents = useMemo(() => normalizeAgentIntervals(args.agent_intervals), [JSON.stringify(args.agent_intervals || [])]);
+  const agents = useMemo(
+    () => normalizeAgentIntervals(args.agent_intervals, String(args.selected_agent_name || args.selected_agent || "").trim()),
+    [JSON.stringify(args.agent_intervals || []), args.selected_agent_name, args.selected_agent],
+  );
   const showAgentIntervals = args.show_agent_intervals !== false;
 
   const selectedDataAgentName = useMemo(() => {
@@ -865,7 +893,7 @@ function App(props) {
     const gridStart = viewportStartMs || bufferStartMs || sectionStartMs || Date.now();
     const gridEnd = viewportEndMs || Math.min(gridStart + visibleMs, sectionEndMs || gridStart + visibleMs);
     const base = buildGridKeepaliveTraces(gridStart, gridEnd);
-    base.push(...buildCurveTraces(args.track_data));
+    base.push(...buildCurveTraces(args.track_data, markerDisplay));
     if (showAgentIntervals) {
       agents.forEach((a) => {
         base.push({
@@ -922,6 +950,7 @@ function App(props) {
     return base;
   }, [
     args.track_data,
+    markerDisplay,
     agents,
     tags,
     selectedTagId,
@@ -934,6 +963,38 @@ function App(props) {
     visibleMs,
   ]);
 
+  function applyPreferredStartDateTime() {
+    const requestedMs = dateTimeLocalToMs(startDateTimeValue);
+    if (requestedMs == null) {
+      alert("Please enter a valid date/time.");
+      return;
+    }
+
+    const clampedStart = clampViewport(requestedMs, visibleMs);
+    const clampedEnd = Math.min(clampedStart + visibleMs, sectionEndMs || clampedStart + visibleMs);
+
+    viewportSpanRef.current = visibleMs;
+    viewportStartRef.current = clampedStart;
+    setViewportSpanMs(visibleMs);
+    setViewportStartMs(clampedStart);
+    setStartDateTimeValue(fmtDateTimeLocal(clampedStart));
+
+    if (bufferStartMs != null && bufferEndMs != null && clampedStart >= bufferStartMs && clampedEnd <= bufferEndMs) {
+      setPlotViewport(clampedStart);
+      return;
+    }
+
+    Streamlit.setComponentValue({
+      event: "viewport_request",
+      source: "set_datetime",
+      viewport_start: fmtTime(clampedStart),
+      viewport_end: fmtTime(clampedEnd),
+      viewport_span_seconds: 12 * 3600,
+    });
+  }
+  
+  
+  
   function bestOverlapsForTag(tag) {
     const s = toMs(tag.start);
     const e = toMs(tag.end);
@@ -958,14 +1019,14 @@ function App(props) {
 
   function buildHitRows(currentTags = tags) {
     const effectiveTags = dedupeTags(currentTags || []);
-    const defaultSymptom = agents[0]?.label || "Agent hit";
+    const defaultSymptom = selectedDataAgentName;
     return effectiveTags.map((tag) => {
       const overlaps = bestOverlapsForTag(tag);
       const best = overlaps[0] || null;
       const percent = best ? best.percent : 0;
       return {
-        symptom: best ? best.agent.label : defaultSymptom,
-        data_agent: best ? best.agent.label : defaultSymptom,
+        symptom: defaultSymptom,
+        data_agent: defaultSymptom,
         well: String(args.selected_well || String(args.context_key || "").split("__")[0] || ""),
         section: (args.selected_sections || []).join(" + "),
         date: tag.start ? String(tag.start).split(" ")[0] : "",
@@ -1267,25 +1328,45 @@ function App(props) {
   function resetChartZoom() {
     const gd = plotRef.current;
     if (!gd?._fullLayout) return;
-    captureInitialRangesOnce();
-    if (!initialRangesRef.current) return;
+
+    const resetStart = clampViewport(viewportStartRef.current ?? initialPlotRangeRef.current ?? bufferStartMs ?? sectionStartMs, visibleMs);
+    const resetEnd = Math.min(resetStart + visibleMs, sectionEndMs || resetStart + visibleMs);
+    const yRange = [fmtTime(resetEnd), fmtTime(resetStart)];
+    const update = {
+      "yaxis.range": yRange,
+      "yaxis2.range": yRange,
+      "yaxis3.range": yRange,
+      "yaxis4.range": yRange,
+      "yaxis.autorange": false,
+      "yaxis2.autorange": false,
+      "yaxis3.autorange": false,
+      "yaxis4.autorange": false,
+    };
+
+    ["xaxis", "xaxis2", "xaxis3", "xaxis4"].forEach((axisName) => {
+      update[`${axisName}.range`] = [0, 1];
+      update[`${axisName}.autorange`] = false;
+    });
 
     zoomHistoryRef.current = [];
     viewportSpanRef.current = visibleMs;
+    viewportStartRef.current = resetStart;
     setViewportSpanMs(visibleMs);
+    setViewportStartMs(resetStart);
+    setStartDateTimeValue(fmtDateTimeLocal(resetStart));
     updateZoomHistoryCount();
     programmaticRelayoutRef.current = true;
 
-    Promise.resolve(Plotly.relayout(gd, makeRelayoutUpdate(initialRangesRef.current)))
+    Promise.resolve(Plotly.relayout(gd, update))
       .then(() => Plotly.redraw(gd))
       .catch((err) => console.error("Virtual log viewer reset zoom error:", err))
       .finally(() => {
         setTimeout(() => {
-          lastRangesRef.current = JSON.parse(JSON.stringify(initialRangesRef.current));
-          viewportStartRef.current = initialPlotRangeRef.current;
-          setViewportStartMs(initialPlotRangeRef.current);
+          lastRangesRef.current = getCurrentRanges();
+          initialRangesRef.current = JSON.parse(JSON.stringify(lastRangesRef.current || {}));
           programmaticRelayoutRef.current = false;
           updateZoomHistoryCount();
+          updateCaptureLayer();
         }, 100);
       });
   }
@@ -2156,6 +2237,10 @@ function showTaggingHover(e) {
       <div className="vlv-toolbar">
         <button disabled={zoomHistoryCount === 0} onClick={undoLastZoom}>Undo chart zoom</button>
         <button onClick={resetChartZoom}>Reset chart zoom</button>
+        <span style={{fontSize: 12, color: "#555", marginLeft: 6}}>Dots:</span>
+        <button className={markerDisplay === "Lines only" ? "active-blue" : ""} onClick={() => setMarkerDisplay("Lines only")}>No dots</button>
+        <button className={markerDisplay === "Small dots" ? "active-blue" : ""} onClick={() => setMarkerDisplay("Small dots")}>Small dots</button>
+        <button className={markerDisplay === "Larger dots" ? "active-blue" : ""} onClick={() => setMarkerDisplay("Larger dots")}>Large dots</button>
 
         <button
           className={tagMode ? "active" : ""}
@@ -2190,6 +2275,20 @@ function showTaggingHover(e) {
         <button disabled={!selectedTagId} onClick={deleteSelected}>🗑 Delete selected tag</button>
         <button onClick={downloadHitResults}>Download hit results Excel</button>
 
+        <span className="vlv-toolbar-time-jump" aria-label="Set chart start date and time">
+          <label>
+            Set plot start time:
+            <input
+              type="datetime-local"
+              step="1"
+              value={startDateTimeValue}
+              min={sectionStartMs ? fmtDateTimeLocal(sectionStartMs) : undefined}
+              max={sectionEndMs ? fmtDateTimeLocal(Math.max(sectionStartMs || 0, sectionEndMs - visibleMs)) : undefined}
+              onChange={(e) => setStartDateTimeValue(e.target.value)}
+            />
+          </label>
+          <button onClick={applyPreferredStartDateTime}>Show next 12 hours</button>
+        </span>
 
         <span className="vlv-spacer" />
         <span style={{fontSize: 12, color: "#555"}}>Zoom mode:</span>
@@ -2287,7 +2386,7 @@ function showTaggingHover(e) {
           onDoubleClick={onDoubleClick}
         />
         <div ref={selectBoxRef} className="vlv-selection" />
-        {false && <div ref={hoverLineRef} className="vlv-hover-line" />}
+        <div ref={hoverLineRef} className="vlv-hover-line" />
         <div ref={hoverBoxRef} className="vlv-hover-box" />
       </div>
 
@@ -2301,7 +2400,8 @@ function showTaggingHover(e) {
             )}
           </div>
         ))}
-      </div>    
+      </div>
+         
     </div>
   );
 }

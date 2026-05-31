@@ -813,8 +813,8 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
     # Accept backend window changes only from the React plot-area wheel handler.
     # This is a server-side safety net for the browser/page-scroll mix-up: stale
     # or accidental component values must not move the backend data window.
-    if str(component_value.get("source") or "") != "arrow_scroll":
-        return False
+    if str(component_value.get("source") or "") not in {"arrow_scroll", "set_datetime"}:
+       return False
 
     viewport_text = component_value.get("viewport_start")
     if viewport_text:
@@ -957,6 +957,8 @@ def _render_virtual_log_component(
         saved_tags=saved_tags,
         saved_hit_results=_virtual_json_safe(saved_hit_results),
         saved_tag_mode=bool(st.session_state.get(f"virtual_tag_mode_{context_key}", False)),
+        marker_display=st.session_state.get(f"marker_display_{context_key}", DEFAULT_MARKER_DISPLAY),
+    
     )
 
     component_state_changed = _apply_virtual_component_event(
@@ -1748,7 +1750,7 @@ def main():
                 "arrow rail to move through time and load the next raw buffer near the edge. "
                 "Raw points are not downsampled."
             )
-            
+
         _render_virtual_log_component(
             df=df,
             context_key=context_key,

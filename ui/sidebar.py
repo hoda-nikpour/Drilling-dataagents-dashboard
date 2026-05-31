@@ -4888,6 +4888,25 @@ def _render_dashboard_session_download_with_browser_tags(
                 }}
             }}
 
+            function selectedAgentNameFromPayload(payload) {{
+                const ctx = (payload && payload.dashboard_context) ? payload.dashboard_context : {{}};
+                return String(
+                    ctx.selected_agent_choice ||
+                    ctx.selected_activity ||
+                    ctx.selected_symptom ||
+                    "data_agent"
+                ).trim() || "data_agent";
+            }}
+
+            function normalizeHitResultAgentName(row, selectedAgentName) {{
+                const clean = Object.assign({{}}, row || {{}});
+                clean.data_agent = selectedAgentName;
+                clean.symptom = selectedAgentName;
+                return clean;
+            }}
+            
+            
+            
             function readBrowserDrawnTags() {{
                 if (!contextKey) return [];
 
@@ -4979,6 +4998,7 @@ def _render_dashboard_session_download_with_browser_tags(
                 const allSavedTags = deduplicate(manualBase.concat(allDrawn));
                 payload.tag_intervals = allSavedTags;
 
+                const selectedAgentName = selectedAgentNameFromPayload(payload);
                 const existingHitResults = Array.isArray(payload.hit_results) ? payload.hit_results : [];
                 const combinedHitResults = existingHitResults.concat(Array.isArray(browserHitResults) ? browserHitResults : []);
 
@@ -5010,7 +5030,7 @@ def _render_dashboard_session_download_with_browser_tags(
                     hitSeen.add(ident);
                     row.tag_start = tagStart;
                     row.tag_end = tagEnd;
-                    hitOut.push(row);
+                    hitOut.push(normalizeHitResultAgentName(row, selectedAgentName));
                 }});
                 payload.hit_results = hitOut;
                 payload.dashboard_state.widget_state["hit_result_history_" + contextKey] = hitOut;
