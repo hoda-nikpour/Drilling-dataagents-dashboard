@@ -522,10 +522,13 @@ function normalizeAgentIntervals(agentIntervals, selectedAgentName = "") {
     .map((item, idx) => {
       const s = toMs(item.start);
       const e = toMs(item.end);
-      if (s == null || e == null) return null;
+
+      if (!Number.isFinite(s)) return null;
+      if (!Number.isFinite(e)) return null;
+
       const startMs = Math.min(s, e);
       const endMs = Math.max(s, e);
-      if (endMs <= startMs) return null;
+
       return {
         startMs,
         endMs,
@@ -996,26 +999,34 @@ function App(props) {
   
   
   function bestOverlapsForTag(tag) {
-    const s = toMs(tag.start);
-    const e = toMs(tag.end);
-    if (s == null || e == null || e <= s) return [];
-    const out = [];
-    agents.forEach((a) => {
-      const os = Math.max(s, a.startMs);
-      const oe = Math.min(e, a.endMs);
-      if (oe > os) {
-        const matchMs = Math.max(e - s, a.endMs - a.startMs, 1);
-        out.push({
-          startMs: os,
-          endMs: oe,
-          percent: ((oe - os) / matchMs) * 100,
-          agent: a,
-        });
-      }
-    });
-    out.sort((a, b) => b.percent - a.percent);
-    return out;
-  }
+  const s = toMs(tag.start);
+  const e = toMs(tag.end);
+  if (s == null || e == null || e <= s) return [];
+
+  const out = [];
+
+  agents.forEach((a) => {
+    const a0 = a.startMs;
+    const a1 = a.endMs > a.startMs ? a.endMs : a.startMs + 1000;
+
+    const os = Math.max(s, a0);
+    const oe = Math.min(e, a1);
+
+    if (oe > os) {
+      const matchMs = Math.max(e - s, a1 - a0, 1);
+
+      out.push({
+        startMs: os,
+        endMs: oe,
+        percent: ((oe - os) / matchMs) * 100,
+        agent: a,
+      });
+    }
+  });
+
+  out.sort((a, b) => b.percent - a.percent);
+  return out;
+}
 
   function buildHitRows(currentTags = tags) {
     const effectiveTags = dedupeTags(currentTags || []);

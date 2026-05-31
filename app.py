@@ -1662,7 +1662,7 @@ def main():
                     key=f"detailed_{boss_table_key}",
                 )
 
-    if (
+    if False and (
         agent_cfg.get("agent_source") == "Symptom agent"
         and symptom_cfg.get("selected_symptom") == "TRQSpike"
         and not symptom_cfg.get("features", pd.DataFrame()).empty
