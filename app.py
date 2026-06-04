@@ -1349,19 +1349,25 @@ def main():
         context_key=context_key,
     )
 
+    SHOW_CURVE_SOURCE_CONTROLS = False
+    DEFAULT_CURVE_SOURCE = "Raw values"  # keeps the same default behavior as the current code
+
     with st.sidebar:
-        st.subheader("Curve Source")
-        curve_source = st.radio(
-            "Values shown in Tracks 1–3",
-            options=["Raw values", "Cleaned values"],
-            index=0,
-            key=f"curve_source_{context_key}",
-            help=(
-                "Raw values preserve the original sensor data. "
-                "Cleaned values apply the dashboard cleaning rules. "
-                "Agents always use cleaned values."
-            ),
-        )
+        if SHOW_CURVE_SOURCE_CONTROLS:
+            st.subheader("Curve Source")
+            curve_source = st.radio(
+                "Values shown in Tracks 1–3",
+                options=["Raw values", "Cleaned values"],
+                index=0,
+                key=f"curve_source_{context_key}",
+                help=(
+                    "Raw values preserve the original sensor data. "
+                    "Cleaned values apply the dashboard cleaning rules. "
+                    "Agents always use cleaned values."
+                ),
+            )
+        else:
+            curve_source = DEFAULT_CURVE_SOURCE
 
     requested_columns = build_requested_columns(
         selected_labels=selected_labels,

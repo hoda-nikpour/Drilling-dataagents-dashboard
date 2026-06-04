@@ -2303,10 +2303,10 @@ function showTaggingHover(e) {
 
         <span className="vlv-spacer" />
         <span style={{fontSize: 12, color: "#555"}}>Zoom mode:</span>
-        <button className={zoomMode === "x" && !tagMode ? "active-blue" : ""} onClick={() => chooseZoomMode("x")}>🔍 X</button>
+        {/* X zoom hidden for now */}
         <button className={zoomMode === "y" && !tagMode ? "active-blue" : ""} onClick={() => chooseZoomMode("y")}>🔍 Y</button>
-        <button className={zoomMode === "xy" && !tagMode ? "active-blue" : ""} onClick={() => chooseZoomMode("xy")}>🔍 XY</button>
-
+        {/* XY zoom hidden for now */}
+        
         <span style={{fontSize: 12, color: "#555"}}>Chart zoom undo history: {zoomHistoryCount} / 10</span>
       </div>
       {false && (

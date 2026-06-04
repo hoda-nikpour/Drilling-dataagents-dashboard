@@ -1669,7 +1669,7 @@ def render_review_loader_before_well_selector() -> dict | None:
         st.subheader("Load Dashboard Session")
 
         uploaded_review = st.file_uploader(
-            "Drag/drop saved dashboard here",
+            " ",
             type=["json"],
             key="review_upload_global_before_well",
         )
@@ -4392,66 +4392,69 @@ def render_track4_manual_tag_controls(
                     except Exception:
                         pass
 
-        with st.expander("Manual Tag Intervals", expanded=False):
-            st.caption(
-                "Set tag start and end times manually, or draw tags directly on the chart. "
-                "Saved tags remain section-level and only appear in windows they overlap."
-            )
+        SHOW_MANUAL_TAG_INTERVALS = False
 
-            st.caption(
-                f"Current loaded window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
-            )
-            st.caption(
-                f"Manual tags can use full section range: "
-                f"{_format_datetime_text(section_t_min)} → {_format_datetime_text(section_t_max)}"
-            )
-
-            for i in range(1, 4):
-                enabled = st.checkbox(
-                    f"Enable Tag {i}",
-                    value=False,
-                    key=f"enable_tag_{i}_{context_key}",
+        if SHOW_MANUAL_TAG_INTERVALS:
+            with st.expander("Manual Tag Intervals", expanded=False):
+                st.caption(
+                    "Set tag start and end times manually, or draw tags directly on the chart. "
+                    "Saved tags remain section-level and only appear in windows they overlap."
                 )
 
-                if enabled:
-                    label = st.text_input(
-                        f"Tag {i} label",
-                        value=f"Observation {i}",
-                        key=f"tag_label_{i}_{context_key}",
+                st.caption(
+                    f"Current loaded window: {_format_datetime_text(t_min)} → {_format_datetime_text(t_max)}"
+                )
+                st.caption(
+                    f"Manual tags can use full section range: "
+                    f"{_format_datetime_text(section_t_min)} → {_format_datetime_text(section_t_max)}"
+                )
+
+                for i in range(1, 4):
+                    enabled = st.checkbox(
+                        f"Enable Tag {i}",
+                        value=False,
+                        key=f"enable_tag_{i}_{context_key}",
                     )
 
-                    tag_start = _safe_datetime_input(
-                        label=f"Tag {i} start time — year / month / day / hour / minute / second",
-                        key=f"tag_start_{i}_{context_key}",
-                        default_value=t_min,
-                        min_value=section_t_min,
-                        max_value=section_t_max,
-                    )
-
-                    tag_end = _safe_datetime_input(
-                        label=f"Tag {i} end time — year / month / day / hour / minute / second",
-                        key=f"tag_end_{i}_{context_key}",
-                        default_value=min(section_t_max, pd.Timestamp(t_min) + timedelta(minutes=30)),
-                        min_value=section_t_min,
-                        max_value=section_t_max,
-                    )
-
-                    if pd.Timestamp(tag_end) <= pd.Timestamp(tag_start):
-                        st.warning(
-                            f"Tag {i}: end time must be after start time. "
-                            "This tag is not added to Track 4."
+                    if enabled:
+                        label = st.text_input(
+                            f"Tag {i} label",
+                            value=f"Observation {i}",
+                            key=f"tag_label_{i}_{context_key}",
                         )
-                        continue
 
-                    st.caption(f"Tag interval: {tag_start} → {tag_end}")
+                        tag_start = _safe_datetime_input(
+                            label=f"Tag {i} start time — year / month / day / hour / minute / second",
+                            key=f"tag_start_{i}_{context_key}",
+                            default_value=t_min,
+                            min_value=section_t_min,
+                            max_value=section_t_max,
+                        )
 
-                    tag_intervals.append(
-                        {
-                            "label": label.strip() or f"Observation {i}",
-                            "start": tag_start,
-                            "end": tag_end,
-                        }
-                    )
+                        tag_end = _safe_datetime_input(
+                            label=f"Tag {i} end time — year / month / day / hour / minute / second",
+                            key=f"tag_end_{i}_{context_key}",
+                            default_value=min(section_t_max, pd.Timestamp(t_min) + timedelta(minutes=30)),
+                            min_value=section_t_min,
+                            max_value=section_t_max,
+                        )
+
+                        if pd.Timestamp(tag_end) <= pd.Timestamp(tag_start):
+                            st.warning(
+                                f"Tag {i}: end time must be after start time. "
+                                "This tag is not added to Track 4."
+                            )
+                            continue
+
+                        st.caption(f"Tag interval: {tag_start} → {tag_end}")
+
+                        tag_intervals.append(
+                            {
+                                "label": label.strip() or f"Observation {i}",
+                                "start": tag_start,
+                                "end": tag_end,
+                            }
+                        )
 
         # Chart-drawn tags restored from JSON or received from the browser are
         # stored separately from the three sidebar Tagger slots. Add them to the
@@ -5095,10 +5098,10 @@ def _render_dashboard_session_download_with_browser_tags(
                 downloadText(finalText, fileName);
 
                 if (browserDrawnTags.length) {{
-                    setStatus("Saved with " + browserDrawnTags.length + " drawn tag(s) and " + browserHitResults.length + " hit-result row(s).");
-                }} else {{
-                    setStatus("Saved with " + browserHitResults.length + " hit-result row(s). No browser-drawn tags were found.");
-                }}
+                        setStatus("Saved with " + browserDrawnTags.length + " drawn tag(s) and " + browserHitResults.length + " hit-result row(s).");
+                    }} else {{
+                        setStatus("Saved.");
+                    }}
             }}
 
             if (button) {{
