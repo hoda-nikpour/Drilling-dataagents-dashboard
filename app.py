@@ -1350,7 +1350,7 @@ def main():
     )
 
     SHOW_CURVE_SOURCE_CONTROLS = False
-    DEFAULT_CURVE_SOURCE = "Raw values"  # keeps the same default behavior as the current code
+    DEFAULT_CURVE_SOURCE = "Cleaned values"  # keeps the same default behavior as the current code
 
     with st.sidebar:
         if SHOW_CURVE_SOURCE_CONTROLS:
@@ -1358,7 +1358,7 @@ def main():
             curve_source = st.radio(
                 "Values shown in Tracks 1–3",
                 options=["Raw values", "Cleaned values"],
-                index=0,
+                index=1,
                 key=f"curve_source_{context_key}",
                 help=(
                     "Raw values preserve the original sensor data. "
