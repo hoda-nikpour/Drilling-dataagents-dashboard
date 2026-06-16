@@ -1725,20 +1725,6 @@ def main():
     track_param_labels = track_param_labels + [[]]
     track_colors = track_colors + [[]]
 
-    fig = create_multi_track_chart(
-        df=df,
-        track_params=track_params_real,
-        track_param_labels=track_param_labels,
-        track_colors=track_colors,
-        zoom_percent=zoom_percent,
-        section_ranges=section_ranges,
-        agent_cfg=agent_cfg,
-        chart_height=agent_cfg.get("chart_height", 950),
-        parameter_ranges=parameter_ranges,
-        marker_display=marker_display,
-        curve_source=curve_source,
-    )
-
     chart_key = f"multi_track_chart_{context_key}"
 
     saved_hit_results = st.session_state.get(f"hit_result_history_{context_key}", [])
@@ -1750,12 +1736,6 @@ def main():
     )
 
     if use_virtual_log_viewer:
-        if False:
-            st.caption(
-                "Virtual log viewer: mouse-wheel scrolls the main page only. Hold the left-side "
-                "arrow rail to move through time and load the next raw buffer near the edge. "
-                "Raw points are not downsampled."
-            )
 
         _render_virtual_log_component(
             df=df,
@@ -1770,6 +1750,20 @@ def main():
             parameter_ranges=parameter_ranges,
         )
     else:
+        fig = create_multi_track_chart(
+            df=df,
+            track_params=track_params_real,
+            track_param_labels=track_param_labels,
+            track_colors=track_colors,
+            zoom_percent=zoom_percent,
+            section_ranges=section_ranges,
+            agent_cfg=agent_cfg,
+            chart_height=agent_cfg.get("chart_height", 950),
+            parameter_ranges=parameter_ranges,
+            marker_display=marker_display,
+            curve_source=curve_source,
+        )
+
         render_chart(
             fig,
             chart_key,

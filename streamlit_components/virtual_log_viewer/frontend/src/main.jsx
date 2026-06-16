@@ -468,7 +468,7 @@ function buildCurveTraces(trackData, markerDisplay = "Lines only") {
       const markerSize = markerDisplay === "Larger dots" ? 4 : 2;
 
       traces.push({
-        type: "scatter",
+        type: "scattergl",
         mode: showMarkers ? "lines+markers" : "lines",
         x: xNorm,
         y: curve.y || [],
@@ -501,7 +501,7 @@ function buildGridKeepaliveTraces(rangeStartMs, rangeEndMs) {
   return [1, 2, 3, 4].map((trackNo) => {
     const axis = traceAxis(trackNo);
     return {
-      type: "scatter",
+      type: "scattergl",
       mode: "lines",
       x: [0, 1],
       y: [fmtTime(start), fmtTime(end)],
@@ -893,14 +893,17 @@ function App(props) {
   );
 
   const traces = useMemo(() => {
-    const gridStart = viewportStartMs || bufferStartMs || sectionStartMs || Date.now();
-    const gridEnd = viewportEndMs || Math.min(gridStart + visibleMs, sectionEndMs || gridStart + visibleMs);
+    // Keep invisible grid traces tied to the loaded backend buffer, not to the
+    // current visible viewport. Otherwise every scroll/zoom state update rebuilds
+    // all curve arrays and calls Plotly.react again.
+    const gridStart = bufferStartMs || sectionStartMs || Date.now();
+    const gridEnd = bufferEndMs || sectionEndMs || Math.min(gridStart + visibleMs, sectionEndMs || gridStart + visibleMs);
     const base = buildGridKeepaliveTraces(gridStart, gridEnd);
     base.push(...buildCurveTraces(args.track_data, markerDisplay));
     if (showAgentIntervals) {
       agents.forEach((a) => {
         base.push({
-          type: "scatter",
+          type: "scattergl",
           mode: "lines",
           x: Array(20).fill(0.76),
           y: Array.from({length: 20}, (_, i) => fmtTime(a.startMs + ((a.endMs - a.startMs) * i) / 19)),
@@ -922,7 +925,7 @@ function App(props) {
       const id = tagKey(tag);
       const selected = selectedTagId === id;
       base.push({
-        type: "scatter",
+        type: "scattergl",
         mode: "lines",
         x: Array(20).fill(0.24),
         y: Array.from({length: 20}, (_, i) => fmtTime(s + ((e - s) * i) / 19)),
@@ -936,7 +939,7 @@ function App(props) {
       });
       bestOverlapsForTag(tag).forEach((ov) => {
         base.push({
-          type: "scatter",
+          type: "scattergl",
           mode: "lines",
           x: Array(20).fill(0.50),
           y: Array.from({length: 20}, (_, i) => fmtTime(ov.startMs + ((ov.endMs - ov.startMs) * i) / 19)),
@@ -958,9 +961,8 @@ function App(props) {
     tags,
     selectedTagId,
     showAgentIntervals,
-    viewportStartMs,
-    viewportEndMs,
     bufferStartMs,
+    bufferEndMs,
     sectionStartMs,
     sectionEndMs,
     visibleMs,
@@ -1439,7 +1441,7 @@ function App(props) {
       .filter(Boolean)
       .map((trace) => ({
         ...trace,
-        type: trace.type === "scattergl" ? "scatter" : trace.type,
+        type: trace.type || "scatter",
         x: Array.isArray(trace.x) ? trace.x : [],
         y: Array.isArray(trace.y) ? trace.y : [],
       }));
