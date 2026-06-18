@@ -544,7 +544,6 @@ def _stable_virtual_tag_id(label: str, start_text: str, end_text: str, idx: int 
 def _is_virtual_chart_tag(item: dict) -> bool:
     return str(item.get("source") or "").strip() in _CHART_DRAWN_TAG_SOURCES
 
-
 def _normalize_virtual_component_tag(item, idx: int = 1, *, chart_only: bool = False) -> dict | None:
     """Normalize a tag sent to/from the React virtual viewer."""
     if not isinstance(item, dict):
@@ -567,30 +566,42 @@ def _normalize_virtual_component_tag(item, idx: int = 1, *, chart_only: bool = F
     label = str(item.get("label") or (f"Dragged Tag {idx}" if is_chart_tag else f"Tag {idx}"))
     start_text = _virtual_dt_text(start)
     end_text = _virtual_dt_text(end)
-    created_at = str(item.get("created_at") or "").strip()
-    if is_chart_tag and not created_at:
-        created_at = _stable_virtual_tag_id(label, start_text, end_text, idx)
+
+    tag_id = str(item.get("tag_id") or item.get("created_at") or "").strip()
+    if is_chart_tag and not tag_id:
+        tag_id = _stable_virtual_tag_id(label, start_text, end_text, idx)
+
+    created_at = str(item.get("created_at") or tag_id or "").strip()
+    updated_at = str(item.get("updated_at") or pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    try:
+        revision = int(item.get("revision") or 1)
+    except Exception:
+        revision = 1
 
     return {
+        "tag_id": tag_id,
         "label": label,
         "start": start_text,
         "end": end_text,
         "source": "chart_drag" if is_chart_tag else source,
+        "status": str(item.get("status") or "active"),
         "created_at": created_at,
+        "updated_at": updated_at,
+        "revision": revision,
     }
 
-
 def _virtual_component_tag_identity(item: dict) -> tuple[str, str, str, str]:
-    created_at = str(item.get("created_at") or "").strip()
-    if created_at and _is_virtual_chart_tag(item):
-        return ("chart_id", created_at, "", "")
+    tag_id = str(item.get("tag_id") or item.get("created_at") or "").strip()
+    if tag_id and _is_virtual_chart_tag(item):
+        return ("chart_id", tag_id, "", "")
+
     return (
         str(item.get("source") or ""),
         str(item.get("label") or ""),
         str(item.get("start") or ""),
         str(item.get("end") or ""),
     )
-
 
 def _deduplicate_virtual_component_tags(items, *, chart_only: bool = False) -> list[dict]:
     """Remove duplicate tag rows before they are saved or sent back to React."""
@@ -609,6 +620,139 @@ def _deduplicate_virtual_component_tags(items, *, chart_only: bool = False) -> l
 
     return out
 
+
+def _active_virtual_tag_ledger(context_key: str) -> list[dict]:
+    """Return active chart-drawn tags from the durable Streamlit tag ledger."""
+    ledger_key = f"tag_ledger_{context_key}"
+    items = st.session_state.get(ledger_key, []) or []
+    deleted_key = f"deleted_tag_ids_{context_key}"
+    deleted_ids = {
+        str(x or "").strip()
+        for x in (st.session_state.get(deleted_key, []) or [])
+        if str(x or "").strip()
+    }
+
+    active = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("status") or "active").lower() != "deleted"
+        and str(item.get("tag_id") or item.get("created_at") or "").strip() not in deleted_ids
+    ]
+
+
+
+    return _deduplicate_virtual_component_tags(active, chart_only=True)
+
+
+def _merge_virtual_tag_ledger(
+    context_key: str,
+    incoming_tags,
+    deleted_tag_ids=None,
+    *,
+    reason: str = "autosave",
+) -> list[dict]:
+    """
+    Merge React chart tags into a durable ledger.
+
+    Safety rule:
+    An empty/stale React payload must never erase existing tags.
+    Tags are removed only when React sends explicit deleted_tag_ids.
+    """
+    ledger_key = f"tag_ledger_{context_key}"
+    visual_key = f"visual_tag_intervals_{context_key}"
+    deleted_key = f"deleted_tag_ids_{context_key}"
+    now_text = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    existing_items = st.session_state.get(ledger_key)
+    if not isinstance(existing_items, list) or not existing_items:
+        existing_items = st.session_state.get(visual_key, []) or []
+
+    ledger: dict[str, dict] = {}
+
+    for idx, item in enumerate(existing_items or [], start=1):
+        normalized = _normalize_virtual_component_tag(item, idx, chart_only=True)
+        if normalized is None:
+            continue
+
+        tag_id = str(normalized.get("tag_id") or normalized.get("created_at") or "").strip()
+        if not tag_id:
+            continue
+
+        ledger[tag_id] = normalized
+
+    stored_deleted_ids = {
+        str(x or "").strip()
+        for x in (st.session_state.get(deleted_key, []) or [])
+        if str(x or "").strip()
+    }
+
+    deleted_ids = {
+        str(x or "").strip()
+        for x in (deleted_tag_ids or [])
+        if str(x or "").strip()
+    }
+
+    all_deleted_ids = stored_deleted_ids | deleted_ids
+
+    for tag_id in all_deleted_ids:
+        ledger.pop(tag_id, None)
+
+    incoming = [
+        tag for tag in _deduplicate_virtual_component_tags(incoming_tags or [], chart_only=True)
+        if str(tag.get("tag_id") or tag.get("created_at") or "").strip() not in all_deleted_ids
+    ]
+
+    st.session_state[deleted_key] = sorted(all_deleted_ids)
+
+
+    # Never let an accidental empty autosave/state_update erase the ledger.
+    if not incoming and not deleted_ids and ledger:
+        out = sorted(ledger.values(), key=lambda x: str(x.get("start") or ""))
+        st.session_state[ledger_key] = out
+        st.session_state[visual_key] = out
+        return out
+
+    for incoming_tag in incoming:
+        tag_id = str(incoming_tag.get("tag_id") or incoming_tag.get("created_at") or "").strip()
+        if not tag_id:
+            continue
+
+        previous = ledger.get(tag_id, {})
+
+        try:
+            previous_revision = int(previous.get("revision") or 0)
+        except Exception:
+            previous_revision = 0
+
+        try:
+            incoming_revision = int(incoming_tag.get("revision") or 1)
+        except Exception:
+            incoming_revision = 1
+
+        merged = {
+            **previous,
+            **incoming_tag,
+            "tag_id": tag_id,
+            "source": "chart_drag",
+            "status": "active",
+            "created_at": previous.get("created_at") or incoming_tag.get("created_at") or tag_id,
+            "updated_at": now_text,
+            "revision": max(previous_revision + 1, incoming_revision),
+        }
+
+        ledger[tag_id] = merged
+
+    out = sorted(ledger.values(), key=lambda x: str(x.get("start") or ""))
+
+    st.session_state[ledger_key] = out
+    st.session_state[visual_key] = out
+    st.session_state[f"tag_autosave_status_{context_key}"] = {
+        "count": len(out),
+        "last_saved": now_text,
+        "reason": reason,
+    }
+
+    return out
 
 def _deduplicate_virtual_hit_results(rows, current_tags: list[dict] | None = None) -> list[dict]:
     """Keep only one hit row per current tag interval and drop stale resize rows."""
@@ -668,6 +812,9 @@ def _ensure_fresh_virtual_session(context_key: str, *, loaded_dashboard_active: 
     if not loaded_dashboard_active:
         for key in (
             f"visual_tag_intervals_{context_key}",
+            f"tag_ledger_{context_key}",
+            f"deleted_tag_ids_{context_key}",
+            f"tag_autosave_status_{context_key}",
             f"hit_result_history_{context_key}",
             f"virtual_tag_mode_{context_key}",
         ):
@@ -763,23 +910,22 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
     event_type = str(component_value.get("event") or "state_update").strip() or "state_update"
     state_changed = False
 
-    if event_type == "state_update":
+    if event_type in {"state_update", "tag_autosave"}:
         normalized_tags: list[dict] | None = None
-        tags = component_value.get("tags")
-        if isinstance(tags, list):
-            normalized_tags = _deduplicate_virtual_component_tags(tags, chart_only=True)
-            visual_key = f"visual_tag_intervals_{context_key}"
-            existing_tags = _deduplicate_virtual_component_tags(
-                st.session_state.get(visual_key, []) or [],
-                chart_only=True,
-            )
-            if not _same_virtual_json_value(existing_tags, normalized_tags):
-                st.session_state[visual_key] = normalized_tags
-                state_changed = True
 
-        # Preserve Tagging mode across the rerun caused by accepting a tag.
-        # Without this, one drawn tag remounts the component with Tagging off,
-        # so a second drag appears to be refused.
+        tags = component_value.get("tags")
+        deleted_tag_ids = component_value.get("deleted_tag_ids") or []
+
+        if isinstance(tags, list):
+            normalized_tags = _merge_virtual_tag_ledger(
+                context_key,
+                tags,
+                deleted_tag_ids,
+                reason=str(component_value.get("reason") or event_type),
+            )
+            state_changed = True
+
+        # Preserve Tagging mode across reruns.
         if "tag_mode" in component_value:
             tag_mode_key = f"virtual_tag_mode_{context_key}"
             new_tag_mode = bool(component_value.get("tag_mode"))
@@ -790,17 +936,15 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
         hit_results = component_value.get("hit_results")
         if isinstance(hit_results, list):
             if normalized_tags is None:
-                normalized_tags = _deduplicate_virtual_component_tags(
-                    st.session_state.get(f"visual_tag_intervals_{context_key}", []) or [],
-                    chart_only=True,
-                )
+                normalized_tags = _active_virtual_tag_ledger(context_key)
+
             hit_key = f"hit_result_history_{context_key}"
-            # React sends the current Hit results table, including both manual
-            # sidebar tags and browser-drawn tags. Do not filter this list with
-            # chart-only tags, otherwise manual-tag hit rows disappear from
-            # saved/restored sessions. React has already rebuilt the rows from
-            # the current tag set, so de-duplication is enough here.
-            safe_hit_results = _deduplicate_virtual_hit_results(hit_results, None)
+
+            # Keep hit-result rows synchronized with the accepted current tags.
+            # Otherwise old tag intervals can remain in Python state after a
+            # resize/delete and later get saved/restored as stale tag rows.
+            safe_hit_results = _deduplicate_virtual_hit_results(hit_results, normalized_tags)
+
             if not _same_virtual_json_value(st.session_state.get(hit_key, []), safe_hit_results):
                 st.session_state[hit_key] = safe_hit_results
                 state_changed = True
@@ -909,18 +1053,31 @@ def _render_virtual_log_component(
         agent_cfg.get("tag_intervals", []) or [],
         chart_only=False,
     )
+    
+
     visual_tags = _deduplicate_virtual_component_tags(
         st.session_state.get(f"visual_tag_intervals_{context_key}", []) or [],
         chart_only=True,
     )
 
+    ledger_tags = _active_virtual_tag_ledger(context_key)
+
+    if not ledger_tags and visual_tags:
+        ledger_tags = _merge_virtual_tag_ledger(
+            context_key,
+            visual_tags,
+            [],
+            reason="bootstrap_from_visual_tags",
+        )
+
     # agent_cfg["tag_intervals"] may already contain visual tags from the sidebar
-    # merge. Prefer the session-state visual tags because they carry the stable
-    # created_at id needed for resize/delete. Fall back to chart tags from
-    # agent_cfg only when session state has none, e.g. loaded older sessions.
+    # merge. Prefer the durable tag ledger, then visual_tag_intervals, then chart
+    # tags from agent_cfg for older restored sessions.
     manual_tags = [tag for tag in manual_or_sidebar_tags if not _is_virtual_chart_tag(tag)]
     chart_tags_from_agent = [tag for tag in manual_or_sidebar_tags if _is_virtual_chart_tag(tag)]
-    chart_tags = visual_tags if visual_tags else chart_tags_from_agent
+    chart_tags = ledger_tags if ledger_tags else (visual_tags if visual_tags else chart_tags_from_agent)
+
+
     saved_tags = _virtual_json_safe(
         _deduplicate_virtual_component_tags(
             list(manual_tags) + list(chart_tags),
@@ -932,12 +1089,19 @@ def _render_virtual_log_component(
         saved_tags,
     )
 
+
+    restore_saved_dashboard_once = bool(
+        st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)
+    )
+
     result = render_virtual_log_viewer(
         key=f"virtual_log_viewer_{context_key}",
         context_key=context_key,
         browser_session_token=str(st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh")),
-        restore_saved_dashboard=bool(st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)),
+        restore_saved_dashboard=restore_saved_dashboard_once,
         selected_well=selected_well,
+
+
         selected_sections=list(selected_sections),
         section_start=_virtual_dt_text(window_info["section_start"]),
         section_end=_virtual_dt_text(window_info["section_end"]),
@@ -961,6 +1125,10 @@ def _render_virtual_log_component(
     
     )
 
+    # The uploaded dashboard restore mode must be one-shot.
+    if restore_saved_dashboard_once:
+        st.session_state[f"_loaded_dashboard_active_{context_key}"] = False
+
     component_state_changed = _apply_virtual_component_event(
         result,
         context_key=context_key,
@@ -968,9 +1136,6 @@ def _render_virtual_log_component(
         section_end=window_info["section_end"],
     )
 
-    # Do not call st.rerun() after a tag state_update. The React component keeps
-    # drawn/edited tags locally and browser-persisted, and Python stores them for
-    # later Save Dashboard Session/export use. Forcing an immediate rerun here is
     # what made the Plotly component refresh and start the tag-disappear loop.
     return result
 

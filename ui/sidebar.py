@@ -37,7 +37,7 @@ ACTIVITY_AGENT_CHOICES = {
 SYMPTOM_AGENT_CHOICES = {
     "OpenHoleLength": "OpenHoleLength",
     "TRQErratic": "TRQErratic",
-    "TRQSpice": "TRQSpike",
+    "TRQSpike": "TRQSpike",
     "PSpike": "PSpike",
     "OverPull": "OverPull",
     "TookWeight": "TookWeight",
@@ -50,6 +50,15 @@ ACTIVITY_AGENT_DISPLAY_BY_INTERNAL = {
 SYMPTOM_AGENT_DISPLAY_BY_INTERNAL = {
     internal: display for display, internal in SYMPTOM_AGENT_CHOICES.items()
 }
+
+
+def _normalize_symptom_display_name(display: str) -> str:
+    display = str(display or "").strip()
+    legacy_aliases = {
+        "TRQSpice": "TRQSpike",
+    }
+    return legacy_aliases.get(display, display)
+
 
 AGENT_PICKER_ACTIVITY_HEADER = "__activity_agents_header__"
 AGENT_PICKER_SYMPTOM_HEADER = "__symptom_agents_header__"
@@ -87,7 +96,7 @@ def _parse_agent_picker_choice(value) -> tuple[str, str, str]:
         display = text.split("::", 1)[1]
         return "Activity agent", display, ACTIVITY_AGENT_CHOICES.get(display, display)
     if text.startswith("symptom::"):
-        display = text.split("::", 1)[1]
+        display = _normalize_symptom_display_name(text.split("::", 1)[1])
         return "Symptom agent", display, SYMPTOM_AGENT_CHOICES.get(display, display)
     return "None", "", ""
 
@@ -771,16 +780,23 @@ def _build_export_payload(
     # Keep manual sidebar tags and chart-drawn tags explicit in the saved JSON.
     # Track 4 receives both through tag_intervals, but restore needs to know which
     # ones came from the browser-drawn tagger path.
+
     visual_key = f"visual_tag_intervals_{context_key}" if context_key else ""
+    ledger_key = f"tag_ledger_{context_key}" if context_key else ""
+
     drawn_tag_intervals = []
-    if visual_key:
-        for idx, item in enumerate(st.session_state.get(visual_key, []) or [], start=1):
+
+    if context_key:
+        ledger_items = st.session_state.get(ledger_key, []) or st.session_state.get(visual_key, []) or []
+
+        for idx, item in enumerate(ledger_items, start=1):
             normalized = _normalize_restored_visual_tag(
                 item,
                 fallback_label=f"Drawn Tag {idx}",
             )
-            if normalized:
+            if normalized and str(normalized.get("status") or "active").lower() != "deleted":
                 drawn_tag_intervals.append(normalized)
+
 
     if not drawn_tag_intervals:
         drawn_tag_intervals = [
@@ -827,29 +843,64 @@ def _build_export_payload(
         "plot_track_param_labels": saved_track_param_labels,
         "manual_tagger_intervals": [
             {
+                "tag_id": str(x.get("tag_id", "")),
                 "label": str(x.get("label", "")),
                 "start": _json_safe_text(x.get("start")),
                 "end": _json_safe_text(x.get("end")),
                 "source": x.get("source", "manual"),
+                "status": x.get("status", "active"),
+                "created_at": x.get("created_at", ""),
+                "updated_at": x.get("updated_at", ""),
+                "revision": x.get("revision", 1),
             }
             for x in manual_tagger_intervals
         ],
+
         "drawn_tag_intervals": [
             {
+                "tag_id": str(x.get("tag_id", "")),
                 "label": str(x.get("label", "")),
                 "start": _json_safe_text(x.get("start")),
                 "end": _json_safe_text(x.get("end")),
                 "source": "chart_drag",
+                "status": x.get("status", "active"),
+                "created_at": x.get("created_at", ""),
+                "updated_at": x.get("updated_at", ""),
+                "revision": x.get("revision", 1),
             }
             for x in drawn_tag_intervals
         ],
+        "tag_ledger": [
+            {
+                "tag_id": str(x.get("tag_id", "")),
+                "label": str(x.get("label", "")),
+                "start": _json_safe_text(x.get("start")),
+                "end": _json_safe_text(x.get("end")),
+                "source": "chart_drag",
+                "status": x.get("status", "active"),
+                "created_at": x.get("created_at", ""),
+                "updated_at": x.get("updated_at", ""),
+                "revision": x.get("revision", 1),
+            }
+            for x in drawn_tag_intervals
+        ],
+                
+
+
+
+
         "hit_results": saved_hit_results,
         "tag_intervals": [
             {
+                "tag_id": str(x.get("tag_id", "")),
                 "label": str(x.get("label", "")),
                 "start": _json_safe_text(x.get("start")),
                 "end": _json_safe_text(x.get("end")),
                 "source": x.get("source", "manual"),
+                "status": x.get("status", "active"),
+                "created_at": x.get("created_at", ""),
+                "updated_at": x.get("updated_at", ""),
+                "revision": x.get("revision", 1),
             }
             for x in canonical_tag_intervals
         ],
@@ -898,8 +949,11 @@ def _build_export_payload(
     }
 
     if context_key:
+        payload["dashboard_state"]["widget_state"][f"visual_tag_intervals_{context_key}"] = payload["drawn_tag_intervals"]
+        payload["dashboard_state"]["widget_state"][f"tag_ledger_{context_key}"] = payload["tag_ledger"]
         payload["dashboard_state"]["widget_state"][f"hit_result_history_{context_key}"] = saved_hit_results
 
+    
     json_text = json.dumps(payload, indent=2)
 
     output = io.StringIO()
@@ -943,6 +997,7 @@ def _build_export_payload(
         )
 
     return json_text, output.getvalue()
+
 
 def _format_datetime_text(value) -> str:
     """
@@ -1051,8 +1106,6 @@ def _safe_uploaded_label(value, fallback: str) -> str:
 
 
 
-
-
 def _normalize_section_tag(item: dict, fallback_label: str = "Saved Tag", t_min=None, t_max=None) -> dict | None:
     """
     Normalize any saved section-level tag without forcing it into the current
@@ -1098,11 +1151,18 @@ def _normalize_section_tag(item: dict, fallback_label: str = "Saved Tag", t_min=
 
     source = str(item.get("source", "manual") or "manual").strip() or "manual"
 
+    tag_id = str(item.get("tag_id") or item.get("created_at") or "").strip()
+
     return {
+        "tag_id": tag_id,
         "label": label,
         "start": _format_datetime_text(start_ts),
         "end": _format_datetime_text(end_ts),
         "source": source,
+        "status": str(item.get("status") or "active"),
+        "created_at": str(item.get("created_at") or tag_id or ""),
+        "updated_at": str(item.get("updated_at") or ""),
+        "revision": item.get("revision", 1),
     }
 
 def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag", t_min=None, t_max=None) -> dict | None:
@@ -1110,8 +1170,8 @@ def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag
     Normalize a saved or browser-created chart-drawn tag.
 
     This accepts several schemas so old saved dashboard JSON files can still be
-    restored. The returned item uses the same shape as normal Track 4 tagger
-    intervals: label/start/end/source.
+    restored. The returned item uses a durable tag_id so resize/delete/save/load
+    do not depend only on start/end timestamps.
     """
     if not isinstance(item, dict):
         return None
@@ -1150,11 +1210,23 @@ def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag
     )
     label = str(label).strip() or fallback_label
 
+    start_text = _format_datetime_text(start_ts)
+    end_text = _format_datetime_text(end_ts)
+
+    tag_id = str(item.get("tag_id") or item.get("created_at") or "").strip()
+    if not tag_id:
+        tag_id = "tag_" + str(abs(hash(f"{label}|{start_text}|{end_text}")))[:16]
+
     return {
+        "tag_id": tag_id,
         "label": label,
-        "start": _format_datetime_text(start_ts),
-        "end": _format_datetime_text(end_ts),
+        "start": start_text,
+        "end": end_text,
         "source": "chart_drag",
+        "status": str(item.get("status") or "active"),
+        "created_at": str(item.get("created_at") or tag_id),
+        "updated_at": str(item.get("updated_at") or ""),
+        "revision": item.get("revision", 1),
     }
 
 
@@ -1162,6 +1234,10 @@ def _visual_tag_identity(item: dict) -> tuple[str, str, str]:
     """Stable identity used to remove duplicate restored/drawn tags."""
     if not isinstance(item, dict):
         return ("", "", "")
+
+    tag_id = str(item.get("tag_id") or item.get("created_at") or "").strip()
+    if tag_id:
+        return ("tag_id", tag_id, "")
 
     try:
         start = _format_datetime_text(item.get("start"))
@@ -1173,10 +1249,8 @@ def _visual_tag_identity(item: dict) -> tuple[str, str, str]:
     except Exception:
         end = str(item.get("end", ""))
 
-    # Time is the important identity. Keep label in the tuple only as a fallback
-    # when two intentionally separate tags have exactly the same interval.
+    # Fallback for old saved JSON files that do not have tag_id.
     return (str(item.get("label", "")), start, end)
-
 
 def _deduplicate_visual_tags(items: list[dict]) -> list[dict]:
     """Remove duplicate chart-drawn tags while preserving order."""
@@ -1764,7 +1838,10 @@ def _clear_after_well_unlock_or_change():
             "max_override_",
             "curve_source_",
             "visual_tag_intervals_",
+            "tag_ledger_",
+            "deleted_tag_ids_",
             "hit_result_history_",
+
             "enable_tag_",
             "tag_label_",
             "tag_start_",
@@ -1791,7 +1868,10 @@ def _clear_after_section_unlock_or_change():
             "max_override_",
             "curve_source_",
             "visual_tag_intervals_",
+            "tag_ledger_",
+            "deleted_tag_ids_",
             "hit_result_history_",
+
             "enable_tag_",
             "tag_label_",
             "tag_start_",
@@ -1830,7 +1910,10 @@ def _clear_after_auto_well_lock():
             "max_override_",
             "curve_source_",
             "visual_tag_intervals_",
+            "tag_ledger_",
+            "deleted_tag_ids_",
             "hit_result_history_",
+
             "enable_tag_",
             "tag_label_",
             "tag_start_",
@@ -1859,7 +1942,10 @@ def _clear_after_auto_section_lock():
             "max_override_",
             "curve_source_",
             "visual_tag_intervals_",
+            "tag_ledger_",
+            "deleted_tag_ids_",
             "hit_result_history_",
+
             "enable_tag_",
             "tag_label_",
             "tag_start_",
@@ -4460,25 +4546,38 @@ def render_track4_manual_tag_controls(
         # stored separately from the three sidebar Tagger slots. Add them to the
         # same tag_intervals list that Track 4 uses, so they are visualized as
         # real Tagger-lane intervals and included in the Hit results.
+
         visual_key = f"visual_tag_intervals_{context_key}"
-        visual_items = st.session_state.get(visual_key, [])
+        ledger_key = f"tag_ledger_{context_key}"
+        visual_items = st.session_state.get(ledger_key) or st.session_state.get(visual_key, [])
+
         if isinstance(visual_items, list):
             cleaned_visual_items = []
+
             for visual_idx, visual_item in enumerate(visual_items, start=1):
                 normalized_visual = _normalize_section_tag(
                     visual_item,
                     fallback_label=f"Drawn Tag {visual_idx}",
                 )
+
                 if normalized_visual is None:
                     continue
+
+                if str(normalized_visual.get("status") or "active").lower() == "deleted":
+                    continue
+
                 cleaned_visual_items.append(normalized_visual)
+
                 if _interval_overlaps_window(normalized_visual, t_min, t_max):
                     tag_intervals.append(normalized_visual)
 
             # Keep all saved/drawn tags as section-level absolute timestamps.
             # Do not clamp tags to the current 12-hour window.
-            st.session_state[visual_key] = _deduplicate_visual_tags(cleaned_visual_items)
-
+            cleaned_visual_items = _deduplicate_visual_tags(cleaned_visual_items)
+            st.session_state[ledger_key] = cleaned_visual_items
+            st.session_state[visual_key] = cleaned_visual_items
+        
+ 
         
 
     return {
@@ -4694,6 +4793,42 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
     dashboard_state = uploaded_data.get("dashboard_state", {}) or {}
     widget_state = dashboard_state.get("widget_state", {}) or {}
 
+
+    # Restore durable chart-drawn tag ledger as early as possible, before the
+    # React viewer receives saved_tags. Prefer explicit tag_ledger, but remain
+    # compatible with older JSON files that only have drawn_tag_intervals.
+    ledger_candidates = (
+        uploaded_data.get("tag_ledger")
+        or widget_state.get(f"tag_ledger_{context_key}")
+        or uploaded_data.get("drawn_tag_intervals")
+        or widget_state.get(f"visual_tag_intervals_{context_key}")
+        or []
+    )
+
+    restored_ledger = []
+
+    for idx, item in enumerate(ledger_candidates or [], start=1):
+        normalized = _normalize_restored_visual_tag(item, fallback_label=f"Drawn Tag {idx}")
+        if normalized:
+            restored_ledger.append(normalized)
+
+    restored_ledger = _deduplicate_visual_tags(restored_ledger)
+
+    if restored_ledger:
+        st.session_state[f"tag_ledger_{context_key}"] = restored_ledger
+        st.session_state[f"visual_tag_intervals_{context_key}"] = restored_ledger
+
+    restored_hit_results = (
+        uploaded_data.get("hit_results")
+        or widget_state.get(f"hit_result_history_{context_key}")
+        or []
+    )
+
+    if isinstance(restored_hit_results, list):
+        st.session_state[f"hit_result_history_{context_key}"] = restored_hit_results
+
+
+
     if not widget_state:
         return
 
@@ -4814,6 +4949,16 @@ def _render_dashboard_session_download_with_browser_tags(
                 return isNaN(d.getTime()) ? null : d.getTime();
             }}
 
+            function hashCode(text) {{
+                let h = 2166136261;
+                text = String(text || "");
+                for (let i = 0; i < text.length; i++) {{
+                    h ^= text.charCodeAt(i);
+                    h = Math.imul(h, 16777619);
+                }}
+                return h >>> 0;
+            }}
+
             function normalizeTag(item, idx) {{
                 if (!item || typeof item !== "object") return null;
 
@@ -4831,22 +4976,56 @@ def _render_dashboard_session_download_with_browser_tags(
                 const chartSources = ["chart_drag", "client_drag_tag", "visual", "visual_tag", "dragged", "server_tagger"];
                 const source = chartSources.includes(rawSource) ? "chart_drag" : (rawSource || "manual");
 
+                const startText = String(start).replace("T", " ").slice(0, 19);
+                const endText = String(end).replace("T", " ").slice(0, 19);
+                const label = String(
+                    item.label ||
+                    item["Tag Label"] ||
+                    item.tag_label ||
+                    (source === "chart_drag" ? ("Drawn Tag " + idx) : ("Observation " + idx))
+                );
+
+                const tagId = String(item.tag_id || item.created_at || "").trim()
+                    || ("tag_" + Math.abs(hashCode(label + "|" + startText + "|" + endText)));
+
                 return {{
-                    label: String(item.label || item["Tag Label"] || item.tag_label || (source === "chart_drag" ? ("Drawn Tag " + idx) : ("Observation " + idx))),
-                    start: String(start).replace("T", " ").slice(0, 19),
-                    end: String(end).replace("T", " ").slice(0, 19),
-                    source: source
+                    tag_id: tagId,
+                    label: label,
+                    start: startText,
+                    end: endText,
+                    source: source,
+                    status: item.status || "active",
+                    created_at: item.created_at || tagId,
+                    updated_at: item.updated_at || "",
+                    revision: item.revision || 1
                 }};
             }}
 
+     
+
             function identity(tag) {{
+                if (!tag || typeof tag !== "object") return "||";
+
                 const source = String((tag && tag.source) || "chart_drag").toLowerCase();
+                const tagId = String((tag && (tag.tag_id || tag.created_at)) || "").trim();
+
+                if (
+                    (source === "chart_drag" ||
+                     source === "client_drag_tag" ||
+                     source === "visual" ||
+                     source === "visual_tag" ||
+                     source === "dragged" ||
+                     source === "server_tagger") &&
+                    tagId
+                ) {{
+                    return "chart_drag|" + tagId;
+                }}
+
                 const start = String((tag && tag.start) || "").replace("T", " ").slice(0, 19);
                 const end = String((tag && tag.end) || "").replace("T", " ").slice(0, 19);
-                if (source === "chart_drag" || source === "client_drag_tag" || source === "visual" || source === "visual_tag" || source === "dragged" || source === "server_tagger") {{
-                    return "chart_drag|" + start + "|" + end;
-                }}
-                return source + "|" + String((tag && tag.label) || "") + "|" + start + "|" + end;
+                const label = String((tag && (tag.label || tag.tag_label || tag["Tag Label"])) || "");
+
+                return source + "|" + label + "|" + start + "|" + end;
             }}
 
             function deduplicate(tags) {{
@@ -4984,6 +5163,9 @@ def _render_dashboard_session_download_with_browser_tags(
                 const allDrawn = deduplicate(existingDrawn.concat(browserDrawnTags));
 
                 payload.drawn_tag_intervals = allDrawn;
+                payload.tag_ledger = allDrawn;
+                payload.dashboard_state.widget_state["tag_ledger_" + contextKey] = allDrawn;
+
                 payload.dashboard_state.widget_state["visual_tag_intervals_" + contextKey] = allDrawn;
 
                 const manual = Array.isArray(payload.manual_tagger_intervals)
@@ -5090,6 +5272,8 @@ def _render_dashboard_session_download_with_browser_tags(
 
                     finalPayload.manual_tagger_intervals = manualTags;
                     finalPayload.drawn_tag_intervals = drawnTags;
+                    finalPayload.tag_ledger = drawnTags;
+                    finalPayload.dashboard_state.widget_state["tag_ledger_" + contextKey] = drawnTags;
                     finalPayload.tag_intervals = allTags;
                     finalPayload.dashboard_state.widget_state["visual_tag_intervals_" + contextKey] = drawnTags;
                 }}

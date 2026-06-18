@@ -26,6 +26,17 @@ function fmtTime(ms) {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 }
 
+function snapToSecondMs(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n / 1000) * 1000;
+}
+
+function fmtTimeSecond(ms) {
+  const snapped = snapToSecondMs(ms);
+  return snapped == null ? "" : fmtTime(snapped);
+}
+
 function clamp(value, minValue, maxValue) {
   return Math.max(minValue, Math.min(maxValue, value));
 }
@@ -188,6 +199,21 @@ function stableTagIdFromParts(label, start, end, idx = 0) {
   return `tag_${(h >>> 0).toString(36)}`;
 }
 
+function makeNewTagId() {
+  return `tag_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function tagLedgerId(tag) {
+  return String(tag?.tag_id || tag?.created_at || "").trim();
+}
+
+function tagKeyToLedgerId(key) {
+  const text = String(key || "");
+  if (text.startsWith("chart_drag|")) return text.slice("chart_drag|".length);
+  return text;
+}
+
+
 function tagKey(tag) {
   const source = isChartTag(tag) ? "chart_drag" : (String(tag?.source || "manual").trim() || "manual");
   const label = String(tag?.label || "").trim();
@@ -196,11 +222,12 @@ function tagKey(tag) {
   const start = startMs == null ? String(tag?.start || "").trim() : fmtTime(startMs);
   const end = endMs == null ? String(tag?.end || "").trim() : fmtTime(endMs);
 
-  // v7: chart-drawn tags are identical when their interval is identical.
-  // Do not use created_at. Previous code produced two ids for the same hit
-  // interval: a browser Date.now id and a stable tag_ id.
+  // Durable identity: chart-drawn tags keep the same id when resized.
+  // Fallback to interval identity only for very old saved sessions that have no id.
+  const ledgerId = tagLedgerId(tag);
+  if (source === "chart_drag" && ledgerId) return `${source}|${ledgerId}`;
   if (source === "chart_drag") return `${source}|${start}|${end}`;
-
+  
   return `${source}|${label}|${start}|${end}`;
 }
 
@@ -225,15 +252,21 @@ function normalizeTag(tag, idx = 0) {
   const start = fmtTime(startMs);
   const end = fmtTime(endMs);
   const label = String(tag.label || (chartTag ? `Dragged Tag ${idx + 1}` : `Tag ${idx + 1}`)).trim();
-  const createdAt = chartTag ? stableTagIdFromParts(label, start, end, 0) : "";
+  const existingId = String(tag.tag_id || tag.created_at || "").trim();
+  const ledgerId = chartTag ? (existingId || stableTagIdFromParts(label, start, end, idx)) : existingId;
+  const nowText = new Date().toISOString();
 
   return {
     ...tag,
+    tag_id: ledgerId,
     label: label || (chartTag ? `Dragged Tag ${idx + 1}` : `Tag ${idx + 1}`),
     start,
     end,
     source,
-    created_at: createdAt,
+    status: tag.status || "active",
+    created_at: tag.created_at || ledgerId || nowText,
+    updated_at: tag.updated_at || nowText,
+    revision: Number(tag.revision || 1),
   };
 }
 
@@ -258,12 +291,18 @@ function chartTagsForServer(items) {
       const start = fmtTime(toMs(tag.start));
       const end = fmtTime(toMs(tag.end));
       const label = tag.label || `Dragged Tag ${idx + 1}`;
+      const ledgerId = tagLedgerId(tag) || stableTagIdFromParts(label, start, end, idx);
+
       return {
+        tag_id: ledgerId,
         label,
         start,
         end,
         source: "chart_drag",
-        created_at: stableTagIdFromParts(label, start, end, 0),
+        status: tag.status || "active",
+        created_at: tag.created_at || ledgerId,
+        updated_at: tag.updated_at || new Date().toISOString(),
+        revision: Number(tag.revision || 1),
       };
     });
 }
@@ -309,6 +348,62 @@ function allTagStorageKey(contextKey, sessionToken) {
 
 function latestAllTagStorageKey(contextKey) {
   return `hoda_virtual_all_tags_latest_${String(contextKey || "default")}`;
+}
+
+function deletedChartTagStorageKey(contextKey, sessionToken) {
+  const safeContext = String(contextKey || "default");
+  const safeSession = String(sessionToken || "fresh");
+  return `hoda_virtual_deleted_chart_tag_ids_${safeContext}_${safeSession}`;
+}
+
+function loadDeletedChartTagIds(contextKey, sessionToken) {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.sessionStorage.getItem(
+      deletedChartTagStorageKey(contextKey, sessionToken),
+    );
+    const parsed = JSON.parse(raw || "[]");
+    return Array.isArray(parsed)
+      ? parsed.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function saveDeletedChartTagIds(contextKey, sessionToken, ids) {
+  if (typeof window === "undefined") return;
+
+  const cleanIds = Array.from(
+    new Set(
+      (Array.isArray(ids) ? ids : Array.from(ids || []))
+        .map((x) => String(x || "").trim())
+        .filter(Boolean),
+    ),
+  );
+
+  try {
+    window.sessionStorage.setItem(
+      deletedChartTagStorageKey(contextKey, sessionToken),
+      JSON.stringify(cleanIds),
+    );
+  } catch (err) {}
+}
+
+function filterDeletedChartTags(items, deletedIds) {
+  const deleted = new Set(
+    (Array.isArray(deletedIds) ? deletedIds : Array.from(deletedIds || []))
+      .map((x) => String(x || "").trim())
+      .filter(Boolean),
+  );
+
+  if (!deleted.size) return dedupeTags(items || []);
+
+  return dedupeTags(items || []).filter((tag) => {
+    if (!isChartTag(tag)) return true;
+    const id = tagLedgerId(tag) || tagKeyToLedgerId(tagKey(tag));
+    return !deleted.has(String(id || "").trim());
+  });
 }
 
 function saveStoredAllTags(contextKey, sessionToken, items) {
@@ -381,16 +476,40 @@ function clearStoredChartTags(contextKey, sessionToken) {
   try {
     window.sessionStorage.removeItem(chartTagStorageKey(contextKey, sessionToken));
     window.sessionStorage.setItem(latestChartTagStorageKey(contextKey), "[]");
+
     window.localStorage.removeItem(chartTagStorageKey(contextKey, sessionToken));
     window.localStorage.setItem(latestChartTagStorageKey(contextKey), "[]");
+
+    // Also clear delete tombstones when the whole chart-tag session is reset.
+    window.sessionStorage.removeItem(deletedChartTagStorageKey(contextKey, sessionToken));
   } catch (err) {
     // Safe to ignore.
   }
 }
 
-function mergeManualAndChartTags(serverTags, localChartTags) {
-  const manual = dedupeTags(serverTags || []).filter((tag) => !isChartTag(tag));
-  const chart = dedupeTags([...(serverTags || []), ...(localChartTags || [])]).filter(isChartTag);
+function mergeManualAndChartTags(
+  serverTags,
+  localChartTags,
+  preferLocalChartTags = true,
+  deletedIds = [],
+) {
+  const deleted = new Set(
+    (Array.isArray(deletedIds) ? deletedIds : Array.from(deletedIds || []))
+      .map((x) => String(x || "").trim())
+      .filter(Boolean),
+  );
+
+  const server = filterDeletedChartTags(serverTags || [], deleted);
+  const local = filterDeletedChartTags(localChartTags || [], deleted);
+
+  const manual = server.filter((tag) => !isChartTag(tag));
+  const serverChart = server.filter(isChartTag);
+  const localChart = local.filter(isChartTag);
+
+  const chart = preferLocalChartTags
+    ? dedupeTags([...localChart, ...serverChart]).filter(isChartTag)
+    : dedupeTags([...serverChart, ...localChart]).filter(isChartTag);
+
   return dedupeTags([...manual, ...chart]);
 }
 
@@ -459,24 +578,29 @@ function traceAxis(trackNo) {
 function buildCurveTraces(trackData, markerDisplay = "Lines only") {
   const traces = [];
   const colors = ["#8e44ad", "#2f80ed", "#27ae60", "#d35400", "#7f8c8d"];
+
   (trackData?.tracks || []).forEach((track) => {
     const trackNo = Number(track.track || 1);
     const axis = traceAxis(trackNo);
+
     (track.curves || []).forEach((curve, curveIdx) => {
+      const color = colors[curveIdx % colors.length];
       const xNorm = normalize(curve.x || [], curve.display_min, curve.display_max);
+      const yValues = curve.y || [];
       const showMarkers = markerDisplay === "Small dots" || markerDisplay === "Larger dots";
       const markerSize = markerDisplay === "Larger dots" ? 4 : 2;
 
+      // Always draw the connecting line as its own trace.
+      // This prevents Plotly/WebGL marker mode from hiding or weakening the line.
       traces.push({
         type: "scattergl",
-        mode: showMarkers ? "lines+markers" : "lines",
+        mode: "lines",
         x: xNorm,
-        y: curve.y || [],
+        y: yValues,
         xaxis: axis.xaxis,
         yaxis: axis.yaxis,
-        line: {width: 1.5, color: colors[curveIdx % colors.length], simplify: false},
-        marker: {size: markerSize, opacity: showMarkers ? 0.75 : 0, color: colors[curveIdx % colors.length], line: {width: 0}},
-        connectgaps: false,
+        line: {width: 1.5, color, simplify: false},
+        connectgaps: true,
         name: `${curve.label}`,
         hoverinfo: "none",
         meta: {
@@ -487,10 +611,42 @@ function buildCurveTraces(trackData, markerDisplay = "Lines only") {
         customdata: (curve.x || []).map((v) => [v]),
         showlegend: false,
       });
+
+      // Draw dots as a second trace only when the user asks for dots.
+      // The line trace above remains visible and connected.
+      if (showMarkers) {
+        traces.push({
+          type: "scattergl",
+          mode: "markers",
+          x: xNorm,
+          y: yValues,
+          xaxis: axis.xaxis,
+          yaxis: axis.yaxis,
+          marker: {
+            size: markerSize,
+            opacity: 0.75,
+            color,
+            line: {width: 0},
+          },
+          connectgaps: true,
+          name: `${curve.label} dots`,
+          hoverinfo: "none",
+          meta: {
+            label: curve.label || curve.raw_col || "Value",
+            unit: curve.unit || "",
+            raw_values: curve.x || [],
+          },
+          customdata: (curve.x || []).map((v) => [v]),
+          showlegend: false,
+        });
+      }
     });
   });
+
   return traces;
 }
+
+
 
 function buildGridKeepaliveTraces(rangeStartMs, rangeEndMs) {
   const start = Number.isFinite(Number(rangeStartMs)) ? Number(rangeStartMs) : Date.now();
@@ -566,6 +722,9 @@ function App(props) {
   const suppressStateUpdateRef = useRef(true);
   const lastStatePayloadRef = useRef("");
   const pendingLocalChartTagsJsonRef = useRef("");
+  const deletedChartTagIdsRef = useRef(new Set());
+  const deletedTagStorageContextRef = useRef("");
+  const restoredDashboardHydratedRef = useRef(false);
 
   // Stable virtual-scroll state. Wheel movement is accumulated in refs and
   // flushed with requestAnimationFrame. This avoids a React/Plotly rerender loop
@@ -583,6 +742,14 @@ function App(props) {
   const marginHours = Number(args.buffer_margin_hours || 4);
   const visibleMs = visibleHours * HOUR_MS;
   const browserSessionToken = String(args.browser_session_token || "fresh");
+  const deletedTagStorageContext = `${String(args.context_key || "default")}|${browserSessionToken}`;
+
+  if (deletedTagStorageContextRef.current !== deletedTagStorageContext) {
+    deletedTagStorageContextRef.current = deletedTagStorageContext;
+    deletedChartTagIdsRef.current = new Set(
+      loadDeletedChartTagIds(args.context_key, browserSessionToken),
+    );
+  }
   const restoreSavedDashboard = Boolean(args.restore_saved_dashboard);
   const propViewportSpanMs = clamp(
     Number(args.viewport_span_seconds || 0) > 0 ? Number(args.viewport_span_seconds) * 1000 : visibleMs,
@@ -609,11 +776,32 @@ function App(props) {
     mergeManualAndChartTags(
       Array.isArray(args.saved_tags) ? args.saved_tags : [],
       loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard),
+      !restoreSavedDashboard,
+      deletedChartTagIdsRef.current,
     ),
   );
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [hitRows, setHitRows] = useState(Array.isArray(args.saved_hit_results) ? args.saved_hit_results : []);
+
+  const [autosaveStatus, setAutosaveStatus] = useState(() => ({
+    count: chartTagsForServer(
+      mergeManualAndChartTags(
+        Array.isArray(args.saved_tags) ? args.saved_tags : [],
+        loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard),
+        !restoreSavedDashboard,
+        deletedChartTagIdsRef.current,
+      ),
+    ).length,
+    savedAt: null,
+    pending: false,
+    reason: "loaded",
+  }));
+
+
+
   const [markerDisplay, setMarkerDisplay] = useState(String(args.marker_display || "Lines only"));
+  
+  
   const [startDateTimeValue, setStartDateTimeValue] = useState(() => fmtDateTimeLocal(initialViewportStartMs));
   useEffect(() => {
     // Give the component keyboard focus on first render so T/Z work without
@@ -661,6 +849,7 @@ function App(props) {
 
     if (contextChanged) {
       const newStart = toMs(args.viewport_start) || bufferStartMs || sectionStartMs;
+      restoredDashboardHydratedRef.current = false;
       if (!restoreSavedDashboard) {
         clearStoredChartTags(currentContextKey, browserSessionToken);
       }
@@ -699,29 +888,49 @@ function App(props) {
     };
   }, []);
 
-  useEffect(() => {
-    const incomingServer = dedupeTags(Array.isArray(args.saved_tags) ? args.saved_tags : []);
-    const storedChart = loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard);
-    const incoming = mergeManualAndChartTags(incomingServer, storedChart);
+useEffect(() => {
+  const deletedIds = deletedChartTagIdsRef.current || new Set();
 
-    setTags((old) => {
-      const current = dedupeTags(old);
-      const merged = mergeManualAndChartTags(
-        incomingServer,
-        restoreSavedDashboard
-          ? [...storedChart, ...current.filter(isChartTag)]
-          : [...storedChart, ...current.filter(isChartTag)],
-      );
+  const incomingServer = filterDeletedChartTags(
+    Array.isArray(args.saved_tags) ? args.saved_tags : [],
+    deletedIds,
+  );
 
-      if (stableJson(current) === stableJson(merged)) return old;
-      suppressStateUpdateRef.current = true;
-      return merged;
-    });
-    setSelectedTagId((oldId) => {
-      if (!oldId) return null;
-      return incoming.some((tag) => tagKey(tag) === oldId || String(tag.created_at || "") === oldId) ? oldId : null;
-    });
-  }, [JSON.stringify(args.saved_tags || []), args.context_key, browserSessionToken, restoreSavedDashboard]);
+  const storedChart = filterDeletedChartTags(
+    loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard),
+    deletedIds,
+  );
+
+  const preferUploadedSavedTagsNow =
+    restoreSavedDashboard && !restoredDashboardHydratedRef.current;
+
+  setTags((old) => {
+    const current = filterDeletedChartTags(old, deletedIds);
+
+    const manualTags = incomingServer.filter((tag) => !isChartTag(tag));
+    const localChartTags = current.filter(isChartTag);
+    const storedChartTags = dedupeTags(storedChart).filter(isChartTag);
+    const serverChartTags = incomingServer.filter(isChartTag);
+
+    const chartMergeOrder = preferUploadedSavedTagsNow
+      ? [...serverChartTags, ...storedChartTags, ...localChartTags]
+      : [...localChartTags, ...storedChartTags, ...serverChartTags];
+
+    const merged = dedupeTags([
+      ...manualTags,
+      ...chartMergeOrder,
+    ]);
+
+    if (stableJson(current) === stableJson(merged)) return old;
+
+    suppressStateUpdateRef.current = true;
+    return merged;
+  });
+
+  if (preferUploadedSavedTagsNow) {
+    restoredDashboardHydratedRef.current = true;
+  }
+}, [JSON.stringify(args.saved_tags || []), args.context_key, browserSessionToken, restoreSavedDashboard]);
 
   const agents = useMemo(
     () => normalizeAgentIntervals(args.agent_intervals, String(args.selected_agent_name || args.selected_agent || "").trim()),
@@ -1075,35 +1284,67 @@ function App(props) {
     // sidebar tags and browser-drawn tags.
     saveStoredHitRows(args.context_key, browserSessionToken, rows);
 
-    // Critical change: drawing/editing a tag no longer calls Streamlit immediately.
-    // Streamlit setComponentValue causes a rerun, which was remounting the plot and
-    // starting the refresh loop. Keep chart tags local and persist them in browser
-    // storage; sync them to Python only when the user presses "Save drawn tags".
     saveStoredChartTags(args.context_key, browserSessionToken, cleanTags.filter(isChartTag));
     saveStoredAllTags(args.context_key, browserSessionToken, cleanTags);
     suppressStateUpdateRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [JSON.stringify(tags), args.context_key, browserSessionToken]);
 
+function autosaveTagLedger(nextTags, reason = "edit", deletedTagIds = []) {
+  const cleanDeletedIds = (Array.isArray(deletedTagIds) ? deletedTagIds : [])
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
 
+  if (cleanDeletedIds.length) {
+    cleanDeletedIds.forEach((id) => deletedChartTagIdsRef.current.add(id));
+    saveDeletedChartTagIds(
+      args.context_key,
+      browserSessionToken,
+      deletedChartTagIdsRef.current,
+    );
+  }
 
-  function sendCurrentStateToStreamlit(reason = "manual_save") {
-    const cleanTags = dedupeTags(tags);
-    const outgoingChartTags = chartTagsForServer(cleanTags);
-    const rows = normalizeRowsForServer(buildHitRows(cleanTags));
-    const payload = {
-      event: "state_update",
-      reason,
-      tag_mode: tagModeRef.current,
-      tags: outgoingChartTags,
-      hit_results: rows,
-    };
-    const payloadJson = stableJson(payload);
-    if (lastStatePayloadRef.current === payloadJson) return;
+  const cleanTags = filterDeletedChartTags(
+    dedupeTags(nextTags || []),
+    deletedChartTagIdsRef.current,
+  );
+
+  const outgoingChartTags = chartTagsForServer(cleanTags);
+  const rows = normalizeRowsForServer(buildHitRows(cleanTags));
+
+  saveStoredChartTags(args.context_key, browserSessionToken, outgoingChartTags);
+  saveStoredAllTags(args.context_key, browserSessionToken, cleanTags);
+  saveStoredHitRows(args.context_key, browserSessionToken, rows);
+
+  const payload = {
+    event: "tag_autosave",
+    reason,
+    tag_mode: tagModeRef.current,
+    tags: outgoingChartTags,
+    hit_results: rows,
+    deleted_tag_ids: cleanDeletedIds,
+  };
+
+  const payloadJson = stableJson(payload);
+
+  if (lastStatePayloadRef.current !== payloadJson) {
     lastStatePayloadRef.current = payloadJson;
     pendingLocalChartTagsJsonRef.current = stableJson(outgoingChartTags);
     Streamlit.setComponentValue(payload);
   }
+
+  setAutosaveStatus({
+    count: outgoingChartTags.length,
+    savedAt: new Date(),
+    pending: false,
+    reason,
+  });
+}
+
+function sendCurrentStateToStreamlit(reason = "manual_save") {
+  autosaveTagLedger(tags, reason, []);
+}
+
 
   function axisNames() {
     const gd = plotRef.current;
@@ -1586,16 +1827,76 @@ function App(props) {
     maybeRequestBuffer(viewportStartMs);
   }, [viewportStartMs, viewportSpanMs, setPlotViewport, maybeRequestBuffer]);
 
-  function pixelToTime(clientY) {
-    const gd = plotRef.current;
-    if (!gd?._fullLayout?.yaxis) return null;
-    const rect = gd.getBoundingClientRect();
-    const size = gd._fullLayout._size;
-    const plotY = clamp(clientY - rect.top - size.t, 0, size.h);
-    let v = gd._fullLayout.yaxis.p2d(plotY);
-    const ms = toMs(v);
-    return ms == null ? null : ms;
+function getPlotGeometry() {
+  const gd = plotRef.current;
+  const capture = captureRef.current;
+  const wrap = wrapRef.current;
+
+  if (!gd?._fullLayout?.yaxis || !gd?._fullLayout?._size || !capture || !wrap) {
+    return null;
   }
+
+  const size = gd._fullLayout._size;
+  const captureRect = capture.getBoundingClientRect();
+  const wrapRect = wrap.getBoundingClientRect();
+
+  const captureHeight = Math.max(1, captureRect.height || size.h);
+  const captureWidth = Math.max(1, captureRect.width || size.w);
+
+  return {
+    gd,
+    yaxis: gd._fullLayout.yaxis,
+    size,
+    captureRect,
+    wrapRect,
+    topInWrap: captureRect.top - wrapRect.top,
+    leftInWrap: captureRect.left - wrapRect.left,
+    captureHeight,
+    captureWidth,
+  };
+}
+
+function clientYToPlotPixel(clientY) {
+  const geom = getPlotGeometry();
+  if (!geom) return null;
+
+  const yInCapture = clamp(clientY - geom.captureRect.top, 0, geom.captureHeight);
+
+  // Convert from actual capture-layer pixels to Plotly plot-area pixels.
+  return clamp((yInCapture / geom.captureHeight) * geom.size.h, 0, geom.size.h);
+}
+
+function plotPixelToWrapY(plotY) {
+  const geom = getPlotGeometry();
+  if (!geom || plotY == null) return null;
+
+  const yInCapture = (Number(plotY) / Math.max(1, geom.size.h)) * geom.captureHeight;
+  return geom.topInWrap + yInCapture;
+}
+
+function timeMsToWrapY(ms) {
+  const geom = getPlotGeometry();
+  if (!geom || ms == null) return null;
+
+  const plotY = geom.yaxis.d2p(fmtTime(ms));
+  if (!Number.isFinite(plotY)) return null;
+
+  return plotPixelToWrapY(plotY);
+}
+
+function pixelToTime(clientY) {
+  const geom = getPlotGeometry();
+  if (!geom) return null;
+
+  const plotY = clientYToPlotPixel(clientY);
+  if (plotY == null) return null;
+
+  const value = geom.yaxis.p2d(plotY);
+  const ms = toMs(value);
+  const snapped = snapToSecondMs(ms);
+
+  return snapped == null ? null : snapped;
+}
 
   function nearestTagId(clientY) {
     const ms = pixelToTime(clientY);
@@ -1640,20 +1941,25 @@ function App(props) {
     }
   }
 
-  function updateSelectBox(startY, curY) {
-    const gd = plotRef.current;
-    const box = selectBoxRef.current;
-    if (!gd?._fullLayout?._size || !box) return;
-    const rect = gd.getBoundingClientRect();
-    const wrapRect = wrapRef.current.getBoundingClientRect();
-    const y1 = startY - wrapRect.top;
-    const y2 = curY - wrapRect.top;
-    box.style.display = "block";
-    box.style.left = `${gd._fullLayout._size.l}px`;
-    box.style.width = `${gd._fullLayout._size.w}px`;
-    box.style.top = `${Math.min(y1, y2)}px`;
-    box.style.height = `${Math.max(4, Math.abs(y2 - y1))}px`;
-  }
+function updateSelectBox(startY, curY) {
+  const box = selectBoxRef.current;
+  const geom = getPlotGeometry();
+  if (!box || !geom) return;
+
+  const p1 = clientYToPlotPixel(startY);
+  const p2 = clientYToPlotPixel(curY);
+  if (p1 == null || p2 == null) return;
+
+  const y1 = plotPixelToWrapY(p1);
+  const y2 = plotPixelToWrapY(p2);
+  if (y1 == null || y2 == null) return;
+
+  box.style.display = "block";
+  box.style.left = `${geom.leftInWrap}px`;
+  box.style.width = `${geom.captureWidth}px`;
+  box.style.top = `${Math.min(y1, y2)}px`;
+  box.style.height = `${Math.max(2, Math.abs(y2 - y1))}px`;
+}
 
   function hideSelectBox() {
     if (selectBoxRef.current) selectBoxRef.current.style.display = "none";
@@ -1750,19 +2056,18 @@ function showTaggingHover(e) {
   if (!gd?._fullLayout?.yaxis || !gd?._fullLayout?._size || !wrap) return;
 
   try {
-    const gdRect = gd.getBoundingClientRect();
     const wrapRect = wrap.getBoundingClientRect();
-    const size = gd._fullLayout._size;
-    const plotY = clamp(e.clientY - gdRect.top - size.t, 0, size.h);
-    const top = gdRect.top - wrapRect.top + size.t + plotY;
     const ms = pixelToTime(e.clientY);
+    const top = ms == null ? null : timeMsToWrapY(ms);
     const timeText = ms == null ? "" : fmtTime(ms);
     const curvePoint = getTaggingHoverCurvePoint(e, ms);
 
     if (hoverLineRef.current) {
       hoverLineRef.current.style.left = "0px";
       hoverLineRef.current.style.width = "100%";
-      hoverLineRef.current.style.top = `${top}px`;
+      if (top != null) {
+        hoverLineRef.current.style.top = `${top}px`;
+      }
       hoverLineRef.current.style.display = "block";
     }
 
@@ -1771,13 +2076,15 @@ function showTaggingHover(e) {
         hoverBoxRef.current.innerHTML =
           `<b>${htmlEscape(curvePoint.label)}</b><br>` +
           `${htmlEscape(formatLimitValue(curvePoint.value))} ${htmlEscape(curvePoint.unit)}<br>` +
-          `Time: ${htmlEscape(curvePoint.timeText)}`;
+          (timeText ? `Mouse time: ${htmlEscape(timeText)}<br>` : "") +
+          `Nearest point time: ${htmlEscape(curvePoint.timeText)}`;
       } else {
         hoverBoxRef.current.innerHTML =
           `<b>Tagging mode</b><br>` +
-          (timeText ? `Time: ${htmlEscape(timeText)}<br>` : "") +
+          (timeText ? `Mouse time: ${htmlEscape(timeText)}<br>` : "") +
           `Drag vertically to create/edit a Track 4 tag`;
       }
+      
 
       hoverBoxRef.current.style.left =
         `${Math.max(8, Math.min(e.clientX - wrapRect.left + 12, wrapRect.width - 245))}px`;
@@ -1796,24 +2103,25 @@ function showTaggingHover(e) {
   }
 }
 
-  function updateResizePreview(startMs, endMs) {
-    const gd = plotRef.current;
-    const box = selectBoxRef.current;
-    const wrap = wrapRef.current;
-    if (!gd?._fullLayout?.yaxis || !box || !wrap) return;
-    try {
-      const y1 = gd._fullLayout.yaxis.d2p(fmtTime(startMs)) + gd._fullLayout._size.t;
-      const y2 = gd._fullLayout.yaxis.d2p(fmtTime(endMs)) + gd._fullLayout._size.t;
-      const size = gd._fullLayout._size;
-      box.style.display = "block";
-      box.style.left = `${size.l}px`;
-      box.style.width = `${size.w}px`;
-      box.style.top = `${Math.min(y1, y2)}px`;
-      box.style.height = `${Math.max(4, Math.abs(y2 - y1))}px`;
-    } catch (err) {
-      // Preview failure should never break editing.
-    }
+function updateResizePreview(startMs, endMs) {
+  const box = selectBoxRef.current;
+  const geom = getPlotGeometry();
+  if (!box || !geom) return;
+
+  try {
+    const y1 = timeMsToWrapY(startMs);
+    const y2 = timeMsToWrapY(endMs);
+    if (y1 == null || y2 == null) return;
+
+    box.style.display = "block";
+    box.style.left = `${geom.leftInWrap}px`;
+    box.style.width = `${geom.captureWidth}px`;
+    box.style.top = `${Math.min(y1, y2)}px`;
+    box.style.height = `${Math.max(2, Math.abs(y2 - y1))}px`;
+  } catch (err) {
+    // Preview failure should never break editing.
   }
+}
 
   function isWheelInsidePlotArea(e) {
     const gd = plotRef.current;
@@ -2075,42 +2383,72 @@ function showTaggingHover(e) {
     }
   }
 
-  function commitActiveResize() {
-    if (!resizeRef.current.active) return false;
-    const resize = resizeRef.current;
-    const ns = resize.previewStartMs ?? resize.startMs;
-    const ne = resize.previewEndMs ?? resize.endMs;
 
-    if (resize.tagId && ns != null && ne != null) {
-      setTags((old) =>
-        dedupeTags(
-          old.map((tag) => {
-            const id = tagKey(tag);
-            if (id !== resize.tagId) return tag;
-          const newStart = fmtTime(Math.min(ns, ne));
-          const newEnd = fmtTime(Math.max(ns, ne));
+
+function commitActiveResize() {
+  if (!resizeRef.current.active) return false;
+
+  const resize = resizeRef.current;
+  const ns = resize.previewStartMs ?? resize.startMs;
+  const ne = resize.previewEndMs ?? resize.endMs;
+
+  if (resize.tagId && ns != null && ne != null) {
+    setTags((old) => {
+      const next = dedupeTags(
+        old.map((tag) => {
+          const id = tagKey(tag);
+          if (id !== resize.tagId) return tag;
+
+          let snappedStart = snapToSecondMs(Math.min(ns, ne));
+          let snappedEnd = snapToSecondMs(Math.max(ns, ne));
+
+          if (snappedStart == null || snappedEnd == null) return tag;
+
+          if (snappedEnd <= snappedStart) {
+            snappedEnd = snappedStart + 1000;
+          }
+
+          const newStart = fmtTimeSecond(snappedStart);
+          const newEnd = fmtTimeSecond(snappedEnd);
+
+
           const oldSource = String(tag.source || "manual").trim() || "manual";
           const newLabel = tag.label || (isChartSource(oldSource) ? "Dragged tag" : "Manual tag");
+          const ledgerId = tagLedgerId(tag) || stableTagIdFromParts(newLabel, tag.start, tag.end, 0);
 
           return {
             ...tag,
+            tag_id: ledgerId,
             label: newLabel,
             start: newStart,
             end: newEnd,
             source: isChartSource(oldSource) ? "chart_drag" : oldSource,
-            created_at: isChartSource(oldSource)
-              ? stableTagIdFromParts(newLabel, newStart, newEnd, 0)
-              : (tag.created_at || ""),
-          };  
-          }),
-        ),
+            status: "active",
+            created_at: tag.created_at || ledgerId,
+            updated_at: new Date().toISOString(),
+            revision: Number(tag.revision || 1) + 1,
+          };
+        }),
       );
-    }
 
-    resizeRef.current = {active: false, boundary: null, tagId: null, startMs: null, endMs: null, previewStartMs: null, previewEndMs: null};
-    hideSelectBox();
-    return true;
+      autosaveTagLedger(next, "resize", []);
+      return next;
+    });
   }
+
+  resizeRef.current = {
+    active: false,
+    boundary: null,
+    tagId: null,
+    startMs: null,
+    endMs: null,
+    previewStartMs: null,
+    previewEndMs: null,
+  };
+
+  hideSelectBox();
+  return true;
+}
 
   function onMouseUp(e) {
     if (!tagModeRef.current && !resizeRef.current.active && !dragRef.current.active) return;
@@ -2121,7 +2459,7 @@ function showTaggingHover(e) {
 
     if (!dragRef.current.active) return;
     const startY = dragRef.current.startY;
-    const endY = e.clientY;
+    const endY = dragRef.current.currentY ?? e.clientY;
     dragRef.current = {active: false, startY: null, currentY: null};
     hideSelectBox();
 
@@ -2130,26 +2468,47 @@ function showTaggingHover(e) {
     const t1 = pixelToTime(startY);
     const t2 = pixelToTime(endY);
     if (t1 == null || t2 == null) return;
-    const s = Math.min(t1, t2);
-    const en = Math.max(t1, t2);
+
+    let s = Math.min(t1, t2);
+    let en = Math.max(t1, t2);
+
+    s = snapToSecondMs(s);
+    en = snapToSecondMs(en);
+
+    if (s == null || en == null) return;
+
+    // Keep a real interval. If the user draws a very tiny interval, make it 1 second.
+    if (en <= s) {
+      en = s + 1000;
+    }
+
     const label = `Dragged Tag ${chartTagsForServer(tags).length + 1}`;
-    const startText = fmtTime(s);
-    const endText = fmtTime(en);
+    const startText = fmtTimeSecond(s);
+    const endText = fmtTimeSecond(en);
+
+
+    const ledgerId = makeNewTagId();
+
     const item = {
+      tag_id: ledgerId,
       label,
       start: startText,
       end: endText,
-      created_at: stableTagIdFromParts(label, startText, endText, 0),
       source: "chart_drag",
+      status: "active",
+      created_at: ledgerId,
+      updated_at: new Date().toISOString(),
+      revision: 1,
     };
+
     setRedoTags([]);
+
     setTags((old) => {
       const next = dedupeTags([...old, item]);
-      const rows = normalizeRowsForServer(buildHitRows(next));
-      saveStoredChartTags(args.context_key, browserSessionToken, chartTagsForServer(next));
-      saveStoredHitRows(args.context_key, browserSessionToken, rows);
+      autosaveTagLedger(next, "draw", []);
       return next;
     });
+    
   }
 
   function onDoubleClick(e) {
@@ -2175,7 +2534,17 @@ function showTaggingHover(e) {
     }
 
     if (selectedTagId === id) {
-      setTags((old) => old.filter((tag) => tagKey(tag) !== id));
+      setTags((old) => {
+        const removed = old.find((tag) => tagKey(tag) === id);
+        const deletedIds = removed
+          ? [tagLedgerId(removed) || tagKeyToLedgerId(id)]
+          : [tagKeyToLedgerId(id)];
+
+        const next = old.filter((tag) => tagKey(tag) !== id);
+        autosaveTagLedger(next, "delete", deletedIds);
+        return next;
+      });
+
       setSelectedTagId(null);
     } else {
       setSelectedTagId(id);
@@ -2187,7 +2556,12 @@ function showTaggingHover(e) {
     if (!drawn.length) return;
     const last = drawn[drawn.length - 1];
     const lastId = tagKey(last);
-    setTags((old) => old.filter((tag) => tagKey(tag) !== lastId));
+    setTags((old) => {
+      const next = old.filter((tag) => tagKey(tag) !== lastId);
+      autosaveTagLedger(next, "undo", [tagLedgerId(last) || tagKeyToLedgerId(lastId)]);
+      return next;
+    });
+
     setRedoTags((old) => [...old.slice(-9), last]);
     if (selectedTagId === lastId) setSelectedTagId(null);
   }
@@ -2196,14 +2570,35 @@ function showTaggingHover(e) {
     if (!redoTags.length) return;
     const restored = redoTags[redoTags.length - 1];
     setRedoTags((old) => old.slice(0, -1));
-    setTags((old) => dedupeTags([...old, restored]));
+    setTags((old) => {
+      const next = dedupeTags([...old, restored]);
+      autosaveTagLedger(next, "redo", []);
+      return next;
+    });
   }
 
   function deleteSelected() {
     if (!selectedTagId) return;
-    setTags((old) => old.filter((tag) => tagKey(tag) !== selectedTagId));
+
+    const idToDelete = selectedTagId;
+
+    setTags((old) => {
+      const removed = old.find((tag) => tagKey(tag) === idToDelete);
+      const deletedIds = removed
+        ? [tagLedgerId(removed) || tagKeyToLedgerId(idToDelete)]
+        : [tagKeyToLedgerId(idToDelete)];
+
+      const next = old.filter((tag) => tagKey(tag) !== idToDelete);
+      autosaveTagLedger(next, "delete", deletedIds);
+      return next;
+    });
+
     setSelectedTagId(null);
   }
+
+
+
+
 
   function downloadHitResults() {
     const rows = buildHitRows(dedupeTags(tags));
@@ -2271,13 +2666,23 @@ function showTaggingHover(e) {
 
             <button onClick={() => {
               clearStoredChartTags(args.context_key, browserSessionToken);
+
               setTags((old) => {
+                const deletedIds = old
+                  .filter(isChartTag)
+                  .map((tag) => tagLedgerId(tag))
+                  .filter(Boolean);
+
                 const remaining = old.filter((tag) => !isChartTag(tag));
                 const rows = buildHitRows(remaining);
+
                 setHitRows(rows);
                 saveStoredHitRows(args.context_key, browserSessionToken, rows);
+                autosaveTagLedger(remaining, "clear", deletedIds);
+
                 return remaining;
               });
+
               setSelectedTagId(null);
               setRedoTags([]);
             }}>Clear drag tags</button>
@@ -2327,7 +2732,20 @@ function showTaggingHover(e) {
             {visibleRows.length ? `Tags: ${visibleRows.length} | Hits: ${hitCount} | Misses: ${missCount}` : "No dragged tags yet."}
           </span>
         </summary>
+
+        <div style={{
+          fontSize: 11,
+          color: autosaveStatus.pending ? "#a15c00" : "#287a3e",
+          marginTop: 3,
+          marginBottom: 4,
+        }}>
+          {autosaveStatus.pending
+            ? "⚠ Tags not yet synced"
+            : `Tags autosaved: ${autosaveStatus.count} drawn tag(s)${autosaveStatus.savedAt ? `, last saved ${autosaveStatus.savedAt.toLocaleTimeString()}` : ""}`}
+        </div>
+
         <div style={{overflowX: "auto", marginTop: 6}}>
+        
           {visibleRows.length ? (
             <table>
               <thead>
