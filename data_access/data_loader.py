@@ -267,8 +267,64 @@ def load_sections_for_columns(
             st.warning(f"No supported time column found in {path.name}")
             continue
 
-        needed = [time_col] + OPTIONAL_META_COLUMNS + list(requested_columns)
-        cols = [c for c in needed if c in schema_cols]
+        requested = list(requested_columns)
+
+        precleaned_companions = []
+        for raw_col in requested:
+            precleaned_companions.extend([
+                f"{raw_col}__clean",
+                f"{raw_col}__quality",
+            ])
+
+        needed = (
+            [time_col]
+            + OPTIONAL_META_COLUMNS
+            + requested
+            + precleaned_companions
+        )
+
+        cols = list(dict.fromkeys(
+            c for c in needed if c in schema_cols
+        ))
+
+        # -------------------------------------------------
+        # TEMPORARY VERIFICATION
+        # -------------------------------------------------
+        available_pairs = []
+        legacy_raw = []
+        incomplete_pairs = []
+
+        for raw_col in requested:
+            if raw_col not in schema_cols:
+                continue
+
+            clean_col = f"{raw_col}__clean"
+            quality_col = f"{raw_col}__quality"
+
+            has_clean = clean_col in schema_cols
+            has_quality = quality_col in schema_cols
+
+            if has_clean != has_quality:
+                incomplete_pairs.append(
+                    (raw_col, has_clean, has_quality)
+                )
+            elif has_clean:
+                available_pairs.append(raw_col)
+            else:
+                legacy_raw.append(raw_col)
+
+        if incomplete_pairs:
+            raise RuntimeError(
+                f"[VERIFY FAILED] Incomplete pre-cleaned pairs "
+                f"in {path.name}: {incomplete_pairs}"
+            )
+
+        print(
+            f"[VERIFY LOADER] {path.name} | "
+            f"precleaned pairs={len(available_pairs)} | "
+            f"legacy/raw-only={len(legacy_raw)}"
+        )
+
 
         filters = []
         if start_bound is not None:
@@ -331,13 +387,63 @@ def load_sections_for_columns(
 
     for col in merged.columns:
         if col in {"_section_in", "DEPT"}:
-            merged[col] = pd.to_numeric(merged[col], errors="coerce").astype("float32")
+            merged[col] = pd.to_numeric(
+                merged[col],
+                errors="coerce",
+            ).astype("float32")
+            continue
+
+        # Preserve Data Cleaning Module text/status columns.
+        if col.endswith((
+            "__quality",
+            "__quality_dashboard",
+            "__qc_flags",
+        )):
             continue
 
         if merged[col].dtype == object:
-            merged[col] = pd.to_numeric(merged[col], errors="coerce")
-        elif pd.api.types.is_integer_dtype(merged[col]) or pd.api.types.is_float_dtype(merged[col]):
+            merged[col] = pd.to_numeric(
+                merged[col],
+                errors="coerce",
+            )
+        elif (
+            pd.api.types.is_integer_dtype(merged[col])
+            or pd.api.types.is_float_dtype(merged[col])
+        ):
             merged[col] = merged[col].astype("float32")
+
+
+    # -------------------------------------------------
+    # TEMPORARY VERIFICATION
+    # -------------------------------------------------
+    quality_cols = [
+        c for c in merged.columns
+        if c.endswith("__quality")
+    ]
+
+    bad_quality_cols = [
+        c for c in quality_cols
+        if pd.api.types.is_numeric_dtype(merged[c])
+    ]
+
+    if bad_quality_cols:
+        raise RuntimeError(
+            "[VERIFY FAILED] Quality columns became numeric: "
+            f"{bad_quality_cols}"
+        )
+
+    if quality_cols:
+        example = quality_cols[0]
+
+        print(
+            f"[VERIFY QUALITY] "
+            f"columns={len(quality_cols)} | "
+            f"example={example} | "
+            f"dtype={merged[example].dtype} | "
+            f"non-null={int(merged[example].notna().sum())}"
+        )
+
+
 
     return merged
 

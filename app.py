@@ -1373,6 +1373,28 @@ def main():
         required_symptom_labels=required_symptom_labels,
     )
 
+    # -------------------------------------------------
+    # TEMPORARY AGENT VERIFICATION
+    # -------------------------------------------------
+    print(
+        "[VERIFY AGENT MAP]",
+        {
+            label: agent_clean_label_to_column.get(label)
+            for label in [
+                "SPP",
+                "MFI",
+                "RPMB",
+                "WOB",
+                "TRQ",
+                "HKL",
+            ]
+            if label in agent_clean_label_to_column
+        }
+    )
+
+
+
+
     # Create sidebar containers early, immediately after data agent is locked.
     # This allows agent settings, manual tags, and agent interval table to appear
     # before plot parameters are selected.
@@ -1527,7 +1549,8 @@ def main():
                 key=f"curve_source_{context_key}",
                 help=(
                     "Raw values preserve the original sensor data. "
-                    "Cleaned values apply the dashboard cleaning rules. "
+                    "Cleaned values use standalone Data Cleaning Module output when available; "
+                    "legacy raw-only files are cleaned by the dashboard. "
                     "Agents always use cleaned values."
                 ),
             )
@@ -1596,6 +1619,74 @@ def main():
         required_activity_labels=required_activity_labels,
         required_symptom_labels=required_symptom_labels,
     )
+
+    # -------------------------------------------------
+    # TEMPORARY VERIFICATION
+    # -------------------------------------------------
+
+    # Raw aliases must still point to RAW sensor columns.
+    bad_raw_mapping = {
+        label: col
+        for label, col in label_to_column.items()
+        if col.endswith((
+            "__clean",
+            "__quality",
+        ))
+    }
+
+    if bad_raw_mapping:
+        raise RuntimeError(
+            "[VERIFY FAILED] Alias mapping points "
+            f"to generated columns: {bad_raw_mapping}"
+        )
+
+
+    # Clean mapping must always be:
+    # raw mnemonic + "__clean"
+    bad_clean_mapping = {}
+
+    for label, raw_col in label_to_column.items():
+
+        expected = f"{raw_col}__clean"
+        actual = clean_label_to_column.get(label)
+
+        if actual != expected:
+
+            bad_clean_mapping[label] = {
+                "raw": raw_col,
+                "expected": expected,
+                "actual": actual,
+            }
+
+    if bad_clean_mapping:
+        raise RuntimeError(
+            "[VERIFY FAILED] Clean mapping mismatch: "
+            f"{bad_clean_mapping}"
+        )
+
+
+    watch_labels = [
+        "SPP",
+        "MFI",
+        "RPMB",
+        "WOB",
+        "TRQ",
+        "HKL",
+    ]
+
+    print("[VERIFY MAP]")
+
+    for label in watch_labels:
+
+        if label in label_to_column:
+
+            print(
+                f"  {label}: "
+                f"raw={label_to_column[label]} | "
+                f"clean={clean_label_to_column.get(label)}"
+            )
+
+    print("[VERIFY MAP] PASS")
 
     if st.session_state.get("_show_hidden_parameter_mapping_diagnostics", False):
         with st.expander("Parameter mapping diagnostics", expanded=False):

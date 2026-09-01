@@ -124,37 +124,209 @@ def apply_cleaning_layer(
     required_symptom_labels: list[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, str], pd.DataFrame]:
     """
-    Preserve raw columns and create cleaned columns + quality flags.
+    Preserve raw columns and use pre-cleaned standalone-module
+    columns when available.
+
+    If a pre-cleaned pair is not available, fall back to the
+    dashboard's existing cleaning rules.
 
     Returns:
-    - df_out: dataframe with extra clean/quality columns
+    - df_out: dataframe with clean/quality columns
     - clean_label_to_column: logical label -> cleaned column
     - cleaning_summary_df: per-parameter cleaning summary
     """
+
     df_out = df.copy()
+
     clean_label_to_column: dict[str, str] = {}
     rows = []
 
+    # Temporary verification lists.
+    verify_reused = []
+    verify_mixed = []
+    verify_fallback = []
+
     for label, raw_col in label_to_column.items():
+
         if raw_col not in df_out.columns:
             continue
 
         rule = cleaning_rules.get(label, {})
+
         clean_col = _safe_clean_col_name(raw_col)
         quality_col = _safe_quality_col_name(raw_col)
 
-        clean_series, quality_series, summary = _clean_one_series(
-            raw=df_out[raw_col],
-            rule=rule,
-        )
+        # ------------------------------------------
+        # Detect standalone cleaner output
+        # ------------------------------------------
+        has_clean_col = clean_col in df_out.columns
+        has_quality_col = quality_col in df_out.columns
 
+        if has_clean_col != has_quality_col:
+            raise RuntimeError(
+                f"[VERIFY FAILED] {label} / {raw_col}: "
+                f"clean exists={has_clean_col}, "
+                f"quality exists={has_quality_col}"
+            )
+
+        if has_clean_col and has_quality_col:
+
+            supplied_clean = pd.to_numeric(
+                df_out[clean_col],
+                errors="coerce",
+            )
+
+            supplied_quality = (
+                df_out[quality_col]
+                .astype("object")
+            )
+
+            # Rows processed by the standalone module
+            # have a populated quality/status value.
+            precleaned_mask = (
+                supplied_quality.notna()
+                & supplied_quality
+                .astype(str)
+                .str.strip()
+                .ne("")
+            )
+
+        else:
+
+            supplied_clean = None
+            supplied_quality = None
+
+            precleaned_mask = pd.Series(
+                False,
+                index=df_out.index,
+            )
+
+        # ==========================================
+        # CASE 1
+        # All rows already cleaned by standalone
+        # ==========================================
+        if (
+            len(precleaned_mask) > 0
+            and precleaned_mask.all()
+        ):
+
+            clean_series = supplied_clean.copy()
+            quality_series = supplied_quality.copy()
+
+            verify_reused.append(
+                f"{label}:{int(precleaned_mask.sum())}"
+            )
+
+        # ==========================================
+        # CASE 2
+        # Mixed standalone-cleaned + legacy rows
+        # ==========================================
+        elif precleaned_mask.any():
+
+            clean_series = supplied_clean.copy()
+            quality_series = supplied_quality.copy()
+
+            legacy_mask = ~precleaned_mask
+
+            fallback_clean, fallback_quality, _ = (
+                _clean_one_series(
+                    raw=df_out.loc[legacy_mask, raw_col],
+                    rule=rule,
+                )
+            )
+
+            clean_series.loc[legacy_mask] = fallback_clean
+            quality_series.loc[legacy_mask] = fallback_quality
+
+            verify_mixed.append(
+                f"{label}:"
+                f"standalone={int(precleaned_mask.sum())},"
+                f"fallback={int(legacy_mask.sum())}"
+            )
+
+        # ==========================================
+        # CASE 3
+        # Old/raw-only Parquet
+        # ==========================================
+        else:
+
+            clean_series, quality_series, _ = (
+                _clean_one_series(
+                    raw=df_out[raw_col],
+                    rule=rule,
+                )
+            )
+
+            verify_fallback.append(label)
+
+        # Final clean values used by plots + agents.
         df_out[clean_col] = clean_series.astype("float32")
         df_out[quality_col] = quality_series
 
+        # ------------------------------------------
+        # Build summary from whichever data actually
+        # won: standalone output or dashboard fallback
+        # ------------------------------------------
+        q = quality_series.fillna("").astype(str)
+
+        summary = {
+            "Raw non-null": int(
+                pd.to_numeric(
+                    df_out[raw_col],
+                    errors="coerce",
+                ).notna().sum()
+            ),
+            "Clean non-null": int(
+                pd.to_numeric(
+                    clean_series,
+                    errors="coerce",
+                ).notna().sum()
+            ),
+            "Missing": int(
+                q.str.contains(
+                    "missing",
+                    regex=False,
+                ).sum()
+            ),
+            "Zero drift corrected": int(
+                q.str.contains(
+                    "zero_drift_corrected",
+                    regex=False,
+                ).sum()
+            ),
+            "Below hard min invalid": int(
+                q.str.contains(
+                    "below_hard_min_invalid",
+                    regex=False,
+                ).sum()
+            ),
+            "Above hard max invalid": int(
+                q.str.contains(
+                    "above_hard_max_invalid",
+                    regex=False,
+                ).sum()
+            ),
+            "Infinite invalid": int(
+                q.str.contains(
+                    "infinite_invalid",
+                    regex=False,
+                ).sum()
+            ),
+        }
+
+        # IMPORTANT:
+        # Keep dashboard logical mapping unchanged.
         clean_label_to_column[label] = clean_col
 
-        raw_valid = pd.to_numeric(df_out[raw_col], errors="coerce").dropna()
-        clean_valid = pd.to_numeric(df_out[clean_col], errors="coerce").dropna()
+        raw_valid = pd.to_numeric(
+            df_out[raw_col],
+            errors="coerce",
+        ).dropna()
+
+        clean_valid = pd.to_numeric(
+            df_out[clean_col],
+            errors="coerce",
+        ).dropna()
 
         rows.append(
             {
@@ -162,44 +334,116 @@ def apply_cleaning_layer(
                 "Raw mnemonic": raw_col,
                 "Clean column": clean_col,
                 "Quality column": quality_col,
-                "Raw min": float(raw_valid.min()) if not raw_valid.empty else np.nan,
-                "Raw P50": float(raw_valid.median()) if not raw_valid.empty else np.nan,
-                "Raw max": float(raw_valid.max()) if not raw_valid.empty else np.nan,
-                "Clean min": float(clean_valid.min()) if not clean_valid.empty else np.nan,
-                "Clean P50": float(clean_valid.median()) if not clean_valid.empty else np.nan,
-                "Clean max": float(clean_valid.max()) if not clean_valid.empty else np.nan,
+                "Raw min": (
+                    float(raw_valid.min())
+                    if not raw_valid.empty
+                    else np.nan
+                ),
+                "Raw P50": (
+                    float(raw_valid.median())
+                    if not raw_valid.empty
+                    else np.nan
+                ),
+                "Raw max": (
+                    float(raw_valid.max())
+                    if not raw_valid.empty
+                    else np.nan
+                ),
+                "Clean min": (
+                    float(clean_valid.min())
+                    if not clean_valid.empty
+                    else np.nan
+                ),
+                "Clean P50": (
+                    float(clean_valid.median())
+                    if not clean_valid.empty
+                    else np.nan
+                ),
+                "Clean max": (
+                    float(clean_valid.max())
+                    if not clean_valid.empty
+                    else np.nan
+                ),
                 "Hard min": rule.get("hard_min", ""),
                 "Hard max": rule.get("hard_max", ""),
                 **summary,
             }
         )
 
-    required_activity_labels = required_activity_labels or []
-    required_symptom_labels = required_symptom_labels or []
+    # -------------------------------------------------
+    # TEMPORARY VERIFICATION
+    # -------------------------------------------------
+    print(
+        "[VERIFY CLEANING] "
+        f"reused={verify_reused} | "
+        f"mixed={verify_mixed} | "
+        f"dashboard_fallback={verify_fallback}"
+    )
+
+    # ----------------------------------------------
+    # Existing dashboard agent-input validity masks
+    # ----------------------------------------------
+    required_activity_labels = (
+        required_activity_labels or []
+    )
+
+    required_symptom_labels = (
+        required_symptom_labels or []
+    )
 
     if required_activity_labels:
-        mask = pd.Series(True, index=df_out.index)
+
+        mask = pd.Series(
+            True,
+            index=df_out.index,
+        )
+
         for label in required_activity_labels:
+
             clean_col = clean_label_to_column.get(label)
-            if clean_col is None or clean_col not in df_out.columns:
+
+            if (
+                clean_col is None
+                or clean_col not in df_out.columns
+            ):
                 mask &= False
             else:
                 mask &= df_out[clean_col].notna()
+
         df_out["dq_activity_inputs_ok"] = mask
 
     if required_symptom_labels:
-        mask = pd.Series(True, index=df_out.index)
+
+        mask = pd.Series(
+            True,
+            index=df_out.index,
+        )
+
         for label in required_symptom_labels:
+
             clean_col = clean_label_to_column.get(label)
-            if clean_col is None or clean_col not in df_out.columns:
+
+            if (
+                clean_col is None
+                or clean_col not in df_out.columns
+            ):
                 mask &= False
             else:
                 mask &= df_out[clean_col].notna()
+
         df_out["dq_symptom_inputs_ok"] = mask
 
     summary_df = pd.DataFrame(rows)
 
     if not summary_df.empty:
-        summary_df = summary_df.sort_values("Parameter").reset_index(drop=True)
+        summary_df = (
+            summary_df
+            .sort_values("Parameter")
+            .reset_index(drop=True)
+        )
 
-    return df_out, clean_label_to_column, summary_df
+    return (
+        df_out,
+        clean_label_to_column,
+        summary_df,
+    )
