@@ -248,7 +248,7 @@ def _apply_temporal_activity_resolution(
 
     # Keep original instantaneous labels for debugging/comparison.
     resolved_cfg["labels_raw"] = raw_labels
-
+#test
     # Production activity is now the confirmed/backdated result.
     resolved_cfg["labels"] = resolved_labels
 
