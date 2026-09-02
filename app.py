@@ -5,11 +5,14 @@ import uuid
 
 import pandas as pd
 import streamlit as st
+
 import streamlit.components.v1 as components
 
 from agents.activity_agents import REQUIRED_ACTIVITY_INPUTS
 from agents.symptom_agents import REQUIRED_SYMPTOM_INPUTS
 from services.data_quality import build_time_cadence_df
+
+
 
 from config import (
     CLEANING_RULES,
@@ -2033,7 +2036,20 @@ def main():
         render_bottom_window_navigation(window_info=window_info, context_key=context_key)
         _render_scroll_to_chart_top_once(context_key)
 
+    # ============================================================
+    # SHARE CURRENT DRILLING DATA WITH AGENT VALIDATION PAGE
+    # ============================================================
+    st.session_state["agent_validation_df"] = df
+
+    st.session_state["agent_validation_context"] = {
+        "well": selected_well,
+        "sections": list(selected_sections),
+        "context_key": context_key,
+    }
+
     commit_undo_tracking()
+
+        
 
 
 if __name__ == "__main__":
@@ -2050,3 +2066,4 @@ if __name__ == "__main__":
         print("========== END DASHBOARD CRASH TRACEBACK ==========\n\n")
 
         raise
+
