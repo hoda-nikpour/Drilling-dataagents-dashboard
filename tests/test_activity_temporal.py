@@ -36,6 +36,8 @@ def test_one_sample_activity_flicker_is_suppressed():
         config=TemporalActivityConfig(confirm_samples=2, override_confirm_samples=4, max_backdate_samples=10),
     )
     assert out["activity_resolved"].tolist() == ["Drilling"] * 5
+    assert not out["activity_is_provisional"].any()
+    assert out.loc[2, "activity_transition_status"] == "rejected_unconfirmed"
 
 
 def test_reaming_to_tripping_out_is_confirmed_and_backdated():

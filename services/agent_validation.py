@@ -33,6 +33,60 @@ class BinaryMetrics:
 def _safe_div(n: float, d: float) -> float:
     return float(n / d) if d else 0.0
 
+def _coerce_binary_value(value: object):
+    """Convert common event labels safely to True/False."""
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+
+    if isinstance(value, (int, np.integer)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+
+    if isinstance(value, (float, np.floating)):
+        if value == 1.0:
+            return True
+        if value == 0.0:
+            return False
+
+    text = str(value).strip().lower()
+
+    true_values = {
+        "true",
+        "t",
+        "yes",
+        "y",
+        "1",
+        "event",
+        "positive",
+        "spike",
+    }
+
+    false_values = {
+        "false",
+        "f",
+        "no",
+        "n",
+        "0",
+        "no event",
+        "negative",
+        "normal",
+    }
+
+    if text in true_values:
+        return True
+
+    if text in false_values:
+        return False
+
+    raise ValueError(
+        f"Cannot interpret binary label {value!r}. "
+        "Use True/False, 1/0, Yes/No, Event/No Event, or similar supported labels."
+    )
 
 def binary_metrics(y_true: Sequence[object], y_pred: Sequence[object]) -> BinaryMetrics:
     """Compute TP/TN/FP/FN and derived metrics.
@@ -44,9 +98,15 @@ def binary_metrics(y_true: Sequence[object], y_pred: Sequence[object]) -> Binary
     if len(truth) != len(pred):
         raise ValueError("y_true and y_pred must have the same length")
 
-    valid = truth.notna() & pred.notna()
-    t = truth[valid].astype(bool).to_numpy()
-    p = pred[valid].astype(bool).to_numpy()
+    truth_binary = truth.map(_coerce_binary_value)
+    pred_binary = pred.map(_coerce_binary_value)
+
+    valid = truth_binary.notna() & pred_binary.notna()
+
+    t = truth_binary[valid].astype(bool).to_numpy()
+    p = pred_binary[valid].astype(bool).to_numpy()
+
+    
 
     tp = int(np.sum(t & p))
     tn = int(np.sum(~t & ~p))

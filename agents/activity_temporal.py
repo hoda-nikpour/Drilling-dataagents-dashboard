@@ -249,7 +249,15 @@ def resolve_activity_temporally(
     for i in range(1, n):
         proposed = raw[i]
 
+
         if proposed == committed:
+            # A previously proposed transition was not confirmed.
+            # Clear its provisional flags because later data rejected it.
+            if pending_start is not None:
+                for j in range(pending_start, i):
+                    provisional[j] = False
+                    status[j] = "rejected_unconfirmed"
+
             resolved[i] = committed
             status[i] = "stable"
             pending_state = None
@@ -257,10 +265,19 @@ def resolve_activity_temporally(
             pending_count = 0
             continue
 
+        
+
         is_likely = proposed in graph.get(committed, frozenset())
         required = cfg.confirm_samples if is_likely else cfg.override_confirm_samples
 
         if pending_state != proposed:
+            # A different unconfirmed transition has appeared.
+            # The previous candidate is therefore rejected.
+            if pending_state is not None and pending_start is not None:
+                for j in range(pending_start, i):
+                    provisional[j] = False
+                    status[j] = "rejected_unconfirmed"
+
             pending_state = proposed
             pending_start = i
             pending_count = 1

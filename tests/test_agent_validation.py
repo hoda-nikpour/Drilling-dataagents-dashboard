@@ -27,3 +27,16 @@ def test_activity_confusion_and_metrics():
     assert cm.loc["Drilling", "Drilling"] == 1
     assert cm.loc["Drilling", "Reaming"] == 1
     assert set(per_class["activity"]) == {"Drilling", "Reaming"}
+
+
+def test_binary_metrics_handles_string_boolean_labels():
+    truth = ["True", "False", "1", "0", "Yes", "No"]
+    pred = ["True", "False", "1", "0", "Yes", "No"]
+
+    m = binary_metrics(truth, pred)
+
+    assert m.tp == 3
+    assert m.tn == 3
+    assert m.fp == 0
+    assert m.fn == 0
+    assert m.accuracy == 1.0

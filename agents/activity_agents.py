@@ -360,7 +360,12 @@ def classify_activities(
     ]
 
     for name in priority:
-        labels.loc[rule_masks[name]] = name
+        # First matching rule wins.
+        # This preserves the documented priority:
+        # MakingConnection > Drilling > Reaming > TrippingIn >
+        # TrippingOut > Conditioning > Circulating > Other
+        unmatched = labels.eq("Other")
+        labels.loc[rule_masks[name] & unmatched] = name
 
     labels = enforce_min_duration(labels, cfg.min_interval_samples)
     intervals = intervals_from_label_series(labels, min_samples=cfg.min_interval_samples)
