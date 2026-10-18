@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "well": "Example Well A",
+  "section": "12.25",
+  "agent_kind": "activity",
+  "reviewed_intervals": [{"start":"2026-01-01T00:00:00Z","end":"2026-01-01T00:02:00Z"}],
+  "prediction_coverage": [{"start":"2026-01-01T00:00:00Z","end":"2026-01-01T00:02:00Z"}],
+  "predictions_complete": true,
+  "prediction_generation": "continuous",
+  "activity_labels": ["Drilling", "Reaming"],
+  "expert_activities": [
+    {"id":"e1","activity":"Drilling","start":"2026-01-01T00:00:00Z","end":"2026-01-01T00:01:00Z"},
+    {"id":"e2","activity":"Reaming","start":"2026-01-01T00:01:00Z","end":"2026-01-01T00:02:00Z"}
+  ],
+  "predicted_activities": [
+    {"id":"p1","activity":"Drilling","start":"2026-01-01T00:00:00Z","end":"2026-01-01T00:00:50Z"},
+    {"id":"p2","activity":"Reaming","start":"2026-01-01T00:00:50Z","end":"2026-01-01T00:02:00Z"}
+  ]
+}

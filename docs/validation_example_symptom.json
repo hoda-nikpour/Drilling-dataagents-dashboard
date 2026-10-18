@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "well": "Example Well A",
+  "section": "12.25",
+  "agent": "TRQSpike",
+  "agent_kind": "symptom",
+  "reviewed_intervals": [
+    {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:10:00Z"}
+  ],
+  "prediction_coverage": [
+    {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T00:10:00Z"}
+  ],
+  "predictions_complete": true,
+  "prediction_generation": "continuous",
+  "expert_tags": [
+    {"id": "expert-1", "agent": "TRQSpike", "start": "2026-01-01T00:01:00Z", "end": "2026-01-01T00:02:00Z"}
+  ],
+  "predictions": [
+    {"id": "agent-1", "agent": "TRQSpike", "start": "2026-01-01T00:01:05Z", "end": "2026-01-01T00:02:05Z"},
+    {"id": "agent-2", "agent": "TRQSpike", "start": "2026-01-01T00:04:00Z", "end": "2026-01-01T00:04:30Z"}
+  ],
+  "matching": {"version": "event-v1.0", "method": "iou_one_to_one", "min_iou": 0.25, "min_overlap_seconds": 0}
+}
