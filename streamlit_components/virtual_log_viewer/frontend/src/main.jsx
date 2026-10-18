@@ -142,9 +142,7 @@ function rowIdentity(row) {
   return [
     row.well || "",
     row.section || "",
-    row.tag_label || "",
-    row.tag_start || "",
-    row.tag_end || "",
+    row.tag_id ? `id:${row.tag_id}` : `legacy:${row.tag_label || ""}|${row.tag_start || ""}|${row.tag_end || ""}`,
   ].join("|");
 }
 
@@ -172,7 +170,10 @@ function normalizeRowsForServer(rows) {
     const start = row.tag_start ? fmtTime(toMs(row.tag_start)) : "";
     const end = row.tag_end ? fmtTime(toMs(row.tag_end)) : "";
     if (!start || !end || start === end) return;
-    const key = [row.well || "", row.section || "", start, end].join("|");
+    // New rows use a durable tag ID; older session rows use label + bounds.
+    // Different tags sharing the same timestamps must NOT silently disappear.
+    const key = [row.well || "", row.section || "",
+      row.tag_id ? `id:${row.tag_id}` : `legacy:${row.tag_label || ""}|${start}|${end}`].join("|");
     if (seen.has(key)) return;
     seen.add(key);
     out.push({...row, tag_start: start, tag_end: end});
@@ -1287,6 +1288,7 @@ useEffect(() => {
         section: (args.selected_sections || []).join(" + "),
         date: tag.start ? String(tag.start).split(" ")[0] : "",
         tag_label: tag.label || "Dragged tag",
+        tag_id: tagLedgerId(tag) || tagKey(tag),
         tag_start: tag.start || "",
         tag_end: tag.end || "",
         agent_start: best ? best.agent.start : "",
@@ -2765,6 +2767,10 @@ function commitActiveResize() {
           </span>
         </summary>
 
+        <div style={{fontSize: 11, color: "#995e00", marginTop: 3}}>
+          Live preview only (current loaded agent buffer); hits/misses here are NOT final validation metrics.
+          Use the independent validation report for Precision, Recall and F1.
+        </div>
         <div style={{
           fontSize: 11,
           color: autosaveStatus.pending ? "#a15c00" : "#287a3e",

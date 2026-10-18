@@ -96,6 +96,7 @@ from ui.sidebar import (
     apply_visual_tag_from_query_params,
 )
 
+from ui.final_validation_panel import render_final_validation_panel
 from ui.styles import apply_global_styles
 from utils.helpers import compute_section_ranges
 from visualization.chart_builder import create_multi_track_chart
@@ -918,34 +919,54 @@ def _merge_virtual_tag_ledger(
     return out
 
 def _deduplicate_virtual_hit_results(rows, current_tags: list[dict] | None = None) -> list[dict]:
-    """Keep only one hit row per current tag interval and drop stale resize rows."""
+    """Keep current tag-result rows by durable ID, with a safe legacy fallback.
+
+    Multiple different tags may share a label and time boundaries; IDs must
+    remain distinct. Resize history tied to removed or moved tags is dropped.
+    """
     safe_rows = _virtual_json_safe(rows or [])
     if not isinstance(safe_rows, list):
         return []
 
-    allowed = None
+    allowed_legacy = None
+    allowed_ids = set()
+    fallback_ids = set()
     if current_tags is not None:
-        allowed = {
-            (
-                str(tag.get("label") or ""),
-                str(tag.get("start") or ""),
-                str(tag.get("end") or ""),
-            )
-            for tag in current_tags
-        }
+        allowed_legacy = set()
+        for tag in current_tags:
+            if not isinstance(tag, dict):
+                continue
+            label = str(tag.get("label") or "")
+            start = str(tag.get("start") or "")
+            end = str(tag.get("end") or "")
+            allowed_legacy.add((label, start, end))
+            tag_id = str(tag.get("tag_id") or "").strip()
+            if tag_id:
+                allowed_ids.add((tag_id, start, end))
+            else:
+                # Old manual tags can lack an ID; React uses the same
+                # source/label/time fallback as its tagKey() helper.
+                source = str(tag.get("source") or "manual")
+                fallback_ids.add((f"{source}|{label}|{start}|{end}", start, end))
+                if source == "chart_drag":
+                    fallback_ids.add((f"chart_drag|{start}|{end}", start, end))
 
     out: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen = set()
     for row in safe_rows:
         if not isinstance(row, dict):
             continue
-        key = (
-            str(row.get("tag_label") or ""),
-            str(row.get("tag_start") or ""),
-            str(row.get("tag_end") or ""),
-        )
-        if allowed is not None and key not in allowed:
-            continue
+        label = str(row.get("tag_label") or "")
+        start = str(row.get("tag_start") or "")
+        end = str(row.get("tag_end") or "")
+        tag_id = str(row.get("tag_id") or "").strip()
+        if allowed_legacy is not None:
+            if tag_id:
+                if (tag_id, start, end) not in allowed_ids and (tag_id, start, end) not in fallback_ids:
+                    continue
+            elif (label, start, end) not in allowed_legacy:
+                continue
+        key = ("id", tag_id) if tag_id else ("legacy", label, start, end)
         if key in seen:
             continue
         seen.add(key)
@@ -1987,6 +2008,23 @@ def main():
         parent=review_controls_container,
         selected_well=selected_well,
         selected_sections=selected_sections,
+    )
+
+    # Opt-in, independent final scoring. Uses exported expert-tag snapshot and
+    # one continuous agent computation; never replaces live plotting/Hit Results.
+    render_final_validation_panel(
+        well=selected_well, sections=selected_sections,
+        agent_source=agent_controls.get("agent_source", "None"),
+        activity_ui=activity_ui, symptom_ui=symptom_ui,
+        full_time_index=time_df.index,
+        requested_columns=section_agent_requested_columns,
+        label_to_column=label_to_column,
+        cleaning_rules=context_cleaning_rules,
+        required_activity_labels=required_activity_labels,
+        required_symptom_labels=required_symptom_labels,
+        run_activity=run_activity_agent,
+        resolve_activity=_apply_temporal_activity_resolution,
+        run_symptom=run_symptom_agent,
     )
 
     render_dashboard_header(

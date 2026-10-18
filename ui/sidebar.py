@@ -1511,46 +1511,54 @@ def _normalized_time_identity(start_value, end_value) -> tuple[str, str] | None:
 
 
 def _filter_hit_result_rows_for_tags(hit_rows: list[dict], tag_intervals: list[dict]) -> list[dict]:
-    """
-    Keep only hit-result rows that correspond to saved drawn/tag intervals.
+    """Only export rows that correspond to current expert tags.
 
-    This prevents old browser localStorage hit-history rows from being saved or
-    restored when they are not present in the saved Track 4 tag set.
+    Prefer durable tag_id, but remain backward compatible with pre-ID browser
+    rows by matching time and label. Do not collapse different tag IDs with
+    coincident start/end times. Never alter the underlying saved tag ledger.
     """
-    valid_tag_times = set()
+    valid_times = set()
+    valid_ids = set()
     for tag in tag_intervals or []:
         if not isinstance(tag, dict):
             continue
         ident = _normalized_time_identity(tag.get("start"), tag.get("end"))
-        if ident is not None:
-            valid_tag_times.add(ident)
+        if ident is None:
+            continue
+        valid_times.add(ident)
+        tag_id = str(tag.get("tag_id") or "").strip()
+        if tag_id:
+            valid_ids.add((tag_id, ident))
 
-    if not valid_tag_times:
+    if not valid_times:
         return []
 
     filtered: list[dict] = []
     seen = set()
-
     for row in hit_rows or []:
         if not isinstance(row, dict):
             continue
-
         ident = _normalized_time_identity(row.get("tag_start"), row.get("tag_end"))
-        if ident not in valid_tag_times:
+        if ident not in valid_times:
             continue
-
+        row_id = str(row.get("tag_id") or "").strip()
+        # A stale row with an ID that no longer exists must not be revived by
+        # having the same boundaries as another tag. For older rows without
+        # a saved ID, continue to use their original label/time identity.
+        if row_id and valid_ids and (row_id, ident) not in valid_ids:
+            # Older versions could synthesize IDs from source/label/bounds;
+            # preserve those only if a legacy tag without ID remains.
+            if not any(not str(t.get("tag_id") or "").strip() and
+                       _normalized_time_identity(t.get("start"), t.get("end")) == ident
+                       for t in tag_intervals if isinstance(t, dict)):
+                continue
         row_key = (
-            str(row.get("well", "")),
-            str(row.get("section", "")),
-            str(row.get("tag_label", "")),
-            ident[0],
-            ident[1],
+            str(row.get("well", "")), str(row.get("section", "")),
+            f"id:{row_id}" if row_id else f"legacy:{row.get('tag_label','')}:{ident}",
         )
-        if row_key in seen:
-            continue
-        seen.add(row_key)
-        filtered.append(row)
-
+        if row_key not in seen:
+            seen.add(row_key)
+            filtered.append(row)
     filtered.sort(key=lambda r: str(r.get("tag_start", "")))
     return filtered
 
@@ -5136,11 +5144,13 @@ def _render_dashboard_session_download_with_browser_tags(
                 const seen = new Set();
                 rows.forEach(function(row) {{
                     if (!row || typeof row !== "object") return;
+                    const tagId = String(row.tag_id || "").trim();
                     const ident = [
                         row.well || "",
                         row.section || "",
-                        row.tag_start || "",
-                        row.tag_end || ""
+                        tagId ? ("id:" + tagId) :
+                            ("legacy:" + String(row.tag_label || "") + "|" +
+                             String(row.tag_start || "") + "|" + String(row.tag_end || ""))
                     ].join("|");
                     if (seen.has(ident)) return;
                     seen.add(ident);
@@ -5190,11 +5200,26 @@ def _render_dashboard_session_download_with_browser_tags(
                 // Save hit-result rows only for the actual tags that will be saved
                 // in this JSON: both manual sidebar tags and browser-drawn tags.
                 const validTagTimes = new Set();
+                const validTagIds = new Map();
                 allSavedTags.forEach(function(tag) {{
                     if (!tag || typeof tag !== "object") return;
                     const s = String(tag.start || "").replace("T", " ").slice(0, 19);
                     const e = String(tag.end || "").replace("T", " ").slice(0, 19);
-                    if (s && e && s !== e) validTagTimes.add(s + "|" + e);
+                    if (!s || !e || s === e) return;
+                    const times = s + "|" + e;
+                    validTagTimes.add(times);
+                    const tagId = String(tag.tag_id || "").trim();
+                    if (tagId) validTagIds.set(tagId, times);
+                    // React uses a source/label/time identity for very old or
+                    // manual tags without a durable ID. Browser save may
+                    // synthesize a new tag_id, so accept the original React
+                    // identity as well while still checking its exact times.
+                    const source = String(tag.source || "manual").toLowerCase();
+                    if (source === "chart_drag") {{
+                        validTagIds.set("chart_drag|" + s + "|" + e, times);
+                    }} else {{
+                        validTagIds.set(source + "|" + String(tag.label || "") + "|" + s + "|" + e, times);
+                    }}
                 }});
 
                 const hitOut = [];
@@ -5203,13 +5228,17 @@ def _render_dashboard_session_download_with_browser_tags(
                     if (!row || typeof row !== "object") return;
                     const tagStart = String(row.tag_start || "").replace("T", " ").slice(0, 19);
                     const tagEnd = String(row.tag_end || "").replace("T", " ").slice(0, 19);
-                    if (!tagStart || !tagEnd || !validTagTimes.has(tagStart + "|" + tagEnd)) return;
-
+                    const times = tagStart + "|" + tagEnd;
+                    if (!tagStart || !tagEnd || !validTagTimes.has(times)) return;
+                    const tagId = String(row.tag_id || "").trim();
+                    // ID-bearing rows must correspond to an active saved tag,
+                    // not merely share timestamps with a different/stale tag.
+                    if (tagId && validTagIds.get(tagId) !== times) return;
                     const ident = [
                         row.well || "",
                         row.section || "",
-                        tagStart,
-                        tagEnd
+                        tagId ? ("id:" + tagId) :
+                            ("legacy:" + String(row.tag_label || "") + "|" + times)
                     ].join("|");
                     if (hitSeen.has(ident)) return;
                     hitSeen.add(ident);
