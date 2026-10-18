@@ -702,6 +702,40 @@ function App(props) {
   const args = props.args || {};
   const plotRef = useRef(null);
   const rootRef = useRef(null);
+
+  // Keep the Streamlit iframe synchronized with the complete viewer height,
+  // including dynamic tagging results, toolbar wrapping, and track footers.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+
+    let rafId = null;
+    let lastHeight = -1;
+
+    const scheduleFrameHeight = () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        // CSS display:flow-root contains the final child's bottom margin.
+        const nextHeight = Math.max(1, Math.ceil(root.getBoundingClientRect().height));
+        if (nextHeight !== lastHeight) {
+          lastHeight = nextHeight;
+          Streamlit.setFrameHeight(nextHeight);
+        }
+      });
+    };
+
+    const observer = new ResizeObserver(scheduleFrameHeight);
+    observer.observe(root);
+    window.addEventListener("resize", scheduleFrameHeight);
+    scheduleFrameHeight();
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", scheduleFrameHeight);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, []);
   const wrapRef = useRef(null);
   const hoverLineRef = useRef(null);
   const hoverBoxRef = useRef(null);
@@ -1702,7 +1736,6 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
       .then(() => {
         if (cancelled) return;
 
-        Streamlit.setFrameHeight(height + 270);
         updateCaptureLayer();
 
         try {
@@ -1806,7 +1839,6 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
               ${htmlEscape(err?.message || String(err))}
             </div>
           `;
-          Streamlit.setFrameHeight(260);
         }
       });
 

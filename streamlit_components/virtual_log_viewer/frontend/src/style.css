@@ -1,5 +1,5 @@
 body { margin: 0; font-family: Arial, sans-serif; }
-.vlv-root { width: 100%; outline: none; }
+.vlv-root { display: flow-root; width: 100%; outline: none; }
 .vlv-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; background:#f7f7f7; border:1px solid #d0d0d0; padding:6px 8px; }
 .vlv-toolbar button { padding: 6px 10px; border:1px solid #999; background:white; cursor:pointer; font-size:13px; }
 .vlv-toolbar button.active { background:#f3e8ff; border-color:#7e22ce; font-weight:700; }
