@@ -11,6 +11,7 @@ from data_access.data_loader import load_sections_for_columns
 from services.data_cleaning import apply_cleaning_layer
 from drillmate_validation.events import ValidationError, evaluate_events, RULE_VERSION
 from drillmate_validation.activities import evaluate_activities
+from drillmate_validation.smoke_test import run_builtin_validation_selftest
 from drillmate_validation.dashboard_adapter import (
     session_expert_tags, reviewed_windows, binary_activity_timelines,
 )
@@ -34,6 +35,16 @@ def render_final_validation_panel(*, well, sections, agent_source, activity_ui, 
     """
     with st.sidebar.expander('Final validation — independent (opt-in)', expanded=False):
         st.caption('This is NOT the live Hit/Miss table. No existing tags, settings or exports are changed.')
+        # Read-only backend smoke test. Does not require a well, session or agent selection.
+        # The result NEVER represents real-well validation.
+        if st.button('Run built-in engine self-test (synthetic data)', key='online_engine_selftest'):
+            try:
+                example_result = run_builtin_validation_selftest()
+                st.success('Both production validation engines calculated the expected synthetic results.')
+                st.json(example_result)
+            except Exception as exc:
+                st.error('Online validation-engine self-test failed. No real-well result was calculated.')
+                st.exception(exc)
         kind = 'symptom' if agent_source == 'Symptom agent' else 'activity' if agent_source == 'Activity agent' else None
         agent = (symptom_ui.get('selected_symptom') if kind == 'symptom'
                  else activity_ui.get('selected_activity') if kind == 'activity' else '')
