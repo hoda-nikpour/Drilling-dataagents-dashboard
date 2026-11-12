@@ -3,13 +3,30 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import Plotly from "plotly.js-dist-min";
 import {Streamlit, withStreamlitConnection} from "streamlit-component-lib";
+import AgentIntervalTable from "./AgentIntervalTable";
+import DraftRecovery from "./DraftRecovery";
+import {storeBrowserDraft} from "./browserDraft.mjs";
+import {nextInteractionOrder} from "./interactionOrder.mjs";
+import {downloadText} from "./download.mjs";
+import {normalizeValues as normalize, buildHoverIndex, closestHoverPoint, boundedTagTimes} from "./plotData.mjs";
+import {laneHeaderLayout} from "./laneHeaders.mjs";
 import "./style.css";
 
 const HOUR_MS = 3600 * 1000;
 const MIN_VIEWPORT_SPAN_MS = 30 * 1000;
+let laneHeaderCanvas;
+function measuredLaneHeaders(width) {
+  laneHeaderCanvas ||= document.createElement("canvas").getContext("2d");
+  return laneHeaderLayout(width,(text,size)=>{
+    if (!laneHeaderCanvas) return text.length*size*.65;
+    laneHeaderCanvas.font=`bold ${size}px Arial`;
+    return laneHeaderCanvas.measureText(text).width;
+  });
+}
 
 
 function toMs(value) {
+  if (value === null || value === undefined || value === "") return null;
   const d = new Date(value);
   const t = d.getTime();
   return Number.isFinite(t) ? t : null;
@@ -27,6 +44,7 @@ function fmtTime(ms) {
 }
 
 function snapToSecondMs(ms) {
+  if (ms === null || ms === undefined) return null;
   const n = Number(ms);
   if (!Number.isFinite(n)) return null;
   return Math.round(n / 1000) * 1000;
@@ -57,29 +75,6 @@ function safeDownloadName(value, fallback = "data agent") {
     .trim();
 
   return text || fallback;
-}
-
-function normalize(values, limitMin = null, limitMax = null) {
-  const nums = values.filter((v) => Number.isFinite(Number(v))).map(Number);
-
-  let mn = Number(limitMin);
-  let mx = Number(limitMax);
-
-  if (!Number.isFinite(mn) || !Number.isFinite(mx)) {
-    if (!nums.length) return values.map(() => null);
-    mn = Math.min(...nums);
-    mx = Math.max(...nums);
-  }
-
-  if (Math.abs(mx - mn) < 1e-12) {
-    return values.map((v) => (v == null || !Number.isFinite(Number(v)) ? null : 0.5));
-  }
-
-  return values.map((v) => {
-    if (v == null || !Number.isFinite(Number(v))) return null;
-    const clipped = clamp(Number(v), mn, mx);
-    return (clipped - mn) / (mx - mn);
-  });
 }
 
 function formatLimitValue(value) {
@@ -304,6 +299,7 @@ function chartTagsForServer(items) {
         created_at: tag.created_at || ledgerId,
         updated_at: tag.updated_at || new Date().toISOString(),
         revision: Number(tag.revision || 1),
+        edit_revision: Number(tag.edit_revision || tag.revision || 1),
       };
     });
 }
@@ -588,6 +584,12 @@ function buildCurveTraces(trackData, markerDisplay = "Lines only") {
       const color = colors[curveIdx % colors.length];
       const xNorm = normalize(curve.x || [], curve.display_min, curve.display_max);
       const yValues = curve.y || [];
+      const breaks = new Set(trackData?.gap_after_indices || []);
+      const lineX = [], lineY = [], lineRaw = [];
+      xNorm.forEach((value, i) => {
+        lineX.push(value); lineY.push(yValues[i]); lineRaw.push((curve.x || [])[i]);
+        if (breaks.has(i)) { lineX.push(null); lineY.push(null); lineRaw.push(null); }
+      });
       const showMarkers = markerDisplay === "Small dots" || markerDisplay === "Larger dots";
       const markerSize = markerDisplay === "Larger dots" ? 4 : 2;
 
@@ -596,20 +598,20 @@ function buildCurveTraces(trackData, markerDisplay = "Lines only") {
       traces.push({
         type: "scattergl",
         mode: "lines",
-        x: xNorm,
-        y: yValues,
+        x: lineX,
+        y: lineY,
         xaxis: axis.xaxis,
         yaxis: axis.yaxis,
         line: {width: 1.5, color, simplify: false},
-        connectgaps: true,
+        connectgaps: false,
         name: `${curve.label}`,
         hoverinfo: "none",
         meta: {
           label: curve.label || curve.raw_col || "Value",
           unit: curve.unit || "",
-          raw_values: curve.x || [],
+          raw_values: lineRaw,
         },
-        customdata: (curve.x || []).map((v) => [v]),
+        customdata: lineRaw.map((v) => [v]),
         showlegend: false,
       });
 
@@ -629,7 +631,7 @@ function buildCurveTraces(trackData, markerDisplay = "Lines only") {
             color,
             line: {width: 0},
           },
-          connectgaps: true,
+          connectgaps: false,
           name: `${curve.label} dots`,
           hoverinfo: "none",
           meta: {
@@ -672,6 +674,13 @@ function buildGridKeepaliveTraces(rangeStartMs, rangeEndMs) {
       name: `Track ${trackNo} grid`,
     };
   });
+}
+
+function agentNavigationViewStart(request, spanMs) {
+  const target = toMs(request?.start);
+  if (target == null) return null;
+  const fraction = Number(request?.lead_in_fraction || 0);
+  return target - spanMs * (Number.isFinite(fraction) ? clamp(fraction, 0, 1) : 0);
 }
 
 function normalizeAgentIntervals(agentIntervals, selectedAgentName = "") {
@@ -765,6 +774,10 @@ function App(props) {
   // flushed with requestAnimationFrame. This avoids a React/Plotly rerender loop
   // while the user is scrolling or resizing a tag.
   const initialPlotRangeRef = useRef(null);
+  const appliedNavigationRef = useRef(null);
+  const appliedNavigationOrderRef = useRef(0);
+  const pendingNavigationRef = useRef(null);
+  const [pendingNavigation, setPendingNavigation] = useState(null);
   const viewportStartRef = useRef(null);
   const wheelDeltaRef = useRef(0);
   const wheelRafRef = useRef(null);
@@ -796,6 +809,8 @@ function App(props) {
   const sectionEndMs = toMs(args.section_end);
   const bufferStartMs = toMs(args.buffer_start || args.track_data?.time_start);
   const bufferEndMs = toMs(args.buffer_end || args.track_data?.time_end);
+  const activeBufferRef = useRef(null);
+  activeBufferRef.current = {start:bufferStartMs,end:bufferEndMs};
   const initialViewportStartMs = toMs(args.viewport_start) || bufferStartMs || sectionStartMs;
   if (initialPlotRangeRef.current == null) initialPlotRangeRef.current = initialViewportStartMs;
   if (viewportStartRef.current == null) viewportStartRef.current = initialViewportStartMs;
@@ -808,25 +823,25 @@ function App(props) {
   const [zoomHistoryCount, setZoomHistoryCount] = useState(0);
   const [redoTags, setRedoTags] = useState([]);
   const [tags, setTags] = useState(() =>
-    mergeManualAndChartTags(
+    restoreSavedDashboard ? dedupeTags(args.saved_tags || []) : mergeManualAndChartTags(
       Array.isArray(args.saved_tags) ? args.saved_tags : [],
       loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard),
       !restoreSavedDashboard,
       deletedChartTagIdsRef.current,
     ),
   );
+  const tagsRef = useRef(tags);
+  tagsRef.current = tags;
+  const snapshotSequenceRef = useRef(0);
+  const snapshotProviderRef = useRef(null);
+  const draftEditedRef = useRef(false);
+  const draftStateRef = useRef(null);
+  const [snapshotError, setSnapshotError] = useState("");
   const [selectedTagId, setSelectedTagId] = useState(null);
   const [hitRows, setHitRows] = useState(Array.isArray(args.saved_hit_results) ? args.saved_hit_results : []);
 
   const [autosaveStatus, setAutosaveStatus] = useState(() => ({
-    count: chartTagsForServer(
-      mergeManualAndChartTags(
-        Array.isArray(args.saved_tags) ? args.saved_tags : [],
-        loadStoredChartTags(args.context_key, browserSessionToken, restoreSavedDashboard),
-        !restoreSavedDashboard,
-        deletedChartTagIdsRef.current,
-      ),
-    ).length,
+    count: chartTagsForServer(tags).length,
     savedAt: null,
     pending: false,
     reason: "loaded",
@@ -838,6 +853,10 @@ function App(props) {
   
   
   const [startDateTimeValue, setStartDateTimeValue] = useState(() => fmtDateTimeLocal(initialViewportStartMs));
+  useEffect(() => {
+    if (viewportStartMs != null) setStartDateTimeValue(fmtDateTimeLocal(viewportStartMs));
+  }, [viewportStartMs]);
+  const hoverIndex = useMemo(() => buildHoverIndex(args.track_data,toMs),[args.track_data]);
   useEffect(() => {
     // Give the component keyboard focus on first render so T/Z work without
     // needing the first mouse click on the Tagging button.
@@ -883,6 +902,7 @@ function App(props) {
     const bufferChanged = bufferKeyRef.current !== currentBufferKey;
 
     if (contextChanged) {
+      clearPendingNavigation();
       const newStart = toMs(args.viewport_start) || bufferStartMs || sectionStartMs;
       restoredDashboardHydratedRef.current = false;
       if (!restoreSavedDashboard) {
@@ -904,10 +924,23 @@ function App(props) {
 
     if (bufferChanged) {
       bufferKeyRef.current = currentBufferKey;
-      const current = viewportStartRef.current ?? toMs(args.viewport_start) ?? bufferStartMs ?? sectionStartMs;
+      const request = args.navigation_request;
+      const staleCommand = Number(request?.order || 0) < appliedNavigationOrderRef.current;
+      const explicitStart = request?.id && !staleCommand ? agentNavigationViewStart(request, getActiveSpanMs()) : null;
+      const current = explicitStart ?? viewportStartRef.current ?? toMs(args.viewport_start) ?? bufferStartMs ?? sectionStartMs;
       const clamped = clampViewport(current, viewportSpanRef.current);
       viewportStartRef.current = clamped;
       setViewportStartMs(clamped);
+      const end = Math.min(clamped+getActiveSpanMs(),sectionEndMs ?? Infinity);
+      if (clamped < bufferStartMs || end > bufferEndMs) {
+        // A delayed buffer may belong to a superseded command. Keep the
+        // current time selection and wait for its data instead of drawing a
+        // blank/mismatched range while the accepted request finishes.
+        const pending = {id:"buffer-"+currentBufferKey+"-"+clamped,start:clamped,end};
+        pendingNavigationRef.current = pending;
+        setPendingNavigation(pending);
+      }
+      if (explicitStart != null) setStartDateTimeValue(fmtDateTimeLocal(clamped));
       requestLockRef.current = false;
     }
   }, [args.context_key, args.viewport_start, bufferStartMs, bufferEndMs, sectionStartMs, clampViewport, browserSessionToken, restoreSavedDashboard, propViewportSpanMs]);
@@ -948,7 +981,7 @@ useEffect(() => {
     const serverChartTags = incomingServer.filter(isChartTag);
 
     const chartMergeOrder = preferUploadedSavedTagsNow
-      ? [...serverChartTags, ...storedChartTags, ...localChartTags]
+      ? [...serverChartTags]
       : [...localChartTags, ...storedChartTags, ...serverChartTags];
 
     const merged = dedupeTags([
@@ -992,7 +1025,7 @@ useEffect(() => {
       const trackNo = Math.max(1, Math.min(4, Number(track.track || 1)));
       rows[trackNo - 1] = (track.curves || []).map(curveLimitsText).filter(Boolean);
     });
-    if (!rows[3].length) rows[3] = ["Tagger | Overlap | Agent"];
+    if (!rows[3].length) rows[3] = ["Expert tags | Overlap | Agent detections"];
     return rows;
   }, [JSON.stringify(args.track_data?.tracks || [])]);
 
@@ -1006,6 +1039,42 @@ useEffect(() => {
   function getActiveSpanMs() {
     const rawSpan = Number(viewportSpanRef.current ?? visibleMs);
     return clamp(Number.isFinite(rawSpan) ? rawSpan : visibleMs, MIN_VIEWPORT_SPAN_MS, visibleMs);
+  }
+
+  function clearPendingNavigation() {
+    pendingNavigationRef.current = null;
+    setPendingNavigation(null);
+  }
+
+  function cancelTagGesture() {
+    dragRef.current = {active:false};
+    resizeRef.current = {active:false};
+    hideSelectBox();
+  }
+
+  function hideHover() {
+    if (hoverLineRef.current) hoverLineRef.current.style.display = "none";
+    if (hoverBoxRef.current) hoverBoxRef.current.style.display = "none";
+  }
+
+  function ensureVisibleBuffer(start,span,source) {
+    const end = Math.min(start+span,sectionEndMs ?? start+span);
+    const buffer = activeBufferRef.current;
+    const order = nextInteractionOrder(args.latest_viewport_order);
+    // Undo/Reset is a new manual choice even if its data is already loaded.
+    // Its order must supersede any earlier table command and late buffer.
+    appliedNavigationOrderRef.current = Math.max(appliedNavigationOrderRef.current,order);
+    const covered = buffer?.start != null && buffer.end != null && start >= buffer.start && end <= buffer.end;
+    if (!covered) {
+      const pending = {id:"view-"+order,start,end};
+      pendingNavigationRef.current = pending;
+      setPendingNavigation(pending);
+    }
+    Streamlit.setComponentValue({
+      browser_session_token:browserSessionToken,event:"viewport_request",source,
+      request_order:order,
+      viewport_start:fmtTime(start),viewport_end:fmtTime(end),viewport_span_seconds:span/1000,
+    });
   }
 
   function syncViewportFromYRange(range0, range1) {
@@ -1073,7 +1142,7 @@ useEffect(() => {
 
       try {
         programmaticRelayoutRef.current = true;
-        Promise.resolve(Plotly.relayout(gd, update))
+        return Promise.resolve(Plotly.relayout(gd, update))
           .catch((err) => console.error("Virtual log viewer viewport relayout error:", err))
           .finally(() => {
             setTimeout(() => {
@@ -1122,8 +1191,10 @@ useEffect(() => {
       requestLockRef.current = true;
 
       Streamlit.setComponentValue({
+        browser_session_token: browserSessionToken,
         event: "viewport_request",
         source: "arrow_scroll",
+        request_order: nextInteractionOrder(args.latest_viewport_order),
         viewport_start: fmtTime(roundedStartMs),
         viewport_end: fmtTime(roundedStartMs + activeVisibleMs),
         viewport_span_seconds: roundedSpanSeconds,
@@ -1133,7 +1204,7 @@ useEffect(() => {
         requestLockRef.current = false;
       }, 2500);
     },
-    [bufferStartMs, bufferEndMs, visibleMs, marginHours, sectionStartMs, sectionEndMs],
+    [bufferStartMs, bufferEndMs, visibleMs, marginHours, sectionStartMs, sectionEndMs, browserSessionToken],
   );
 
   const traces = useMemo(() => {
@@ -1148,15 +1219,18 @@ useEffect(() => {
       agents.forEach((a) => {
         base.push({
           type: "scattergl",
-          mode: "lines",
-          x: Array(20).fill(0.76),
-          y: Array.from({length: 20}, (_, i) => fmtTime(a.startMs + ((a.endMs - a.startMs) * i) / 19)),
+          // Endpoint markers keep single-sample and sub-pixel events visible
+          // at any time scale without inventing extra event duration.
+          mode: "lines+markers",
+          x: [0.76, 0.76],
+          y: [a.start, a.end],
           xaxis: "x4",
           yaxis: "y4",
           line: {color: "rgba(120,0,0,.98)", width: 9},
+          marker: {color: "rgba(120,0,0,.98)", size: 9, symbol: "circle"},
           showlegend: false,
           hoverinfo: "none",
-          meta: {source: "agent", label: a.label},
+          meta: {source: "agent", label: a.label, severity: a.severity},
           name: a.label,
         });
       });
@@ -1212,34 +1286,112 @@ useEffect(() => {
     visibleMs,
   ]);
 
+  useEffect(() => {
+    const request = args.navigation_request;
+    if (!request?.id || appliedNavigationRef.current === request.id) return;
+    const order = Number(request.order || 0);
+    if (order < appliedNavigationOrderRef.current) return;
+    const span = getActiveSpanMs();
+    const requestedMs = agentNavigationViewStart(request, span);
+    if (requestedMs == null) return;
+
+    appliedNavigationRef.current = request.id;
+    appliedNavigationOrderRef.current = order;
+    // Use the browser's current zoom span, which can be newer than Python's
+    // last loaded buffer. Ordinary reruns must never replay this command.
+    const start = clampViewport(requestedMs, span);
+    const end = Math.min(start + span, sectionEndMs || start + span);
+    const waiting = bufferStartMs == null || bufferEndMs == null || start < bufferStartMs || end > bufferEndMs;
+    const pending = waiting ? {id: request.id, start, end} : null;
+    pendingNavigationRef.current = pending;
+    setPendingNavigation(pending);
+    viewportStartRef.current = start;
+    viewportSpanRef.current = span;
+    suppressNextBufferRequestRef.current = true;
+    setSelectedTagId(null);
+    cancelTagGesture();
+    hideSelectBox();
+    if (hoverLineRef.current) hoverLineRef.current.style.display = "none";
+    if (hoverBoxRef.current) hoverBoxRef.current.style.display = "none";
+    setViewportStartMs(start);
+    setStartDateTimeValue(fmtDateTimeLocal(start));
+    setPlotViewport(start);
+    rootRef.current?.focus?.({preventScroll: true});
+    try {
+      window.frameElement?.scrollIntoView({behavior: "smooth", block: "start"});
+    } catch (err) {
+      // Time navigation still works if an embedding host prevents page access.
+    }
+
+    Streamlit.setComponentValue({
+      browser_session_token: browserSessionToken,
+      event: "viewport_request",
+      source: "agent_interval",
+      request_order: nextInteractionOrder(args.latest_viewport_order),
+      navigation_id: request.id,
+      viewport_start: fmtTime(start),
+      viewport_end: fmtTime(end),
+      viewport_span_seconds: span / 1000,
+    });
+  }, [args.navigation_request?.id, args.navigation_request?.start, browserSessionToken, clampViewport, setPlotViewport]);
+
+  function showTwelveHourWindow(requestedMs, source) {
+    stopArrowScroll();
+    clearPendingNavigation();
+    cancelTagGesture();
+    setSelectedTagId(null);
+
+    const clampedStart = clampViewport(requestedMs, visibleMs);
+    const clampedEnd = Math.min(clampedStart + visibleMs, sectionEndMs || clampedStart + visibleMs);
+    const order = nextInteractionOrder(args.latest_viewport_order);
+    // Manual time navigation also supersedes any older in-flight table command.
+    appliedNavigationOrderRef.current = Math.max(appliedNavigationOrderRef.current, order);
+    const buffer = activeBufferRef.current;
+    const covered = buffer?.start != null && buffer.end != null
+      && clampedStart >= buffer.start && clampedEnd <= buffer.end;
+    if (!covered) {
+      const pending = {id:"time-window-"+order,start:clampedStart,end:clampedEnd};
+      pendingNavigationRef.current = pending;
+      setPendingNavigation(pending);
+    }
+
+    suppressNextBufferRequestRef.current = true;
+    viewportSpanRef.current = visibleMs;
+    viewportStartRef.current = clampedStart;
+    setViewportSpanMs(visibleMs);
+    setViewportStartMs(clampedStart);
+    setStartDateTimeValue(fmtDateTimeLocal(clampedStart));
+    setPlotViewport(clampedStart);
+
+    // Send even when covered, so a late reply cannot undo this choice and a
+    // subsequent rerun/export uses the same viewport on both sides.
+    Streamlit.setComponentValue({
+      browser_session_token:browserSessionToken,event:"viewport_request",source,
+      request_order:order,viewport_start:fmtTime(clampedStart),viewport_end:fmtTime(clampedEnd),
+      viewport_span_seconds:visibleMs/1000,
+    });
+  }
+
   function applyPreferredStartDateTime() {
     const requestedMs = dateTimeLocalToMs(startDateTimeValue);
     if (requestedMs == null) {
       alert("Please enter a valid date/time.");
       return;
     }
+    showTwelveHourWindow(requestedMs,"set_datetime");
+  }
 
-    const clampedStart = clampViewport(requestedMs, visibleMs);
-    const clampedEnd = Math.min(clampedStart + visibleMs, sectionEndMs || clampedStart + visibleMs);
+  function adjacentTimeWindowStart(direction, base = viewportStartRef.current) {
+    if (base == null) return null;
+    const next = clampViewport(base+direction*visibleMs,visibleMs);
+    // With a narrow zoom near section end, clamping a full window could move
+    // backwards. Next must only move forwards, and Previous only backwards.
+    return direction*(next-base) > 1 ? next : null;
+  }
 
-    viewportSpanRef.current = visibleMs;
-    viewportStartRef.current = clampedStart;
-    setViewportSpanMs(visibleMs);
-    setViewportStartMs(clampedStart);
-    setStartDateTimeValue(fmtDateTimeLocal(clampedStart));
-
-    if (bufferStartMs != null && bufferEndMs != null && clampedStart >= bufferStartMs && clampedEnd <= bufferEndMs) {
-      setPlotViewport(clampedStart);
-      return;
-    }
-
-    Streamlit.setComponentValue({
-      event: "viewport_request",
-      source: "set_datetime",
-      viewport_start: fmtTime(clampedStart),
-      viewport_end: fmtTime(clampedEnd),
-      viewport_span_seconds: 12 * 3600,
-    });
+  function showAdjacentTimeWindow(direction) {
+    const next = adjacentTimeWindowStart(direction);
+    if (next != null) showTwelveHourWindow(next,"time_page");
   }
   
   
@@ -1281,6 +1433,10 @@ useEffect(() => {
       const overlaps = bestOverlapsForTag(tag);
       const best = overlaps[0] || null;
       const percent = best ? best.percent : 0;
+      const start = toMs(tag.start), end = toMs(tag.end);
+      const coverage = Array.isArray(args.agent_coverage) ? args.agent_coverage :
+        [{start: args.buffer_start, end: args.buffer_end}];
+      const evaluable = coverage.some((part) => start >= toMs(part.start) && end <= toMs(part.end));
       return {
         symptom: defaultSymptom,
         data_agent: defaultSymptom,
@@ -1293,40 +1449,98 @@ useEffect(() => {
         tag_end: tag.end || "",
         agent_start: best ? best.agent.start : "",
         agent_end: best ? best.agent.end : "",
-        result: best ? "Hit" : "Miss",
-        percent_value: percent,
-        percent: `${percent.toFixed(1)}% hit`,
+        result: evaluable ? (best ? "Hit" : "Miss") : "Not evaluable",
+        percent_value: evaluable ? percent : null,
+        percent: evaluable ? `${percent.toFixed(1)}% hit` : "N/A",
+        agent_source: String(args.agent_source || ""),
+        prediction_revision: args.prediction_revision || "",
+        buffer_start: args.buffer_start || "",
+        buffer_end: args.buffer_end || "",
+        prediction_coverage: coverage,
       };
     });
   }
 
+  function buildSnapshot(currentTags, rows) {
+    return {
+      schema_version: 1, context_key: String(args.context_key || ""),
+      browser_session_token: browserSessionToken, sequence: ++snapshotSequenceRef.current,
+      tags: dedupeTags(currentTags), hit_results: rows,
+      deleted_tag_ids: [...deletedChartTagIdsRef.current],
+      selected_agent: selectedDataAgentName, agent_source: String(args.agent_source || ""),
+      selected_well: args.selected_well || "", selected_sections: args.selected_sections || [],
+      agent_intervals: args.agent_intervals || [], prediction_coverage: args.agent_coverage || [],
+      live_gap_policy: args.live_gap_policy || "",
+      prediction_revision: args.prediction_revision || "",
+      buffer_start: args.buffer_start, buffer_end: args.buffer_end,
+      viewport_start: fmtTime(viewportStartRef.current),
+      viewport_span_seconds: viewportSpanRef.current / 1000,
+      saved_at: new Date().toISOString(),
+      marker_display: markerDisplay,
+      tag_mode: tagModeRef.current,
+      session_base: args.session_base || {
+        dashboard_context: {
+          selected_well:args.selected_well,selected_sections:args.selected_sections,
+          context_key:args.context_key,selected_agent_name:selectedDataAgentName,
+          selected_agent_choice:(args.agent_source === "Activity agent" ? "activity::" : "symptom::")+selectedDataAgentName,
+        },
+        dashboard_state:{widget_state:{}},
+        plot_track_param_labels:(args.track_data?.tracks || []).map(track => (track.curves || []).map(curve => curve.label)),
+      },
+    };
+  }
+
+  // The save button can obtain the current in-memory state even if browser
+  // storage is full. A live provider belongs to exactly one context/editor.
+  snapshotProviderRef.current = () => buildSnapshot(tagsRef.current,normalizeRowsForServer(buildHitRows(tagsRef.current)));
+  useEffect(() => {
+    const host = window.parent;
+    const key = String(args.context_key || "")+"_"+browserSessionToken;
+    const provider = () => snapshotProviderRef.current();
+    try {
+      host.__drillmateSnapshotProviders ||= {};
+      host.__drillmateSnapshotProviders[key] = provider;
+    } catch (_) { return; }
+    return () => {
+      if (host.__drillmateSnapshotProviders?.[key] === provider) delete host.__drillmateSnapshotProviders[key];
+    };
+  },[args.context_key,browserSessionToken]);
+
+  function persistSnapshot(currentTags, rows) {
+    const snapshot = buildSnapshot(currentTags,rows);
+    const draftState = stableJson([snapshot.tags,snapshot.viewport_start,snapshot.viewport_span_seconds,
+      snapshot.marker_display,snapshot.tag_mode,snapshot.session_base]);
+    if (draftStateRef.current !== null && draftStateRef.current !== draftState) draftEditedRef.current = true;
+    draftStateRef.current = draftState;
+    try {
+      window.localStorage.setItem(`hoda_dashboard_snapshot_${args.context_key}_${browserSessionToken}`, JSON.stringify(snapshot));
+      if (draftEditedRef.current) storeBrowserDraft(snapshot);
+      setSnapshotError("");
+    } catch (error) {
+      // Invalidate the old envelope: a failed save must never export stale tags.
+      try { window.localStorage.removeItem(`hoda_dashboard_snapshot_${args.context_key}_${browserSessionToken}`); } catch (_) {}
+      setSnapshotError("Browser draft storage is full or disabled. Use Save Dashboard Session to download your current work.");
+    }
+  }
+
+  const currentRows = useMemo(() => normalizeRowsForServer(buildHitRows(tags)), [
+    JSON.stringify(tags), agents, selectedDataAgentName, args.agent_source,
+    args.context_key, args.selected_well, JSON.stringify(args.selected_sections),
+    args.buffer_start, args.buffer_end, JSON.stringify(args.agent_coverage), args.prediction_revision,
+  ]);
+
   useEffect(() => {
     const cleanTags = dedupeTags(tags);
-    const cleanTagsJson = stableJson(cleanTags);
-
-    if (cleanTagsJson !== stableJson(tags)) {
-      suppressStateUpdateRef.current = true;
-      setTags(cleanTags);
-      return;
-    }
-
-    // Hit rows must be the current projection of the current tags only.
-    // Merging old rows here keeps previous resize positions forever, which made
-    // stretched/compressed tags look as if the dashboard had refused the edit.
-    const rows = normalizeRowsForServer(buildHitRows(cleanTags));
-    setHitRows((old) => (stableJson(normalizeRowsForServer(old)) === stableJson(rows) ? old : rows));
-    // Let the sidebar Save Dashboard Session button capture exactly the rows
-    // currently shown in the React Hit results table, including both manual
-    // sidebar tags and browser-drawn tags.
-    saveStoredHitRows(args.context_key, browserSessionToken, rows);
-
+    setHitRows(currentRows);
+    saveStoredHitRows(args.context_key, browserSessionToken, currentRows);
     saveStoredChartTags(args.context_key, browserSessionToken, cleanTags.filter(isChartTag));
     saveStoredAllTags(args.context_key, browserSessionToken, cleanTags);
+    persistSnapshot(cleanTags, currentRows);
     suppressStateUpdateRef.current = false;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(tags), args.context_key, browserSessionToken]);
+  }, [JSON.stringify(tags), currentRows, args.context_key, browserSessionToken, viewportStartMs, viewportSpanMs, markerDisplay, tagMode, args.session_base]);
 
 function autosaveTagLedger(nextTags, reason = "edit", deletedTagIds = []) {
+  draftEditedRef.current = true;
   const cleanDeletedIds = (Array.isArray(deletedTagIds) ? deletedTagIds : [])
     .map((x) => String(x || "").trim())
     .filter(Boolean);
@@ -1345,15 +1559,20 @@ function autosaveTagLedger(nextTags, reason = "edit", deletedTagIds = []) {
     deletedChartTagIdsRef.current,
   );
 
+  tagsRef.current = cleanTags;
+  setTags(cleanTags);
   const outgoingChartTags = chartTagsForServer(cleanTags);
   const rows = normalizeRowsForServer(buildHitRows(cleanTags));
+  persistSnapshot(cleanTags, rows);
 
   saveStoredChartTags(args.context_key, browserSessionToken, outgoingChartTags);
   saveStoredAllTags(args.context_key, browserSessionToken, cleanTags);
   saveStoredHitRows(args.context_key, browserSessionToken, rows);
 
   const payload = {
+    browser_session_token: browserSessionToken,
     event: "tag_autosave",
+    event_order: nextInteractionOrder(),
     reason,
     tag_mode: tagModeRef.current,
     tags: outgoingChartTags,
@@ -1378,7 +1597,7 @@ function autosaveTagLedger(nextTags, reason = "edit", deletedTagIds = []) {
 }
 
 function sendCurrentStateToStreamlit(reason = "manual_save") {
-  autosaveTagLedger(tags, reason, []);
+  autosaveTagLedger(tagsRef.current, reason, []);
 }
 
 
@@ -1453,10 +1672,13 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
     layer.style.top = `${size.t}px`;
     layer.style.width = `${size.w}px`;
     layer.style.height = `${size.h}px`;
+    const rail = wrapRef.current?.querySelector(".vlv-scroll-rail");
+    if (rail) rail.style.top = `${size.t+3}px`;
   }
 
   function applyTagMode(active) {
     const gd = plotRef.current;
+    hideHover();
     tagModeRef.current = Boolean(active);
     updateCaptureLayer();
 
@@ -1541,6 +1763,10 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
       if (event.repeat) return;
 
       const key = String(event.key || "").toLowerCase();
+      if (key === "escape") {
+        cancelTagGesture(); setSelectedTagId(null); return;
+      }
+      if (dragRef.current.active || resizeRef.current.active) return;
       if (key === "t") {
         event.preventDefault();
         event.stopPropagation?.();
@@ -1594,6 +1820,8 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
       updateZoomHistoryCount();
       return;
     }
+    clearPendingNavigation();
+    cancelTagGesture();
 
     const previous = zoomHistoryRef.current.pop();
     updateZoomHistoryCount();
@@ -1608,6 +1836,7 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
           const restoredY = lastRangesRef.current?.yaxis?.range;
           if (restoredY && restoredY.length === 2) {
             syncViewportFromYRange(restoredY[0], restoredY[1]);
+            ensureVisibleBuffer(viewportStartRef.current,getActiveSpanMs(),"zoom_restore");
           }
           programmaticRelayoutRef.current = false;
           updateZoomHistoryCount();
@@ -1618,6 +1847,8 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
   function resetChartZoom() {
     const gd = plotRef.current;
     if (!gd?._fullLayout) return;
+    clearPendingNavigation();
+    cancelTagGesture();
 
     const resetStart = clampViewport(viewportStartRef.current ?? initialPlotRangeRef.current ?? bufferStartMs ?? sectionStartMs, visibleMs);
     const resetEnd = Math.min(resetStart + visibleMs, sectionEndMs || resetStart + visibleMs);
@@ -1644,6 +1875,7 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
     setViewportSpanMs(visibleMs);
     setViewportStartMs(resetStart);
     setStartDateTimeValue(fmtDateTimeLocal(resetStart));
+    ensureVisibleBuffer(resetStart,visibleMs,"zoom_restore");
     updateZoomHistoryCount();
     programmaticRelayoutRef.current = true;
 
@@ -1665,6 +1897,7 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
     const rangeStart = initialPlotRangeRef.current || bufferStartMs || sectionStartMs;
     const rangeEnd = Math.min((rangeStart || 0) + visibleMs, sectionEndMs || (rangeStart || 0) + visibleMs);
     return {
+      autosize: true,
       height,
       margin: {l: 86, r: 28, t: 45, b: 40},
       paper_bgcolor: "white",
@@ -1677,11 +1910,7 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
       yaxis2: {...makeTimeAxis(rangeStart, rangeEnd, false, height), matches: "y"},
       yaxis3: {...makeTimeAxis(rangeStart, rangeEnd, false, height), matches: "y"},
       yaxis4: {...makeTimeAxis(rangeStart, rangeEnd, false, height), matches: "y"},
-      annotations: [
-        {xref: "paper", yref: "paper", x: 0.885, y: 1.04, text: "<b>Tagger</b>", showarrow: false, font: {color: "purple", size: 12}},
-        {xref: "paper", yref: "paper", x: 0.915, y: 1.04, text: "<b>Overlap</b>", showarrow: false, font: {color: "green", size: 12}},
-        {xref: "paper", yref: "paper", x: 0.955, y: 1.04, text: "<b>Agent</b>", showarrow: false, font: {color: "darkred", size: 12}},
-      ],
+      annotations: [],
     };
   }, [bufferStartMs, sectionStartMs, sectionEndMs, visibleMs, height]);
 
@@ -1690,6 +1919,36 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
     if (!gd) return;
 
     let cancelled = false;
+    let resizeFrame = null;
+    const syncLaneHeaders = () => {
+      if (cancelled || !gd._fullLayout?.xaxis4) return Promise.resolve();
+      const headers=measuredLaneHeaders(gd._fullLayout.xaxis4._length);
+      const signature=items=>JSON.stringify((items || []).map(a=>[a.xref,a.x,a.text,a.font?.size]));
+      if (signature(gd.layout.annotations)===signature(headers.annotations) && gd.layout.margin.t===headers.top) return Promise.resolve();
+      return Promise.resolve(Plotly.relayout(gd,{annotations:headers.annotations,"margin.t":headers.top}));
+    };
+
+    // The iframe/container can widen without a window resize (e.g. sidebar
+    // collapse). Resize Plotly itself, preserving ranges and React/tag state.
+    const resizePlotToContainer = () => {
+      if (resizeFrame !== null) return;
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        if (cancelled || !gd._fullLayout || gd.clientWidth <= 0) return;
+        if (Math.abs(gd.clientWidth - gd._fullLayout.width) < 1) return;
+
+        Promise.resolve(Plotly.Plots.resize(gd))
+          .then(syncLaneHeaders)
+          .then(() => {
+            if (!cancelled) updateCaptureLayer();
+          })
+          .catch((err) => {
+            if (!cancelled) console.error("Virtual log viewer resize error:", err);
+          });
+      });
+    };
+    const plotResizeObserver = new ResizeObserver(resizePlotToContainer);
+    plotResizeObserver.observe(gd);
 
     const config = {
       displaylogo: false,
@@ -1713,6 +1972,10 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
       template: {data: {}, layout: {}},
       annotations: Array.isArray(layout.annotations) ? layout.annotations : [],
     };
+    const domain=safeLayout.xaxis4.domain;
+    const initialHeaders=measuredLaneHeaders(Math.max(0,gd.clientWidth-safeLayout.margin.l-safeLayout.margin.r)*(domain[1]-domain[0]));
+    safeLayout.annotations=initialHeaders.annotations;
+    safeLayout.margin={...safeLayout.margin,t:initialHeaders.top};
 
     const safeTraces = (Array.isArray(traces) ? traces : [])
       .filter(Boolean)
@@ -1735,9 +1998,12 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
     }
 
     Promise.resolve(drawPromise)
-      .then(() => {
+      .then(async () => {
+        if (cancelled) return;
+        await syncLaneHeaders();
         if (cancelled) return;
 
+        resizePlotToContainer();
         updateCaptureLayer();
 
         try {
@@ -1758,7 +2024,17 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
         // Always restore the current virtual viewport after Plotly.react().
         // Tag edits and zoom-mode changes can redraw traces; without this restore,
         // Plotly falls back to the initial 12-hour layout and appears to reload/loop.
-        setPlotViewport(viewportStartRef.current);
+        const viewportReady = setPlotViewport(viewportStartRef.current);
+        const pending = pendingNavigationRef.current;
+        const navigationLoaded = pending && bufferStartMs <= pending.start && bufferEndMs >= pending.end
+          && Math.abs((toMs(args.viewport_start) ?? 0) - pending.start) < 1000;
+        if (navigationLoaded) {
+          Promise.resolve(viewportReady).then(() => {
+            if (cancelled || pendingNavigationRef.current?.id !== pending.id) return;
+            const actualStart = toMs(gd._fullLayout?.yaxis?.range?.[1]);
+            if (actualStart != null && Math.abs(actualStart - pending.start) < 1000) clearPendingNavigation();
+          });
+        }
         updateCaptureLayer();
 
         gd.on?.("plotly_hover", (ev) => {
@@ -1789,9 +2065,13 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
             const time = String(p.y || "");
 
             box.innerHTML =
-              `<b>${htmlEscape(meta.label || p.data?.name || "Value")}</b><br>` +
-              `${htmlEscape(rawText)} ${htmlEscape(meta.unit || "")}<br>` +
-              `Time: ${htmlEscape(time)}`;
+              ["agent","tag","overlap"].includes(meta.source)
+                ? `<b>${htmlEscape(meta.label || p.data?.name || meta.source)}</b><br>` +
+                  `Start: ${htmlEscape(p.data.y?.[0] || "")}<br>End: ${htmlEscape(p.data.y?.at(-1) || "")}` +
+                  (meta.severity ? `<br>Severity: ${htmlEscape(meta.severity)}` : "")
+                : `<b>${htmlEscape(meta.label || p.data?.name || "Value")}</b><br>` +
+                  `${htmlEscape(rawText)} ${htmlEscape(meta.unit || "")}<br>` +
+                  `Time: ${htmlEscape(time)}`;
 
             box.style.left = `${Math.max(8, Math.min(ev.event.clientX - rect.left + 12, rect.width - 210))}px`;
             box.style.top = `${Math.max(8, ev.event.clientY - rect.top - 78)}px`;
@@ -1846,11 +2126,14 @@ function sendCurrentStateToStreamlit(reason = "manual_save") {
 
     return () => {
       cancelled = true;
+      plotResizeObserver.disconnect();
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
     };
   }, [traces, layout, height, setPlotViewport]);
 
   useEffect(() => {
     viewportStartRef.current = viewportStartMs;
+    hideHover();
     setPlotViewport(viewportStartMs);
 
     if (suppressNextBufferRequestRef.current) {
@@ -1883,8 +2166,8 @@ function getPlotGeometry() {
     size,
     captureRect,
     wrapRect,
-    topInWrap: captureRect.top - wrapRect.top,
-    leftInWrap: captureRect.left - wrapRect.left,
+    topInWrap: captureRect.top - wrapRect.top - wrap.clientTop,
+    leftInWrap: captureRect.left - wrapRect.left - wrap.clientLeft,
     captureHeight,
     captureWidth,
   };
@@ -1932,47 +2215,34 @@ function pixelToTime(clientY) {
   return snapped == null ? null : snapped;
 }
 
-  function nearestTagId(clientY) {
-    const ms = pixelToTime(clientY);
-    if (ms == null) return null;
-    let best = null;
-    let bestDist = Infinity;
-    tags.forEach((tag, idx) => {
-      if (!isEditableTrackTag(tag)) return;
-      const s = toMs(tag.start);
-      const e = toMs(tag.end);
-      if (s == null || e == null) return;
-      const top = Math.min(s, e);
-      const bottom = Math.max(s, e);
-      const center = (top + bottom) / 2;
-      const dist = ms >= top && ms <= bottom ? 0 : Math.abs(center - ms);
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = tagKey(tag);
-      }
-    });
-    return bestDist <= 20 * 60 * 1000 ? best : null;
+  function tagHitDistance(clientX, clientY, tag) {
+    const gd = plotRef.current;
+    const full = gd?._fullLayout, xaxis = full?.xaxis4, yaxis = full?.yaxis4;
+    if (!xaxis || !yaxis || !isEditableTrackTag(tag)) return null;
+    const rect = gd.getBoundingClientRect();
+    const px = clientX - rect.left, py = clientY - rect.top;
+    const x0 = xaxis._offset, x1 = x0 + xaxis._length;
+    const y0 = yaxis._offset, y1 = y0 + yaxis._length;
+    if (px < x0 || px > x1 || py < y0 || py > y1) return null;
+    const a = yaxis.d2p(tag.start) + y0, b = yaxis.d2p(tag.end) + y0;
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+    // Test the visible purple stroke, including its actual width plus 3 pixels.
+    const left = Math.min(a,b), right = Math.max(a,b);
+    if (right < y0 || left > y1) return null;
+    const x = xaxis.d2p(0.24) + x0;
+    const halfWidth = selectedTagId === tagKey(tag) ? 5.5 : 3.5;
+    const dy = Math.max(Math.max(y0,left) - py, py - Math.min(y1,right), 0);
+    if (Math.abs(px-x) > halfWidth+3 || dy > 3) return null;
+    return Math.hypot(px-x, dy);
   }
 
-  function isClientYInsideTagId(clientY, tagId, tolerancePx = 14) {
-    const gd = plotRef.current;
-    if (!gd?._fullLayout?.yaxis || !gd?._fullLayout?._size || !tagId) return false;
-
-    const tag = tags.find((item) => tagKey(item) === tagId);
-    if (!tag || !isEditableTrackTag(tag)) return false;
-
-    try {
-      const rect = gd.getBoundingClientRect();
-      const plotY = clientY - rect.top - gd._fullLayout._size.t;
-      const startPixel = gd._fullLayout.yaxis.d2p(tag.start);
-      const endPixel = gd._fullLayout.yaxis.d2p(tag.end);
-      if (!Number.isFinite(startPixel) || !Number.isFinite(endPixel)) return false;
-      const top = Math.min(startPixel, endPixel) - tolerancePx;
-      const bottom = Math.max(startPixel, endPixel) + tolerancePx;
-      return plotY >= top && plotY <= bottom;
-    } catch (err) {
-      return false;
-    }
+  function hitTagId(clientX, clientY) {
+    let best = null, distance = Infinity;
+    tags.forEach((tag) => {
+      const d = tagHitDistance(clientX,clientY,tag);
+      if (d !== null && d < distance) { distance = d; best = tagKey(tag); }
+    });
+    return best;
   }
 
 function updateSelectBox(startY, curY) {
@@ -2034,54 +2304,11 @@ function getTaggingHoverCurvePoint(e, timeMs) {
   const trackNo = getMouseTrackNo(e);
   if (!trackNo) return null;
 
-  const track = (args.track_data?.tracks || []).find(
-    (item) => Number(item.track || 1) === trackNo,
-  );
-  if (!track || !Array.isArray(track.curves) || !track.curves.length) return null;
-
   const gdRect = gd.getBoundingClientRect();
-  const size = full._size;
-  const plotX = clamp(e.clientX - gdRect.left - size.l, 0, size.w);
-  const fracX = size.w > 0 ? plotX / size.w : 0;
-
   const xAxis = full[trackAxisName(trackNo)];
-  const domain = xAxis?.domain || [0, 1];
-  const localX = domain[1] > domain[0]
-    ? clamp((fracX - domain[0]) / (domain[1] - domain[0]), 0, 1)
-    : 0.5;
-
-  let best = null;
-
-  track.curves.forEach((curve) => {
-    const ys = Array.isArray(curve.y) ? curve.y : [];
-    const rawValues = Array.isArray(curve.x) ? curve.x : [];
-    const normalizedValues = normalize(rawValues, curve.display_min, curve.display_max);
-
-    ys.forEach((timeText, idx) => {
-      const pointMs = toMs(timeText);
-      if (pointMs == null) return;
-
-      const rawValue = Number(rawValues[idx]);
-      if (!Number.isFinite(rawValue)) return;
-
-      const normX = Number(normalizedValues[idx]);
-      const xPenalty = Number.isFinite(normX) ? Math.abs(normX - localX) * 5 * 60 * 1000 : 0;
-      const timePenalty = Math.abs(pointMs - timeMs);
-      const score = timePenalty + xPenalty;
-
-      if (!best || score < best.score) {
-        best = {
-          score,
-          label: String(curve.label || curve.raw_col || "Value"),
-          unit: String(curve.unit || ""),
-          value: rawValue,
-          timeText: fmtTime(pointMs),
-        };
-      }
-    });
-  });
-
-  return best;
+  const localX = Number(xAxis.p2d(e.clientX-gdRect.left-xAxis._offset));
+  const best = closestHoverPoint(hoverIndex,trackNo,timeMs,localX);
+  return best ? {...best,timeText:fmtTime(best.timeMs)} : null;
 }
 
 function showTaggingHover(e) {
@@ -2116,7 +2343,7 @@ function showTaggingHover(e) {
         hoverBoxRef.current.innerHTML =
           `<b>Tagging mode</b><br>` +
           (timeText ? `Mouse time: ${htmlEscape(timeText)}<br>` : "") +
-          `Drag vertically to create/edit a Track 4 tag`;
+          (getMouseTrackNo(e) < 4 ? "No valid sensor sample at this time." : "Drag vertically to create/edit a Track 4 tag");
       }
       
 
@@ -2352,7 +2579,7 @@ function updateResizePreview(startMs, endMs) {
     showTaggingHover(e);
 
     if (selectedTagId) {
-      if (!isClientYInsideTagId(e.clientY, selectedTagId, 18)) {
+      if (tagHitDistance(e.clientX, e.clientY, tags.find((tag) => tagKey(tag) === selectedTagId)) === null) {
         setSelectedTagId(null);
         hideSelectBox();
         dragRef.current = {active: false, startY: null, currentY: null};
@@ -2367,7 +2594,10 @@ function updateResizePreview(startMs, endMs) {
 
       resizeRef.current = {
         active: true,
-        boundary: null,
+        boundary: Math.abs(pixelToTime(e.clientY)-startMs) <= Math.abs(pixelToTime(e.clientY)-endMs) ? "start" : "end",
+        clientX: e.clientX,
+        clientY: e.clientY,
+        moved: false,
         tagId: selectedTagId,
         startMs,
         endMs,
@@ -2378,7 +2608,7 @@ function updateResizePreview(startMs, endMs) {
       return;
     }
 
-    dragRef.current = {active: true, startY: e.clientY, currentY: e.clientY};
+    dragRef.current = {active: true, startY: e.clientY, startMs:pixelToTime(e.clientY), currentY: e.clientY};
     updateSelectBox(e.clientY, e.clientY);
   }
 
@@ -2393,6 +2623,8 @@ function updateResizePreview(startMs, endMs) {
       if (ms == null) return;
 
       const resize = resizeRef.current;
+      if (!resize.moved && Math.hypot(e.clientX-resize.clientX,e.clientY-resize.clientY) < 3) return;
+      resize.moved = true;
       let boundary = resize.boundary;
       if (!boundary) {
         boundary = Math.abs(ms - resize.startMs) < Math.abs(ms - resize.endMs) ? "start" : "end";
@@ -2413,7 +2645,9 @@ function updateResizePreview(startMs, endMs) {
 
     if (dragRef.current.active) {
       dragRef.current.currentY = e.clientY;
-      updateSelectBox(dragRef.current.startY, e.clientY);
+      const top = timeMsToWrapY(dragRef.current.startMs);
+      const startY = top == null ? dragRef.current.startY : wrapRef.current.getBoundingClientRect().top+top;
+      updateSelectBox(startY, e.clientY);
     }
   }
 
@@ -2426,21 +2660,16 @@ function commitActiveResize() {
   const ns = resize.previewStartMs ?? resize.startMs;
   const ne = resize.previewEndMs ?? resize.endMs;
 
-  if (resize.tagId && ns != null && ne != null) {
-    setTags((old) => {
+  if (resize.moved && resize.tagId && ns != null && ne != null) {
+    {
       const next = dedupeTags(
-        old.map((tag) => {
+        tagsRef.current.map((tag) => {
           const id = tagKey(tag);
           if (id !== resize.tagId) return tag;
 
-          let snappedStart = snapToSecondMs(Math.min(ns, ne));
-          let snappedEnd = snapToSecondMs(Math.max(ns, ne));
-
-          if (snappedStart == null || snappedEnd == null) return tag;
-
-          if (snappedEnd <= snappedStart) {
-            snappedEnd = snappedStart + 1000;
-          }
+          const times = boundedTagTimes(ns,ne,sectionStartMs,sectionEndMs);
+          if (!times) return tag;
+          const [snappedStart,snappedEnd] = times;
 
           const newStart = fmtTimeSecond(snappedStart);
           const newEnd = fmtTimeSecond(snappedEnd);
@@ -2460,14 +2689,14 @@ function commitActiveResize() {
             status: "active",
             created_at: tag.created_at || ledgerId,
             updated_at: new Date().toISOString(),
-            revision: Number(tag.revision || 1) + 1,
+            revision: Number(tag.edit_revision || tag.revision || 1) + 1,
+            edit_revision: Number(tag.edit_revision || tag.revision || 1) + 1,
           };
         }),
       );
 
       autosaveTagLedger(next, "resize", []);
-      return next;
-    });
+    }
   }
 
   resizeRef.current = {
@@ -2489,32 +2718,26 @@ function commitActiveResize() {
     e.preventDefault();
     e.stopPropagation();
 
+    // The release position may arrive without a final mousemove.
+    onMouseMove(e);
     if (commitActiveResize()) return;
 
     if (!dragRef.current.active) return;
     const startY = dragRef.current.startY;
-    const endY = dragRef.current.currentY ?? e.clientY;
+    const startMs = dragRef.current.startMs;
+    const endY = e.clientY;
     dragRef.current = {active: false, startY: null, currentY: null};
     hideSelectBox();
 
     if (Math.abs(endY - startY) < 6) return;
 
-    const t1 = pixelToTime(startY);
+    const t1 = startMs ?? pixelToTime(startY);
     const t2 = pixelToTime(endY);
     if (t1 == null || t2 == null) return;
 
-    let s = Math.min(t1, t2);
-    let en = Math.max(t1, t2);
-
-    s = snapToSecondMs(s);
-    en = snapToSecondMs(en);
-
-    if (s == null || en == null) return;
-
-    // Keep a real interval. If the user draws a very tiny interval, make it 1 second.
-    if (en <= s) {
-      en = s + 1000;
-    }
+    const times = boundedTagTimes(t1,t2,sectionStartMs,sectionEndMs);
+    if (!times) return;
+    const [s,en] = times;
 
     const label = `Dragged Tag ${chartTagsForServer(tags).length + 1}`;
     const startText = fmtTimeSecond(s);
@@ -2533,15 +2756,12 @@ function commitActiveResize() {
       created_at: ledgerId,
       updated_at: new Date().toISOString(),
       revision: 1,
+      edit_revision: 1,
     };
 
     setRedoTags([]);
 
-    setTags((old) => {
-      const next = dedupeTags([...old, item]);
-      autosaveTagLedger(next, "draw", []);
-      return next;
-    });
+    autosaveTagLedger(dedupeTags([...tagsRef.current, item]), "draw", []);
     
   }
 
@@ -2561,14 +2781,15 @@ function commitActiveResize() {
     e.preventDefault();
     e.stopPropagation();
 
-    const id = nearestTagId(e.clientY);
+    const id = hitTagId(e.clientX, e.clientY);
     if (!id) {
       setSelectedTagId(null);
       return;
     }
 
     if (selectedTagId === id) {
-      setTags((old) => {
+      {
+        const old = tagsRef.current;
         const removed = old.find((tag) => tagKey(tag) === id);
         const deletedIds = removed
           ? [tagLedgerId(removed) || tagKeyToLedgerId(id)]
@@ -2576,8 +2797,7 @@ function commitActiveResize() {
 
         const next = old.filter((tag) => tagKey(tag) !== id);
         autosaveTagLedger(next, "delete", deletedIds);
-        return next;
-      });
+      }
 
       setSelectedTagId(null);
     } else {
@@ -2616,7 +2836,8 @@ function commitActiveResize() {
 
     const idToDelete = selectedTagId;
 
-    setTags((old) => {
+    {
+      const old = tagsRef.current;
       const removed = old.find((tag) => tagKey(tag) === idToDelete);
       const deletedIds = removed
         ? [tagLedgerId(removed) || tagKeyToLedgerId(idToDelete)]
@@ -2624,8 +2845,7 @@ function commitActiveResize() {
 
       const next = old.filter((tag) => tagKey(tag) !== idToDelete);
       autosaveTagLedger(next, "delete", deletedIds);
-      return next;
-    });
+    }
 
     setSelectedTagId(null);
   }
@@ -2659,18 +2879,11 @@ function commitActiveResize() {
       table +
       `</body></html>`;
 
-    const blob = new Blob([html], {type: "application/vnd.ms-excel;charset=utf-8"});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${safeDownloadName(hitResultsTitle, "data agent tags and hit results")}.xls`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    downloadText(html,"application/vnd.ms-excel;charset=utf-8",
+      `${safeDownloadName(hitResultsTitle, "data agent tags and hit results")}.xls`);
   }
 
-  const visibleRows = buildHitRows(dedupeTags(tags));
+  const visibleRows = currentRows;
   const hitCount = visibleRows.filter((r) => r.result === "Hit").length;
   const missCount = visibleRows.filter((r) => r.result === "Miss").length;
 
@@ -2735,11 +2948,11 @@ function commitActiveResize() {
               step="1"
               value={startDateTimeValue}
               min={sectionStartMs ? fmtDateTimeLocal(sectionStartMs) : undefined}
-              max={sectionEndMs ? fmtDateTimeLocal(Math.max(sectionStartMs || 0, sectionEndMs - visibleMs)) : undefined}
+              max={sectionEndMs ? fmtDateTimeLocal(sectionEndMs) : undefined}
               onChange={(e) => setStartDateTimeValue(e.target.value)}
             />
           </label>
-          <button onClick={applyPreferredStartDateTime}>Show next 12 hours</button>
+          <button onClick={applyPreferredStartDateTime} title="Show a 12-hour window starting at the selected date and time, within the available log data.">Show selected time window</button>
         </span>
 
         <span className="vlv-spacer" />
@@ -2770,6 +2983,7 @@ function commitActiveResize() {
         <div style={{fontSize: 11, color: "#995e00", marginTop: 3}}>
           Live preview only (current loaded agent buffer); hits/misses here are NOT final validation metrics.
           Use the independent validation report for Precision, Recall and F1.
+          Tags outside computed coverage, across gaps or during restart warm-up are shown as Not evaluable.
         </div>
         <div style={{
           fontSize: 11,
@@ -2777,9 +2991,9 @@ function commitActiveResize() {
           marginTop: 3,
           marginBottom: 4,
         }}>
-          {autosaveStatus.pending
+          {snapshotError || (autosaveStatus.pending
             ? "⚠ Tags not yet synced"
-            : `Tags autosaved: ${autosaveStatus.count} drawn tag(s)${autosaveStatus.savedAt ? `, last saved ${autosaveStatus.savedAt.toLocaleTimeString()}` : ""}`}
+            : `Tags autosaved: ${autosaveStatus.count} drawn tag(s)${autosaveStatus.savedAt ? `, last saved ${autosaveStatus.savedAt.toLocaleTimeString()}` : ""}`)}
         </div>
 
         <div style={{overflowX: "auto", marginTop: 6}}>
@@ -2805,6 +3019,13 @@ function commitActiveResize() {
         </div>
       </details>
 
+      {viewportStartMs != null && viewportEndMs != null && (
+        <div className="vlv-caption vlv-time-range" aria-live="polite">
+          {pendingNavigation
+            ? `Loading plot from ${fmtTime(pendingNavigation.start)}…`
+            : `Plot time: ${fmtTime(viewportStartMs)} → ${fmtTime(viewportEndMs)}`}
+        </div>
+      )}
       <div
         ref={wrapRef}
         className="vlv-wrap"
@@ -2813,12 +3034,15 @@ function commitActiveResize() {
         onMouseLeave={() => {
           if (hoverLineRef.current) hoverLineRef.current.style.display = "none";
           if (hoverBoxRef.current) hoverBoxRef.current.style.display = "none";
-          commitActiveResize();
-          hideSelectBox();
-          dragRef.current = {active: false, startY: null, currentY: null};
+          if (!resizeRef.current.active && !dragRef.current.active) hideSelectBox();
         }}
       >
         <div ref={plotRef} className="vlv-plot" />
+        {pendingNavigation && (
+          <div className="vlv-navigation-loading" role="status" aria-live="polite">
+            Loading plot from {fmtTime(pendingNavigation.start)}…
+          </div>
+        )}
         <div className="vlv-scroll-rail" aria-label="Track time scroll controls">
           <button
             className="vlv-scroll-arrow vlv-scroll-arrow-up"
@@ -2849,9 +3073,21 @@ function commitActiveResize() {
         <div
           ref={captureRef}
           className={`vlv-capture ${tagMode ? "active" : ""}`}
-          onMouseDown={onMouseDown}
-          onMouseMove={onMouseMove}
-          onMouseUp={onMouseUp}
+          onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            onMouseDown(event);
+            if (dragRef.current.active || resizeRef.current.active) event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          onPointerMove={onMouseMove}
+          onPointerUp={(event) => {
+            onMouseUp(event);
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          onPointerCancel={() => {
+            dragRef.current = {active:false};
+            resizeRef.current = {active:false};
+            hideSelectBox();
+          }}
           onDoubleClick={onDoubleClick}
         />
         <div ref={selectBoxRef} className="vlv-selection" />
@@ -2870,10 +3106,26 @@ function commitActiveResize() {
           </div>
         ))}
       </div>
+      <nav className="vlv-time-navigation" aria-label="Navigate 12-hour plot windows">
+        <button
+          disabled={adjacentTimeWindowStart(-1,viewportStartMs) == null}
+          onClick={() => showAdjacentTimeWindow(-1)}
+          title="Move the plot start back 12 hours and show a 12-hour window, within the available log data."
+        >Show previous 12 hours</button>
+        <button
+          disabled={adjacentTimeWindowStart(1,viewportStartMs) == null}
+          onClick={() => showAdjacentTimeWindow(1)}
+          title="Move the plot start forward 12 hours and show a 12-hour window, within the available log data."
+        >Show next 12 hours</button>
+      </nav>
          
     </div>
   );
 }
 
-const ConnectedApp = withStreamlitConnection(App);
+function ViewerComponent(props) {
+  if (props.args?.view === "draft_recovery") return <DraftRecovery />;
+  return props.args?.view === "agent_interval_table" ? <AgentIntervalTable {...props} /> : <App {...props} />;
+}
+const ConnectedApp = withStreamlitConnection(ViewerComponent);
 createRoot(document.getElementById("root")).render(<ConnectedApp />);

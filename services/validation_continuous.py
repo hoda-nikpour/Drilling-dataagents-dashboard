@@ -145,24 +145,49 @@ def calculate_continuous_predictions(*, full_df: pd.DataFrame, label_to_column: 
 
 
 def normalize_predictions(raw_intervals: list[dict], *, agent: str, log_utc_offset: str,
-                          sample_cadence_seconds: float | None = None) -> list[dict]:
+                          sample_cadence_seconds: float | None = None,
+                          sample_index=None) -> list[dict]:
     """Convert inclusive last-sample endpoints to half-open model intervals.
 
     The current production `mask_to_intervals()` and
     `intervals_from_label_series()` both set `end` to the *last detected
     sample*, not the timestamp immediately after the detected period. For
-    validation ONLY, extend the end by the verified sample cadence. Original
-    dashboard interval timestamps and exports are never modified.
+    validation ONLY, use the next observed sample as the exclusive end. The
+    verified cadence extends only the final sample in a physical segment.
+    This preserves native irregular timestamps without stretching a detection
+    past the next negative sample or truncating it before that sample. Callers
+    without a sample index retain the legacy fixed-cadence conversion.
+    Original dashboard interval timestamps and exports are never modified.
     """
+    fixed_utc_offset(log_utc_offset)
+    if sample_cadence_seconds is not None:
+        if not isfinite(float(sample_cadence_seconds)) or not 0 < float(sample_cadence_seconds):
+            raise ValidationError("Verified finite positive sample cadence required")
+    samples = None
+    if sample_index is not None:
+        samples = pd.DatetimeIndex(sample_index)
+        if (samples.empty or samples.hasnans or not samples.is_monotonic_increasing
+                or not samples.is_unique):
+            raise ValidationError("Prediction sample index must be nonempty, sorted, unique and valid")
+        if sample_cadence_seconds is None:
+            raise ValidationError("Final sample needs an explicit positive sample cadence")
+        if samples.tz is None:
+            samples = samples.tz_localize(fixed_utc_offset(log_utc_offset))
+        samples = samples.tz_convert('UTC')
     normalized = []
     for i, item in enumerate(raw_intervals):
         start = utc_iso(item["start"], log_utc_offset)
         end = utc_iso(item["end"], log_utc_offset)
         if pd.Timestamp(end) < pd.Timestamp(start):
             raise ValidationError("Prediction end precedes start")
-        if sample_cadence_seconds is not None:
-            if not isfinite(float(sample_cadence_seconds)) or not 0 < float(sample_cadence_seconds):
-                raise ValidationError("Verified finite positive sample cadence required")
+        if samples is not None:
+            positions = samples.get_indexer([pd.Timestamp(start), pd.Timestamp(end)])
+            if (positions < 0).any():
+                raise ValidationError("Prediction boundaries must coincide with processed sample timestamps")
+            last = int(positions[1])
+            end = (samples[last + 1] if last + 1 < len(samples) else
+                   samples[last] + pd.Timedelta(seconds=float(sample_cadence_seconds))).isoformat()
+        elif sample_cadence_seconds is not None:
             end = (pd.Timestamp(end) + pd.Timedelta(seconds=float(sample_cadence_seconds))).isoformat()
         normalized.append({"id": f"continuous-{i:08d}", "agent": agent,
                            "start": start, "end": end})

@@ -43,3 +43,12 @@ def render_virtual_log_viewer(**kwargs):
     context_key = kwargs.get("context_key", "default")
     key = kwargs.pop("key", f"virtual_log_viewer_{context_key}")
     return virtual_log_viewer(key=key, default=None, **kwargs)
+
+
+def render_agent_interval_table(**kwargs):
+    key = kwargs.pop("key")
+    return virtual_log_viewer(key=key, default=None, view="agent_interval_table", **kwargs)
+
+
+def render_draft_recovery():
+    return virtual_log_viewer(key="browser_draft_recovery",default=None,view="draft_recovery")

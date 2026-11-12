@@ -212,7 +212,7 @@ def evaluate_events(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError("well and section must be nonempty strings")
     if payload.get("predictions_complete") is not True:
         raise ValidationError("Not evaluable: predictions_complete must be explicitly true")
-    if payload.get("prediction_generation") not in {"continuous", "state_preserving_windows"}:
+    if payload.get("prediction_generation") not in {"continuous", "state_preserving_windows", "gap_reset_segments"}:
         raise ValidationError("Not evaluable: prediction generation must be verified continuous or state_preserving_windows")
     if not isinstance(payload.get("reviewed_intervals"), list) or not payload["reviewed_intervals"]:
         raise ValidationError("Not evaluable: reviewed_intervals must be explicitly supplied")

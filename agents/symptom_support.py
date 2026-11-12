@@ -50,7 +50,7 @@ def mask_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severit
     start = None
     count = 0
 
-    for ts, flag in mask.items():
+    for position, (ts, flag) in enumerate(mask.items()):
         if flag and start is None:
             start = ts
             count = 1
@@ -58,7 +58,7 @@ def mask_to_intervals(mask: pd.Series, label: str, min_samples: int = 1, severit
             count += 1
         elif not flag and start is not None:
             if count >= min_samples:
-                prev_ts = mask.index[mask.index.get_loc(ts) - 1]
+                prev_ts = mask.index[position - 1]
                 intervals.append(
                     {
                         "label": label,

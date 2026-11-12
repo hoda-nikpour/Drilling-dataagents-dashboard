@@ -1,6 +1,7 @@
 
 import gc
 import hashlib
+import json
 import uuid
 
 import pandas as pd
@@ -46,7 +47,8 @@ from data_access.data_loader import (
     load_section_time_index,
 )
 
-from services.virtual_window_service import dataframe_to_track_payload
+from services.virtual_window_service import dataframe_to_track_payload, agent_interval_view_start
+from services.live_gap_service import build_live_gap_plan, run_live_agents
 
 try:
     from streamlit_components.virtual_log_viewer import render_virtual_log_viewer
@@ -295,6 +297,7 @@ def build_section_wide_symptom_intervals(
     symptom_enabled: bool,
     selected_symptom: str,
     symptom_config,
+    gap_plan: dict | None = None,
 ) -> list[dict]:
     """
     Compute the selected data-agent intervals for the whole section without
@@ -352,34 +355,14 @@ def build_section_wide_symptom_intervals(
             required_symptom_labels=list(required_symptom_labels),
         )
 
-        activity_cfg_part = run_activity_agent(
-            df=df_part,
-            label_to_column=clean_label_to_column_part,
-            activity_ui=activity_ui,
+        activity_cfg_part, symptom_cfg_part = run_live_agents(
+            df=df_part, label_to_column=clean_label_to_column_part,
+            activity_ui=activity_ui, symptom_ui=symptom_ui,
+            run_activity=run_activity_agent, resolve_activity=_apply_temporal_activity_resolution,
+            run_symptom=run_symptom_agent, gap_plan=gap_plan,
         )
 
-        # ----------------------------------------------------
-        # Boss feedback:
-        # Resolve/backdate activity BEFORE symptom/event agents.
-        # ----------------------------------------------------
-        if (
-            activity_enabled
-            and isinstance(activity_cfg_part, dict)
-            and not activity_cfg_part.get("labels", pd.Series(dtype=object)).empty
-        ):
-            activity_cfg_part = _apply_temporal_activity_resolution(
-                df=df_part,
-                activity_cfg=activity_cfg_part,
-            )
-
         if symptom_enabled:
-            symptom_cfg_part = run_symptom_agent(
-                df=df_part,
-                label_to_column=clean_label_to_column_part,
-                symptom_ui=symptom_ui,
-                activity_ui=activity_ui,
-                activity_cfg=activity_cfg_part,
-            )
 
             interval_source = symptom_cfg_part.get("intervals", []) or []
         else:
@@ -742,6 +725,14 @@ def _normalize_virtual_component_tag(item, idx: int = 1, *, chart_only: bool = F
         revision = int(item.get("revision") or 1)
     except Exception:
         revision = 1
+    edit_revision = None
+    if "edit_revision" in item:
+        try:
+            edit_revision = int(item["edit_revision"])
+            if edit_revision < 1:
+                return None
+        except (TypeError,ValueError):
+            return None
 
     return {
         "tag_id": tag_id,
@@ -753,6 +744,7 @@ def _normalize_virtual_component_tag(item, idx: int = 1, *, chart_only: bool = F
         "created_at": created_at,
         "updated_at": updated_at,
         "revision": revision,
+        **({"edit_revision":edit_revision} if edit_revision is not None else {}),
     }
 
 def _virtual_component_tag_identity(item: dict) -> tuple[str, str, str, str]:
@@ -893,6 +885,17 @@ def _merge_virtual_tag_ledger(
         except Exception:
             incoming_revision = 1
 
+        # A delayed/replayed edit cannot rewind the expert's latest boundaries.
+        # Revisions belong to edits, rather than to server reruns.
+        if previous:
+            if "edit_revision" in previous:
+                if "edit_revision" not in incoming_tag or incoming_tag["edit_revision"] <= previous["edit_revision"]:
+                    continue
+            elif "edit_revision" not in incoming_tag and incoming_revision <= previous_revision:
+                continue
+            # The first explicit edit revision migrates old ledgers whose
+            # revision counter was inflated by reruns rather than actual edits.
+
         merged = {
             **previous,
             **incoming_tag,
@@ -901,7 +904,7 @@ def _merge_virtual_tag_ledger(
             "status": "active",
             "created_at": previous.get("created_at") or incoming_tag.get("created_at") or tag_id,
             "updated_at": now_text,
-            "revision": max(previous_revision + 1, incoming_revision),
+            "revision": incoming_revision,
         }
 
         ledger[tag_id] = merged
@@ -1091,10 +1094,31 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
     if not isinstance(component_value, dict):
         return False
 
+    # A loaded file creates a new editor generation. Ignore queued events from
+    # the previous iframe rather than letting them overwrite the restored set.
+    expected_token = st.session_state.get(f"_virtual_browser_session_token_{context_key}")
+    if expected_token and component_value.get("browser_session_token") != expected_token:
+        return False
+
     event_type = str(component_value.get("event") or "state_update").strip() or "state_update"
     state_changed = False
 
     if event_type in {"state_update", "tag_autosave"}:
+        order = component_value.get("event_order")
+        order_key = f"_virtual_tag_event_order_{context_key}_{expected_token or 'fresh'}"
+        if order is not None:
+            if not isinstance(order,int) or isinstance(order,bool) or order<=st.session_state.get(order_key,0):
+                return False
+        elif st.session_state.get(order_key,0):
+            return False
+        if "tags" in component_value:
+            items=component_value["tags"]
+            if not isinstance(items,list) or any(_normalize_virtual_component_tag(item) is None for item in items):
+                return False
+        if not isinstance(component_value.get("deleted_tag_ids",[]),list):
+            return False
+        if order is not None:
+            st.session_state[order_key]=order
         normalized_tags: list[dict] | None = None
 
         tags = component_value.get("tags")
@@ -1138,11 +1162,31 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
     if event_type != "viewport_request":
         return False
 
-    # Accept backend window changes only from the React plot-area wheel handler.
-    # This is a server-side safety net for the browser/page-scroll mix-up: stale
-    # or accidental component values must not move the backend data window.
-    if str(component_value.get("source") or "") not in {"arrow_scroll", "set_datetime"}:
-       return False
+    # Accept only explicit time navigation, never ordinary page-wheel scrolling.
+    source = str(component_value.get("source") or "")
+    if source not in {"arrow_scroll", "set_datetime", "agent_interval", "zoom_restore", "time_page"}:
+        return False
+
+    navigation_key = f"_virtual_navigation_request_{context_key}"
+    navigation = st.session_state.get(navigation_key)
+    if source == "agent_interval" and (
+        not isinstance(navigation, dict)
+        or not navigation.get("id")
+        or not navigation.get("start")
+        or navigation.get("browser_session_token") != (expected_token or "fresh")
+        or component_value.get("navigation_id") != navigation.get("id")
+    ):
+        return False
+
+    order_key = f"_virtual_viewport_order_{context_key}_{expected_token or 'fresh'}"
+    floor = max(st.session_state.get(order_key,0),
+                st.session_state.get(f"_agent_interval_click_order_{context_key}_{expected_token or 'fresh'}",0))
+    order = component_value.get("request_order")
+    if order is not None:
+        if not isinstance(order,int) or isinstance(order,bool) or order<=0 or (source!="agent_interval" and order<=floor):
+            return False
+    elif floor and source!="agent_interval":
+        return False
 
     viewport_text = component_value.get("viewport_start")
     if viewport_text:
@@ -1160,9 +1204,27 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
             visible_hours=12,
             visible_seconds=span_seconds,
         )
+        if source == "agent_interval":
+            expected_start = _clamp_virtual_viewport_start(
+                agent_interval_view_start(
+                    navigation["start"], span_seconds,
+                    lead_fraction=navigation.get("lead_in_fraction", 0),
+                ), section_start, section_end,
+                visible_hours=12, visible_seconds=span_seconds,
+            )
+            # Browser time strings have whole-second precision, while a zoom
+            # span can clamp the end-of-section start to a fractional second.
+            if viewport_start.floor("s") != expected_start.floor("s"):
+                return False
+            st.session_state.pop(navigation_key, None)
+        elif order is not None:
+            # Explicit manual navigation supersedes an earlier table command.
+            st.session_state.pop(navigation_key,None)
+        if order is not None:
+            st.session_state[order_key]=max(order,st.session_state.get(order_key,0))
         key = f"virtual_viewport_start_{context_key}"
         span_key = f"virtual_viewport_span_seconds_{context_key}"
-        last_request_key = f"virtual_last_viewport_request_{context_key}"
+        last_request_key = f"virtual_last_viewport_request_{context_key}_{expected_token or 'fresh'}"
         request_fingerprint = f"{_virtual_dt_text(viewport_start)}|{round(span_seconds, 3)}"
 
         # Do not execute the same window request repeatedly while Streamlit is
@@ -1177,15 +1239,17 @@ def _apply_virtual_component_event(component_value, context_key: str, section_st
 
         if (
             st.session_state.get(last_request_key) == request_fingerprint
-            and st.session_state.get(key) == viewport_start
-            and same_span
+            and source != "agent_interval"
+            and (order is None or (st.session_state.get(key) == viewport_start and same_span))
         ):
             return False
 
+        # Record acknowledgements even when Python already preloaded this view.
+        # Otherwise a retained arrow/datetime value can replay on the next click.
+        st.session_state[last_request_key] = request_fingerprint
         if st.session_state.get(key) != viewport_start or not same_span:
             st.session_state[key] = viewport_start
             st.session_state[span_key] = float(span_seconds)
-            st.session_state[last_request_key] = request_fingerprint
             st.rerun()
 
     return False
@@ -1197,6 +1261,15 @@ def _parameter_units_from_catalog(labels: list[list[str]]) -> dict[str, str]:
         for label in track:
             units[str(label)] = str(PARAMETER_CATALOG.get(str(label), {}).get("unit", ""))
     return units
+
+
+def _live_prediction_revision(agent_cfg: dict, window_info: dict) -> str:
+    """Tie the browser projection and session download to the same model inputs."""
+    inputs = {key: agent_cfg.get(key) for key in (
+        'selected_agent', 'agent_source', 'agent_intervals', 'prediction_coverage',
+        'live_gap_policy', 'model_configuration')}
+    inputs['buffer'] = [window_info['start'], window_info['end']]
+    return hashlib.sha256(json.dumps(_virtual_json_safe(inputs), sort_keys=True).encode()).hexdigest()
 
 
 def _render_virtual_log_component(
@@ -1225,12 +1298,15 @@ def _render_virtual_log_component(
 
         return None
 
+    prediction_revision = _live_prediction_revision(agent_cfg, window_info)
+    st.session_state[f'_live_prediction_revision_{context_key}'] = prediction_revision
     track_payload = dataframe_to_track_payload(
         df,
         track_params_real=track_params_real[:3],
         track_param_labels=track_param_labels[:3],
         parameter_units=_parameter_units_from_catalog(track_param_labels[:3]),
         parameter_ranges=parameter_ranges,
+        gap_plan=st.session_state.get(f'_live_gap_plan_{context_key}'),
     )
 
     manual_or_sidebar_tags = _deduplicate_virtual_component_tags(
@@ -1278,10 +1354,16 @@ def _render_virtual_log_component(
         st.session_state.get(f"_loaded_dashboard_active_{context_key}", False)
     )
 
+    editor_token = str(st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh"))
+    navigation_key = f"_virtual_navigation_request_{context_key}"
+    navigation_request = st.session_state.get(navigation_key)
+    if isinstance(navigation_request, dict) and navigation_request.get("browser_session_token") != editor_token:
+        st.session_state.pop(navigation_key, None)
+        navigation_request = None
     result = render_virtual_log_viewer(
-        key=f"virtual_log_viewer_{context_key}",
+        key=f"virtual_log_viewer_{context_key}_{editor_token}",
         context_key=context_key,
-        browser_session_token=str(st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh")),
+        browser_session_token=editor_token,
         restore_saved_dashboard=restore_saved_dashboard_once,
         selected_well=selected_well,
 
@@ -1294,6 +1376,11 @@ def _render_virtual_log_component(
         viewport_start=_virtual_dt_text(window_info["viewport_start"]),
         viewport_end=_virtual_dt_text(window_info["viewport_end"]),
         viewport_span_seconds=float(window_info.get("viewport_span_seconds", 12 * 3600)),
+        navigation_request=navigation_request,
+        latest_viewport_order=max(
+            st.session_state.get(f"_virtual_viewport_order_{context_key}_{editor_token}",0),
+            st.session_state.get(f"_agent_interval_click_order_{context_key}_{editor_token}",0),
+        ),
         visible_hours=12,
         buffer_margin_hours=4,
         height=int(chart_height),
@@ -1302,6 +1389,10 @@ def _render_virtual_log_component(
         show_agent_intervals=bool(agent_cfg.get("show_agent_intervals", True)),
         selected_agent_name=str(agent_cfg.get("selected_agent", "") or ""),
         agent_source=str(agent_cfg.get("agent_source", "") or ""),
+        agent_coverage=_virtual_json_safe(agent_cfg.get("prediction_coverage", [])),
+        live_gap_policy=agent_cfg.get("live_gap_policy", ""),
+        prediction_revision=prediction_revision,
+        session_base=_virtual_json_safe(st.session_state.get(f"_virtual_session_base_{context_key}")),
         saved_tags=saved_tags,
         saved_hit_results=_virtual_json_safe(saved_hit_results),
         saved_tag_mode=bool(st.session_state.get(f"virtual_tag_mode_{context_key}", False)),
@@ -1396,7 +1487,7 @@ def main():
 
     sections_by_well = build_sections_by_well(catalog)
 
-    loaded_review_payload = render_review_loader_before_well_selector()
+    loaded_review_payload = render_review_loader_before_well_selector(sections_by_well)
 
     selected_well, selected_sections = render_well_section_selector(sections_by_well)
 
@@ -1593,38 +1684,19 @@ def main():
     activity_ui = agent_controls["activity_ui"]
     symptom_ui = agent_controls["symptom_ui"]
 
-    activity_cfg = run_activity_agent(
-        df=agent_df,
-        label_to_column=agent_clean_label_to_column,
-        activity_ui=activity_ui,
+    live_gap_plan = build_live_gap_plan(time_df.index, activity_ui, symptom_ui,
+        time_df['_section_in'] if '_section_in' in time_df else None)
+    activity_cfg, symptom_cfg = run_live_agents(
+        df=agent_df, label_to_column=agent_clean_label_to_column,
+        activity_ui=activity_ui, symptom_ui=symptom_ui,
+        run_activity=run_activity_agent, resolve_activity=_apply_temporal_activity_resolution,
+        run_symptom=run_symptom_agent, gap_plan=live_gap_plan,
     )
-
-    # ========================================================
-    # BOSS FEEDBACK:
-    # Apply state transitions + confirmation + backdating
-    # BEFORE downstream symptom/event agents are executed.
-    # ========================================================
-    if (
-        activity_ui["enabled"]
-        and isinstance(activity_cfg, dict)
-        and not activity_cfg.get("labels", pd.Series(dtype=object)).empty
-    ):
-        activity_cfg = _apply_temporal_activity_resolution(
-            df=agent_df,
-            activity_cfg=activity_cfg,
-        )
+    st.session_state[f'_live_gap_plan_{context_key}'] = live_gap_plan
 
     if activity_ui["enabled"] and not activity_cfg["labels"].empty:
         # This is now the temporally resolved/backdated activity.
         agent_df["activity"] = activity_cfg["labels"]
-
-    symptom_cfg = run_symptom_agent(
-        df=agent_df,
-        label_to_column=agent_clean_label_to_column,
-        symptom_ui=symptom_ui,
-        activity_ui=activity_ui,
-        activity_cfg=activity_cfg,
-    )
 
     section_windows = _build_fixed_time_windows_from_index(
         time_df.index,
@@ -1654,6 +1726,7 @@ def main():
         symptom_enabled=bool(symptom_ui.get("enabled", False)),
         selected_symptom=str(symptom_ui.get("selected_symptom", "")),
         symptom_config=symptom_ui.get("config"),
+        gap_plan=live_gap_plan,
     )
 
     selected_agent_label = ""
@@ -1675,6 +1748,7 @@ def main():
         symptom_cfg=agent_interval_table_cfg,
         activity_validation_df=pd.DataFrame(),
         review_df=pd.DataFrame(),
+        context_key=context_key,
     )
 
     available_param_labels = list(dict.fromkeys(list(label_to_column.keys())))
@@ -2001,6 +2075,9 @@ def main():
         activity_cfg=activity_cfg,
         symptom_cfg=symptom_cfg,
     )
+
+    if use_virtual_log_viewer:
+        st.session_state[f'_live_prediction_revision_{context_key}'] = _live_prediction_revision(agent_cfg, window_info)
 
     render_agent_review_outputs(
         agent_cfg=agent_cfg,

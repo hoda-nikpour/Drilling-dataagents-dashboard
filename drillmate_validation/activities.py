@@ -52,7 +52,7 @@ def evaluate_activities(payload):
         raise ValidationError("section must be a nonempty string")
     if payload.get("predictions_complete") is not True:
         raise ValidationError("Not evaluable: predictions_complete must be explicitly true")
-    if payload.get("prediction_generation") not in {"continuous", "state_preserving_windows"}:
+    if payload.get("prediction_generation") not in {"continuous", "state_preserving_windows", "gap_reset_segments"}:
         raise ValidationError("Not evaluable: verified prediction_generation required")
     if not isinstance(payload.get("reviewed_intervals"), list) or not payload["reviewed_intervals"]:
         raise ValidationError("Not evaluable: reviewed_intervals required")

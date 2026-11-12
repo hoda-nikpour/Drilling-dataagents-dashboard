@@ -1,8 +1,11 @@
 
 import csv
 import io
+import hashlib
 import json
+import math
 import uuid
+from dataclasses import asdict, is_dataclass
 from datetime import timedelta
 
 import pandas as pd
@@ -616,9 +619,17 @@ def _is_early_dashboard_key(key: str, context_key: str) -> bool:
     """
     early_prefixes = [
         "track_params_",
+        "act_",
+        "sym_",
+        "marker_display_",
+        "virtual_tag_mode_",
         "max_override_",
         "curve_source_",
         "window_index_",
+        "virtual_viewport_start_",
+        "virtual_viewport_span_seconds_",
+        "exact_time_start_",
+        "exact_time_end_",
     ]
 
     if not key.endswith(f"_{context_key}") and f"_{context_key}_" not in key:
@@ -701,6 +712,11 @@ def _restore_full_dashboard_state(uploaded_data: dict, context_key: str, t_min=N
 
     for key, value in widget_state.items():
         key = str(key)
+
+        # Tag collections are restored once from the canonical saved set, not
+        # from potentially stale compatibility copies in widget_state.
+        if key.startswith(("tag_ledger_", "visual_tag_intervals_", "deleted_tag_ids_", "hit_result_history_")):
+            continue
 
         # Critical:
         # Old saved JSON files may contain internal restore flags, pending payloads,
@@ -1163,6 +1179,7 @@ def _normalize_section_tag(item: dict, fallback_label: str = "Saved Tag", t_min=
         "created_at": str(item.get("created_at") or tag_id or ""),
         "updated_at": str(item.get("updated_at") or ""),
         "revision": item.get("revision", 1),
+        **({"edit_revision":int(item["edit_revision"])} if "edit_revision" in item else {}),
     }
 
 def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag", t_min=None, t_max=None) -> dict | None:
@@ -1227,6 +1244,7 @@ def _normalize_restored_visual_tag(item: dict, fallback_label: str = "Visual Tag
         "created_at": str(item.get("created_at") or tag_id),
         "updated_at": str(item.get("updated_at") or ""),
         "revision": item.get("revision", 1),
+        **({"edit_revision":int(item["edit_revision"])} if "edit_revision" in item else {}),
     }
 
 
@@ -1562,6 +1580,58 @@ def _filter_hit_result_rows_for_tags(hit_rows: list[dict], tag_intervals: list[d
     filtered.sort(key=lambda r: str(r.get("tag_start", "")))
     return filtered
 
+def _saved_session_tags(uploaded_data: dict, context_key: str) -> list[dict]:
+    """Choose one saved tag set by key presence; an explicit [] is authoritative."""
+    if not isinstance(uploaded_data, dict):
+        raise ValueError("Saved dashboard session must be a JSON object")
+    widget = (uploaded_data.get("dashboard_state") or {}).get("widget_state") or {}
+    if "tag_intervals" in uploaded_data:
+        candidates = uploaded_data["tag_intervals"]
+    elif "tag_ledger" in uploaded_data:
+        candidates = uploaded_data["tag_ledger"]
+    elif "drawn_tag_intervals" in uploaded_data or "manual_tagger_intervals" in uploaded_data:
+        candidates = list(uploaded_data.get("manual_tagger_intervals") or []) + list(uploaded_data.get("drawn_tag_intervals") or [])
+    elif f"tag_ledger_{context_key}" in widget:
+        candidates = widget[f"tag_ledger_{context_key}"]
+    else:
+        candidates = widget.get(f"visual_tag_intervals_{context_key}", [])
+    if not isinstance(candidates, list):
+        raise ValueError("Saved tag collection must be a list")
+    restored = []
+    for index, item in enumerate(candidates, start=1):
+        if not isinstance(item, dict):
+            raise ValueError("Invalid saved tag row")
+        if str(item.get("status", "active")).lower() == "deleted":
+            continue
+        normalized = _normalize_section_tag(item, fallback_label=f"Saved Tag {index}")
+        if normalized is None:
+            raise ValueError("Invalid saved tag boundaries")
+        if _looks_like_chart_drag_tag(item):
+            normalized["source"] = "chart_drag"
+        restored.append(normalized)
+    return _deduplicate_visual_tags(restored)
+
+
+def _replace_saved_tag_state(uploaded_data: dict, context_key: str, *, new_edit_session=False):
+    tags = _saved_session_tags(uploaded_data, context_key)
+    widget = (uploaded_data.get("dashboard_state") or {}).get("widget_state") or {}
+    rows = uploaded_data.get("hit_results", widget.get(f"hit_result_history_{context_key}", []))
+    if not isinstance(rows, list):
+        raise ValueError("Saved hit results must be a list")
+    rows = _filter_hit_result_rows_for_tags(rows, tags)
+    # Validate before mutating. Imported active tags form the new baseline;
+    # deletion markers from an earlier editing session must not suppress them.
+    st.session_state[f"tag_ledger_{context_key}"] = tags
+    st.session_state[f"visual_tag_intervals_{context_key}"] = tags
+    st.session_state[f"deleted_tag_ids_{context_key}"] = []
+    st.session_state[f"hit_result_history_{context_key}"] = rows
+    if new_edit_session:
+        st.session_state[f"_virtual_browser_session_token_{context_key}"] = uuid.uuid4().hex
+        st.session_state.pop(f"virtual_last_viewport_request_{context_key}", None)
+        st.session_state.pop(f"tag_autosave_status_{context_key}", None)
+    return tags
+
+
 def _apply_loaded_review_to_state(
     uploaded_data: dict,
     context_key: str,
@@ -1593,49 +1663,7 @@ def _apply_loaded_review_to_state(
     # render_agent_controls(). This is the missing bridge: the JSON may contain
     # drawn_tag_intervals, but Track 4 only visualizes tags that are included in
     # agent_cfg["tag_intervals"].
-    restored_visual_tags = _extract_restorable_visual_tags(
-        uploaded_data=uploaded_data,
-        context_key=context_key,
-        t_min=None,
-        t_max=None,
-    )
-
-    section_level_tags = []
-    saved_tag_candidates = []
-    saved_tag_candidates.extend(uploaded_data.get("manual_tagger_intervals", []) or [])
-    saved_tag_candidates.extend(uploaded_data.get("drawn_tag_intervals", []) or [])
-    saved_tag_candidates.extend(uploaded_data.get("tag_intervals", []) or [])
-
-    for idx, item in enumerate(saved_tag_candidates, start=1):
-        normalized = _normalize_section_tag(item, fallback_label=f"Saved Tag {idx}")
-        if normalized:
-            section_level_tags.append(normalized)
-
-    section_level_tags.extend(restored_visual_tags or [])
-
-    if section_level_tags:
-        st.session_state[f"visual_tag_intervals_{context_key}"] = _deduplicate_visual_tags(section_level_tags)
-
-    # Restore browser Hit results from saved JSON, but keep only rows that
-    # correspond to the saved Track 4 tags. Older saves/browser localStorage may
-    # contain stale rows from tags that were already removed.
-    saved_hit_results = uploaded_data.get("hit_results", []) or []
-    if not saved_hit_results:
-        saved_hit_results = (
-            (uploaded_data.get("dashboard_state", {}) or {})
-            .get("widget_state", {})
-            .get(f"hit_result_history_{context_key}", [])
-        )
-
-    if isinstance(saved_hit_results, list):
-        cleaned_hit_rows = _filter_hit_result_rows_for_tags(
-            saved_hit_results,
-            section_level_tags,
-        )
-        if cleaned_hit_rows:
-            st.session_state[f"hit_result_history_{context_key}"] = cleaned_hit_rows
-        else:
-            st.session_state.pop(f"hit_result_history_{context_key}", None)
+    _replace_saved_tag_state(uploaded_data, context_key)
 
     def _maybe_clamp(ts):
         if pd.isna(ts):
@@ -1735,7 +1763,53 @@ def _apply_loaded_review_to_state(
 
             st.session_state[f"agent_severity_1_{context_key}"] = severity
 
-def render_review_loader_before_well_selector() -> dict | None:
+def _session_from_browser_snapshot(snapshot):
+    """Convert an explicit browser recovery into the normal session format."""
+    if not isinstance(snapshot,dict) or snapshot.get("schema_version")!=1:
+        raise ValueError("Invalid browser draft.")
+    if not isinstance(snapshot.get("tags"),list) or not isinstance(snapshot.get("hit_results",[]),list):
+        raise ValueError("Invalid browser draft tag/result collection.")
+    context_key=str(snapshot.get("context_key") or "")
+    well=snapshot.get("selected_well")
+    sections=snapshot.get("selected_sections")
+    if not well or not isinstance(sections,list) or not sections or _make_context_key_from_loaded_parts(well,sections)!=context_key:
+        raise ValueError("The browser draft has no valid well/section.")
+    base=snapshot.get("session_base") or {}
+    if not isinstance(base,dict):
+        raise ValueError("Invalid browser draft settings.")
+    payload=json.loads(json.dumps(base))
+    context=payload.setdefault("dashboard_context",{})
+    if context.get("context_key",context_key)!=context_key or context.get("selected_well",well)!=well:
+        raise ValueError("Browser draft context does not match its tags.")
+    context.update(selected_well=well,selected_sections=sections,context_key=context_key,
+                   selected_agent_name=snapshot.get("selected_agent",""),
+                   agent_source=snapshot.get("agent_source",""))
+    if not context.get("selected_agent_choice"):
+        agent=snapshot.get("selected_agent","")
+        source="activity::" if snapshot.get("agent_source")=="Activity agent" else "symptom::"
+        context["selected_agent_choice"]=source+agent
+    payload["tag_intervals"]=snapshot["tags"]
+    tags=_saved_session_tags(payload,context_key)
+    drawn=[tag for tag in tags if tag["source"]=="chart_drag"]
+    payload.update(tag_intervals=tags,drawn_tag_intervals=drawn,tag_ledger=drawn,
+                   manual_tagger_intervals=[tag for tag in tags if tag["source"]!="chart_drag"],
+                   hit_results=_filter_hit_result_rows_for_tags(snapshot.get("hit_results",[]),tags),
+                   agent_intervals=snapshot.get("agent_intervals",[]))
+    widget=payload.setdefault("dashboard_state",{}).setdefault("widget_state",{})
+    if snapshot.get("viewport_start") is not None:
+        widget[f"virtual_viewport_start_{context_key}"]=snapshot["viewport_start"]
+    if snapshot.get("viewport_span_seconds") is not None:
+        widget[f"virtual_viewport_span_seconds_{context_key}"]=snapshot["viewport_span_seconds"]
+    if snapshot.get("marker_display") is not None:
+        widget[f"marker_display_{context_key}"]=snapshot["marker_display"]
+    if snapshot.get("tag_mode") is not None:
+        widget[f"virtual_tag_mode_{context_key}"]=snapshot["tag_mode"]
+    payload["browser_draft_recovery"]={"saved_at":snapshot.get("saved_at"),"sequence":snapshot.get("sequence")}
+    _validate_saved_ui_settings(payload,context_key)
+    return payload
+
+
+def render_review_loader_before_well_selector(sections_by_well=None) -> dict | None:
     """
     Load a saved review JSON before well/section selection.
 
@@ -1749,6 +1823,8 @@ def render_review_loader_before_well_selector() -> dict | None:
     """
     with st.sidebar:
         st.subheader("Load Dashboard Session")
+        from streamlit_components.virtual_log_viewer import render_draft_recovery
+        recovery = render_draft_recovery()
 
         uploaded_review = st.file_uploader(
             " ",
@@ -1756,26 +1832,46 @@ def render_review_loader_before_well_selector() -> dict | None:
             key="review_upload_global_before_well",
         )
 
-        if uploaded_review is None:
-            return None
-
-        loaded_review_flag_key = f"_loaded_global_review_once_{uploaded_review.name}"
-        consumed_key = f"_loaded_global_review_consumed_{uploaded_review.name}"
+        contents = uploaded_review.getvalue() if uploaded_review is not None else None
+        # Streamlit keeps file_id stable across reruns and changes it on a new
+        # upload, including re-uploading identical bytes after local edits.
+        identity = ((hashlib.sha256(contents).hexdigest(), str(getattr(uploaded_review, "file_id", "")))
+                    if contents is not None else None)
+        new_recovery = (isinstance(recovery,dict) and recovery.get("event")=="recover_browser_draft"
+                        and recovery.get("request_id") and recovery["request_id"]!=st.session_state.get("_last_browser_recovery_request"))
+        new_upload = identity is not None and identity!=st.session_state.get("_loaded_review_upload_identity")
 
         # After the initial upload-triggered rerun, return the payload exactly once.
-        if st.session_state.get(loaded_review_flag_key, False):
-            if not st.session_state.get(consumed_key, False):
-                st.session_state[consumed_key] = True
+        if not new_recovery and not new_upload:
+            if st.session_state.pop("_loaded_review_upload_pending", False):
                 return st.session_state.get("_loaded_review_payload_global")
-
+            if uploaded_review is None:
+                st.session_state.pop("_loaded_review_upload_identity", None)
             return None
 
         try:
-            uploaded_data = json.load(uploaded_review)
+            uploaded_data = (_session_from_browser_snapshot(recovery.get("snapshot"))
+                             if new_recovery else json.loads(contents.decode("utf-8")))
+            # Reject malformed tag sets before changing the active dashboard.
+            context = uploaded_data.get("dashboard_context", {}) if isinstance(uploaded_data, dict) else {}
+            loaded_key = _make_context_key_from_loaded_parts(context.get("selected_well"), context.get("selected_sections", []))
+            _saved_session_tags(uploaded_data, loaded_key)
+            _validate_saved_ui_settings(uploaded_data,loaded_key)
+            if sections_by_well is not None and context.get("selected_well"):
+                well = context["selected_well"]
+                sections = [str(s).replace('"',"").strip() for s in context.get("selected_sections",[])]
+                if well not in sections_by_well or not sections or any(s not in sections_by_well[well] for s in sections):
+                    raise ValueError("The saved well/section is not available in this dashboard.")
+            saved_rows = uploaded_data.get("hit_results", ((uploaded_data.get("dashboard_state") or {}).get("widget_state") or {}).get(f"hit_result_history_{loaded_key}", []))
+            if not isinstance(saved_rows, list):
+                raise ValueError("Saved hit results must be a list")
 
             st.session_state["_loaded_review_payload_global"] = uploaded_data
-            st.session_state[loaded_review_flag_key] = True
-            st.session_state[consumed_key] = False
+            if new_recovery:
+                st.session_state["_last_browser_recovery_request"]=recovery["request_id"]
+            else:
+                st.session_state["_loaded_review_upload_identity"] = identity
+            st.session_state["_loaded_review_upload_pending"] = True
 
             context = uploaded_data.get("dashboard_context", {})
             selected_well = context.get("selected_well")
@@ -1811,6 +1907,8 @@ def render_review_loader_before_well_selector() -> dict | None:
             st.rerun()
 
         except Exception as e:
+            if new_recovery:
+                st.session_state["_last_browser_recovery_request"]=recovery["request_id"]
             st.error(f"Could not read saved review JSON: {e}")
             return None
 
@@ -2248,13 +2346,21 @@ def render_parameter_range_controls(selected_labels: list[str], context_key: str
             logical_min = float(meta.get("logical_min", 0.0))
             logical_max = float(meta.get("logical_max", 100.0))
             unit = meta.get("unit", "")
+            # A zero-width scale cannot represent a measured curve. Repair old
+            # in-memory values before constructing the bounded widget.
+            scale_key = f"max_override_{label}_{context_key}"
+            minimum_max = logical_min + max(1.0, abs(logical_min)) * 1e-6
+            existing_max = st.session_state.get(scale_key, logical_max)
+            if not isinstance(existing_max, (int, float)) or not math.isfinite(existing_max) or existing_max < minimum_max:
+                st.session_state[scale_key] = logical_max
+                st.warning(f"{label}: maximum must exceed {logical_min:g}; restored {logical_max:g}.")
 
             max_value = st.number_input(
                 f"{label} max ({unit})" if unit else f"{label} max",
-                min_value=float(logical_min),
-                value=float(logical_max),
+                min_value=minimum_max,
+                value=None if scale_key in st.session_state else float(logical_max),
                 step=max(1.0, logical_max / 20 if logical_max > 0 else 1.0),
-                key=f"max_override_{label}_{context_key}",
+                key=scale_key,
             )
             overrides[label] = (logical_min, float(max_value))
 
@@ -4648,6 +4754,15 @@ def build_agent_cfg_from_controls(
     return {
         "agent_source": agent_source,
         "selected_agent": selected_agent_name,
+        "model_configuration": {
+            kind: asdict(config) if is_dataclass(config) else {}
+            for kind, config in (
+                ("activity", controls.get("activity_ui", {}).get("config")),
+                ("symptom", controls.get("symptom_ui", {}).get("config")),
+            )
+        },
+        "prediction_coverage": (activity_cfg if agent_source == "Activity agent" else symptom_cfg).get("prediction_coverage", []) if agent_source != "None" else [],
+        "live_gap_policy": (activity_cfg if agent_source == "Activity agent" else symptom_cfg).get("live_gap_policy", ""),
         "tag_intervals": tag_intervals,
         "agent_intervals": agent_intervals,
         "show_agent_intervals": bool(controls.get("show_agent_intervals", controls.get("show_data_agent_tags", True))),
@@ -4779,6 +4894,53 @@ def build_trq_spike_evaluation_df(symptom_cfg: dict) -> pd.DataFrame:
 
     return out[columns].reset_index(drop=True)
 
+def _validate_saved_ui_settings(uploaded_data,context_key):
+    """Reject invalid active-widget values before replacing the current work."""
+    import math
+    state = uploaded_data.get("dashboard_state") or {}
+    if not isinstance(state,dict) or not isinstance(state.get("widget_state",{}),dict):
+        raise ValueError("Saved dashboard settings must be an object.")
+    widget = state.get("widget_state",{})
+    integer_limits = {
+        "act_short_window":(3,21),"act_medium_window":(6,300),"act_min_interval":(2,30),
+        "act_gap_fill":(0,10),"act_trip_static":(1,10),"sym_trq_window":(10,300),
+        "sym_trqerr_window":(20,300),"sym_trqerr_min_cycles":(2,20),"sym_trqerr_high_cycles":(5,100),
+        "sym_ps_window":(5,100),"sym_ps_gap":(0,10),"sym_op_window":(5,200),
+        "sym_op_gap":(0,10),"sym_tw_window":(5,200),"sym_tw_gap":(0,10),
+    }
+    for key,value in list(widget.items()):
+        if not str(key).endswith("_"+context_key):
+            continue
+        setting=str(key)[:-(len(context_key)+1)]
+        if setting.startswith(("act_","sym_","max_override_")) or setting=="virtual_viewport_span_seconds":
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):
+                raise ValueError(f"Invalid numeric setting: {setting}")
+            if setting in integer_limits:
+                low,high=integer_limits[setting]
+                if value!=int(value) or not low<=value<=high:
+                    raise ValueError(f"Invalid range for {setting}: expected {low}–{high}")
+            if setting=="sym_ohl_casing_depth" and value<0:
+                raise ValueError("Casing depth must be non-negative.")
+            if setting=="virtual_viewport_span_seconds" and not 30<=value<=43200:
+                raise ValueError("Saved plot span must be between 30 seconds and 12 hours.")
+            if setting.startswith("max_override_"):
+                label=setting[len("max_override_"):]
+                minimum=float(PARAMETER_CATALOG.get(label,{}).get("logical_min",0.0))
+                if value <= minimum:
+                    raise ValueError(f"Saved {label} scale maximum must exceed {minimum:g}.")
+        if setting=="marker_display" and value not in ("Lines only","Small dots","Larger dots"):
+            raise ValueError("Invalid saved curve dot setting.")
+        if setting=="virtual_tag_mode" and not isinstance(value,bool):
+            raise ValueError("Invalid saved tagging-mode setting.")
+        if setting=="virtual_viewport_start":
+            try:
+                timestamp=pd.Timestamp(value)
+                if pd.isna(timestamp) or timestamp.tzinfo is not None:
+                    raise ValueError()
+            except Exception:
+                raise ValueError("Saved plot start must use the log clock without a timezone suffix.") from None
+
+
 def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: str):
     """
     Restore widget state that must exist before early sidebar widgets render:
@@ -4791,8 +4953,9 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
     """
     if not uploaded_data:
         return
+    _validate_saved_ui_settings(uploaded_data,context_key)
 
-        _restore_locked_agent_choice_from_payload(
+    _restore_locked_agent_choice_from_payload(
         uploaded_data,
         context_key,
     )
@@ -4802,38 +4965,7 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
     widget_state = dashboard_state.get("widget_state", {}) or {}
 
 
-    # Restore durable chart-drawn tag ledger as early as possible, before the
-    # React viewer receives saved_tags. Prefer explicit tag_ledger, but remain
-    # compatible with older JSON files that only have drawn_tag_intervals.
-    ledger_candidates = (
-        uploaded_data.get("tag_ledger")
-        or widget_state.get(f"tag_ledger_{context_key}")
-        or uploaded_data.get("drawn_tag_intervals")
-        or widget_state.get(f"visual_tag_intervals_{context_key}")
-        or []
-    )
-
-    restored_ledger = []
-
-    for idx, item in enumerate(ledger_candidates or [], start=1):
-        normalized = _normalize_restored_visual_tag(item, fallback_label=f"Drawn Tag {idx}")
-        if normalized:
-            restored_ledger.append(normalized)
-
-    restored_ledger = _deduplicate_visual_tags(restored_ledger)
-
-    if restored_ledger:
-        st.session_state[f"tag_ledger_{context_key}"] = restored_ledger
-        st.session_state[f"visual_tag_intervals_{context_key}"] = restored_ledger
-
-    restored_hit_results = (
-        uploaded_data.get("hit_results")
-        or widget_state.get(f"hit_result_history_{context_key}")
-        or []
-    )
-
-    if isinstance(restored_hit_results, list):
-        st.session_state[f"hit_result_history_{context_key}"] = restored_hit_results
+    _replace_saved_tag_state(uploaded_data, context_key, new_edit_session=True)
 
 
 
@@ -4858,11 +4990,19 @@ def apply_loaded_dashboard_state_early(uploaded_data: dict | None, context_key: 
 
     early_prefixes = [
         "track_params_",
+        "act_",
+        "sym_",
+        "marker_display_",
+        "virtual_tag_mode_",
         "max_override_",
         "curve_source_",
         "window_index_",
         "saved_track_param_labels_",
         "plot_track_param_labels_",
+        "virtual_viewport_start_",
+        "virtual_viewport_span_seconds_",
+        "exact_time_start_",
+        "exact_time_end_",
     ]
 
     for key, value in widget_state.items():
@@ -4912,13 +5052,15 @@ def _render_dashboard_session_download_with_browser_tags(
     A normal st.download_button is prepared on the Python side before the click,
     so it cannot see unsynced browser/localStorage tags at click time.
 
-    This component reads the current browser-drawn tags from localStorage, injects
-    them into the already-built JSON payload, and downloads the final JSON in the
-    browser. Manual sidebar tags remain in the base JSON from Python.
+    This component obtains the current chart snapshot through its live provider
+    (with guarded storage fallback), then downloads a coherent session JSON.
+    Snapshot tags, result rows and viewport replace historical Python values.
     """
-    base_json_text = json.dumps(json_text)
+    base_json_text = json.dumps(json_text).replace("<","\\u003c")
     context_json = json.dumps(str(context_key or ""))
     file_name_json = json.dumps(file_name)
+    browser_token_json = json.dumps(str(st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh")))
+    prediction_revision_json = json.dumps(st.session_state.get(f"_live_prediction_revision_{context_key}", ""))
 
     components.html(
         f"""
@@ -4949,6 +5091,8 @@ def _render_dashboard_session_download_with_browser_tags(
             const baseJsonText = {base_json_text};
             const contextKey = {context_json};
             const fileName = {file_name_json};
+            const browserSessionToken = {browser_token_json};
+            const predictionRevision = {prediction_revision_json};
             const button = document.getElementById("save_dashboard_with_drawn_tags_btn");
             const status = document.getElementById("save_dashboard_with_drawn_tags_status");
 
@@ -5005,7 +5149,8 @@ def _render_dashboard_session_download_with_browser_tags(
                     status: item.status || "active",
                     created_at: item.created_at || tagId,
                     updated_at: item.updated_at || "",
-                    revision: item.revision || 1
+                    revision: item.revision || 1,
+                    edit_revision: Number(item.edit_revision || item.revision || 1)
                 }};
             }}
 
@@ -5081,9 +5226,10 @@ def _render_dashboard_session_download_with_browser_tags(
             function selectedAgentNameFromPayload(payload) {{
                 const ctx = (payload && payload.dashboard_context) ? payload.dashboard_context : {{}};
                 return String(
-                    ctx.selected_agent_choice ||
+                    ctx.selected_agent_name ||
                     ctx.selected_activity ||
                     ctx.selected_symptom ||
+                    String(ctx.selected_agent_choice || "").split("::").pop() ||
                     "data_agent"
                 ).trim() || "data_agent";
             }}
@@ -5195,7 +5341,7 @@ def _render_dashboard_session_download_with_browser_tags(
 
                 const selectedAgentName = selectedAgentNameFromPayload(payload);
                 const existingHitResults = Array.isArray(payload.hit_results) ? payload.hit_results : [];
-                const combinedHitResults = existingHitResults.concat(Array.isArray(browserHitResults) ? browserHitResults : []);
+                const combinedHitResults = Array.isArray(browserHitResults) ? browserHitResults : existingHitResults;
 
                 // Save hit-result rows only for the actual tags that will be saved
                 // in this JSON: both manual sidebar tags and browser-drawn tags.
@@ -5256,65 +5402,110 @@ def _render_dashboard_session_download_with_browser_tags(
             }}
 
             function downloadText(text, name) {{
-                const blob = new Blob([text], {{type: "application/json;charset=utf-8"}});
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
+                let host = window;
+                try {{ if (window.parent?.document) host = window.parent; }} catch (_) {{}}
+                const doc = host.document || document;
+                const urlApi = host.URL || URL;
+                const BlobType = host.Blob || Blob;
+                const blob = new BlobType([text], {{type: "application/json;charset=utf-8"}});
+                const url = urlApi.createObjectURL(blob);
+                const a = doc.createElement("a");
                 a.href = url;
                 a.download = name || "dashboard_session.json";
-                document.body.appendChild(a);
+                doc.body.appendChild(a);
                 a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+                doc.body.removeChild(a);
+                if (typeof host.setTimeout === "function") host.setTimeout(() => urlApi.revokeObjectURL(url),1000);
+                else urlApi.revokeObjectURL(url);
             }}
 
             function setStatus(message) {{
                 if (status) status.textContent = message;
             }}
 
+            function payloadFromSnapshot(basePayload, snapshot) {{
+                if (!snapshot || snapshot.schema_version !== 1 || snapshot.context_key !== contextKey ||
+                    snapshot.browser_session_token !== browserSessionToken ||
+                    !Array.isArray(snapshot.tags) || !Array.isArray(snapshot.hit_results)) {{
+                    throw new Error("The chart is still syncing. Please try Save again.");
+                }}
+                const selected = selectedAgentNameFromPayload(basePayload);
+                if (predictionRevision && snapshot.prediction_revision !== predictionRevision) {{
+                    throw new Error("The current agent results are still syncing. Please try Save again.");
+                }}
+                if (selected && selected !== snapshot.selected_agent) {{
+                    throw new Error("The selected agent is still syncing. Please try Save again.");
+                }}
+                const payload = basePayload;
+                payload.dashboard_context = payload.dashboard_context || {{}};
+                payload.dashboard_state = payload.dashboard_state || {{}};
+                payload.dashboard_state.widget_state = payload.dashboard_state.widget_state || {{}};
+                const widget = payload.dashboard_state.widget_state;
+                // Presence matters: [] is the current state after deleting the last tag.
+                const tags = deduplicate(snapshot.tags);
+                const drawn = tags.filter(tag => String(tag.source || "").toLowerCase() === "chart_drag");
+                payload.tag_intervals = tags;
+                payload.drawn_tag_intervals = drawn;
+                payload.tag_ledger = drawn;
+                payload.manual_tagger_intervals = tags.filter(tag => String(tag.source || "").toLowerCase() !== "chart_drag");
+                payload.hit_results = [];
+                // Reuse exact ID + boundary checks with an empty historical row set.
+                mergePayloadWithDrawnTags(payload, [], snapshot.hit_results);
+                if (payload.hit_results.length !== tags.length) {{
+                    throw new Error("Tag results are still syncing. Please try Save again.");
+                }}
+                widget["tag_ledger_" + contextKey] = drawn;
+                widget["visual_tag_intervals_" + contextKey] = tags;
+                widget["deleted_tag_ids_" + contextKey] = snapshot.deleted_tag_ids || [];
+                widget["hit_result_history_" + contextKey] = payload.hit_results;
+                widget["virtual_viewport_start_" + contextKey] = snapshot.viewport_start;
+                widget["virtual_viewport_span_seconds_" + contextKey] = snapshot.viewport_span_seconds;
+                if (snapshot.marker_display) widget["marker_display_" + contextKey] = snapshot.marker_display;
+                if (typeof snapshot.tag_mode === "boolean") widget["virtual_tag_mode_" + contextKey] = snapshot.tag_mode;
+                payload.agent_intervals = snapshot.agent_intervals || [];
+                payload.preview_snapshot = {{
+                    schema_version: snapshot.schema_version, sequence: snapshot.sequence,
+                    prediction_revision: snapshot.prediction_revision,
+                    selected_agent: snapshot.selected_agent, agent_source: snapshot.agent_source,
+                    buffer_start: snapshot.buffer_start, buffer_end: snapshot.buffer_end,
+                    prediction_coverage: snapshot.prediction_coverage,
+                    live_gap_policy: snapshot.live_gap_policy,
+                }};
+                const hits = payload.hit_results.filter(row => row.result === "Hit").length;
+                const misses = payload.hit_results.filter(row => row.result === "Miss").length;
+                const evaluated = hits + misses;
+                const threshold = Number(payload.summary?.acceptance_threshold_percent || 95);
+                payload.summary = {{
+                    tag_count: tags.length, agent_count: payload.agent_intervals.length,
+                    overlap_count: hits, miss_count: misses,
+                    not_evaluable_count: tags.length - evaluated,
+                    score_percent: evaluated ? Math.round(1000 * hits / evaluated) / 10 : null,
+                    acceptance_threshold_percent: threshold,
+                    accepted: tags.length > 0 && evaluated === tags.length && 100 * hits / evaluated >= threshold,
+                    scope: "live_buffer_preview",
+                }};
+                return payload;
+            }}
+
             function doSave() {{
-                let basePayload = null;
                 try {{
-                    basePayload = JSON.parse(baseJsonText);
-                }} catch (e) {{
-                    alert("Could not prepare the saved dashboard JSON.");
-                    return;
-                }}
-
-                const browserAllTags = readBrowserAllTags();
-                const browserDrawnTags = browserAllTags.length
-                    ? browserAllTags.filter(function(tag) {{
-                        return String((tag && tag.source) || "").toLowerCase() === "chart_drag";
-                    }})
-                    : readBrowserDrawnTags();
-                
-                const browserHitResults = readBrowserHitResults();
-                const finalPayload = mergePayloadWithDrawnTags(basePayload, browserDrawnTags, browserHitResults);
-
-                if (browserAllTags.length) {{
-                    const allTags = deduplicate(browserAllTags);
-                    const manualTags = allTags.filter(function(tag) {{
-                        return String((tag && tag.source) || "").toLowerCase() !== "chart_drag";
-                    }});
-                    const drawnTags = allTags.filter(function(tag) {{
-                        return String((tag && tag.source) || "").toLowerCase() === "chart_drag";
-                    }});
-
-                    finalPayload.manual_tagger_intervals = manualTags;
-                    finalPayload.drawn_tag_intervals = drawnTags;
-                    finalPayload.tag_ledger = drawnTags;
-                    finalPayload.dashboard_state.widget_state["tag_ledger_" + contextKey] = drawnTags;
-                    finalPayload.tag_intervals = allTags;
-                    finalPayload.dashboard_state.widget_state["visual_tag_intervals_" + contextKey] = drawnTags;
-                }}
-                const finalText = JSON.stringify(finalPayload, null, 2);
-
-                downloadText(finalText, fileName);
-
-                if (browserDrawnTags.length) {{
-                        setStatus("Saved with " + browserDrawnTags.length + " drawn tag(s) and " + browserHitResults.length + " hit-result row(s).");
+                    const basePayload = JSON.parse(baseJsonText);
+                    const key = "hoda_dashboard_snapshot_" + contextKey + "_" + browserSessionToken;
+                    let provider = null;
+                    try {{ provider = window.parent?.__drillmateSnapshotProviders?.[contextKey + "_" + browserSessionToken]; }} catch (_) {{}}
+                    let snapshot;
+                    if (typeof provider === "function") {{
+                        snapshot = provider();
                     }} else {{
-                        setStatus("Saved.");
+                        const raw = window.localStorage.getItem(key);
+                        snapshot = raw === null ? null : JSON.parse(raw);
                     }}
+                    const finalPayload = payloadFromSnapshot(basePayload, snapshot);
+                    downloadText(JSON.stringify(finalPayload, null, 2), fileName);
+                    setStatus("Saved " + finalPayload.tag_intervals.length + " tag(s) and " + finalPayload.hit_results.length + " result row(s).");
+                }} catch (error) {{
+                    setStatus(error.message || "Could not save the current dashboard session.");
+                }}
             }}
 
             if (button) {{
@@ -5389,6 +5580,27 @@ def render_agent_review_outputs(
 
         selected_agent_name = str(agent_cfg.get("selected_agent", "") or "data_agent").strip()
         selected_agent_name = selected_agent_name or "data_agent"
+
+        export_payload = json.loads(json_text)
+        export_payload["dashboard_context"]["selected_agent_name"] = selected_agent_name
+        compact_widget = {
+            key:value for key,value in export_payload["dashboard_state"]["widget_state"].items()
+            if not key.startswith(("tag_ledger_","visual_tag_intervals_","deleted_tag_ids_","hit_result_history_",
+                                   "virtual_log_viewer_","agent_interval_table_","virtual_last_viewport_request_"))
+        }
+        st.session_state[f"_virtual_session_base_{context_key}"] = {
+            "dashboard_context":export_payload["dashboard_context"],
+            "dashboard_state":{"schema_version":2,"widget_state":compact_widget},
+            "plot_track_param_labels":export_payload["plot_track_param_labels"],
+        }
+        # The chart supplies tags, rows and viewport atomically at click time.
+        # Keep changing tag/row values out of the button's static HTML to avoid
+        # unnecessary iframe replacement around an immediate Save click.
+        button_payload = {
+            **st.session_state[f"_virtual_session_base_{context_key}"],
+            "summary":{"acceptance_threshold_percent":summary["acceptance_threshold_percent"]},
+        }
+        json_text = json.dumps(button_payload, ensure_ascii=False, sort_keys=True)
 
         well_name = str(selected_well or "well").strip() or "well"
         section_name = "_".join(str(sec).replace('"', "").strip() for sec in (selected_sections or []))

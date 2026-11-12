@@ -1,3 +1,6 @@
+import hashlib
+import base64
+from io import BytesIO
 import json
 import re
 import uuid
@@ -5,6 +8,43 @@ import uuid
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
+from services.virtual_window_service import AGENT_INTERVAL_LEAD_FRACTION, agent_interval_view_start
+
+_INTERVAL_WINDOW_COLUMNS = {"window", "window_start", "window_end"}
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _agent_interval_excel_bytes(rows_json: str, columns: tuple[str, ...]) -> bytes:
+    """Office-editable event list; processing-window metadata stays internal."""
+    selected=[name for name in columns if str(name).strip().lower() not in _INTERVAL_WINDOW_COLUMNS]
+    frame=pd.DataFrame(json.loads(rows_json)).reindex(columns=selected).copy()
+    def excel_time(value):
+        if value is None:return None
+        try:
+            stamp=pd.Timestamp(value)
+        except (ValueError,TypeError):
+            return str(value)
+        if pd.isna(stamp):return None
+        # Excel dates use the same visible log clock, without a timezone suffix.
+        if stamp.tzinfo is not None:stamp=stamp.tz_localize(None)
+        return stamp.to_pydatetime()
+    for name in ('start','end'):
+        if name in frame:frame[name]=frame[name].map(excel_time)
+    frame=frame.rename(columns={'label':'Data agent','start':'Start','end':'End',
+                                'severity':'Severity','source':'Source'})
+    output=BytesIO()
+    with pd.ExcelWriter(output,engine='openpyxl',datetime_format='yyyy-mm-dd hh:mm:ss') as writer:
+        frame.to_excel(writer,index=False,sheet_name='Agent intervals')
+        sheet=writer.sheets['Agent intervals']
+        sheet.freeze_panes='A2'
+        sheet.auto_filter.ref=sheet.dimensions
+        for cells in sheet.iter_cols():
+            name=cells[0].value
+            sheet.column_dimensions[cells[0].column_letter].width=23 if name in ('Start','End') else 22
+            if name in ('Start','End'):
+                for cell in cells[1:]:cell.number_format='yyyy-mm-dd hh:mm:ss'
+    return output.getvalue()
 
 
 def render_dashboard_header(
@@ -35,11 +75,68 @@ def render_review_caption(summary: dict):
         )
 
 
+def _apply_agent_interval_click(value, starts: tuple, context_key: str, table_revision: str) -> bool:
+    """Apply a real timestamp-button click once, using the original row identity."""
+    if not isinstance(value, dict) or value.get("event") != "agent_interval_click":
+        return False
+    editor_token = st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh")
+    if (value.get("context_key") != context_key or value.get("table_revision") != table_revision
+            or value.get("browser_session_token") != editor_token):
+        return False
+    row = value.get("row_index")
+    request_id = value.get("request_id")
+    if (not isinstance(row, int) or isinstance(row, bool) or not 0 <= row < len(starts)
+            or not isinstance(request_id, str) or not request_id):
+        return False
+    # Streamlit retains each table's last value when switching agents. Keep
+    # the consumed ID per table/editor so returning to it cannot replay it.
+    last_key = f"_last_agent_interval_click_{context_key}_{table_revision}_{editor_token}"
+    if st.session_state.get(last_key) == request_id:
+        return False
+    order_key = f"_agent_interval_click_order_{context_key}_{editor_token}"
+    order = value.get("request_order")
+    if order is not None:
+        if not isinstance(order, int) or isinstance(order, bool) or order <= max(
+                st.session_state.get(order_key, 0),
+                st.session_state.get(f"_virtual_viewport_order_{context_key}_{editor_token}",0)):
+            return False
+    elif st.session_state.get(order_key, 0):
+        # A queued value from the previous frontend cannot replace a new click.
+        return False
+    try:
+        start = pd.Timestamp(starts[row])
+    except (TypeError, ValueError):
+        return False
+    if pd.isna(start):
+        return False
+
+    st.session_state[last_key] = request_id
+    if order is not None:
+        st.session_state[order_key] = order
+    st.session_state[f"_virtual_navigation_request_{context_key}"] = {
+        "id": request_id,
+        "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "browser_session_token": editor_token,
+        "order": order or 0,
+        "lead_in_fraction": AGENT_INTERVAL_LEAD_FRACTION,
+    }
+    # The destination is authoritative before the next buffer is constructed.
+    # React still supplies its live zoom span; navigation no longer depends on
+    # that response arriving before Python can move away from the old window.
+    st.session_state[f"virtual_viewport_start_{context_key}"] = agent_interval_view_start(
+        start, st.session_state.get(f"virtual_viewport_span_seconds_{context_key}", 12 * 3600),
+    )
+    count_key = f"_agent_interval_table_generation_{context_key}"
+    st.session_state[count_key] = int(st.session_state.get(count_key, 0)) + 1
+    return True
+
+
 def render_result_tables(
     activity_cfg: dict,
     symptom_cfg: dict,
     activity_validation_df: pd.DataFrame,
     review_df: pd.DataFrame,
+    context_key: str | None = None,
 ):
     if not activity_cfg["summary_df"].empty:
         if st.session_state.get("_show_hidden_activity_summary", False):
@@ -63,7 +160,33 @@ def render_result_tables(
             if symptom_rows.empty:
                 st.info("No intervals were detected for the selected data agent in the selected section.")
             else:
-                st.dataframe(symptom_rows, width="stretch")
+                if context_key and "start" in symptom_rows.columns:
+                    rows_json=json.dumps(interval_rows, default=str)
+                    fingerprint = hashlib.sha256(
+                        json.dumps(interval_rows, default=str, sort_keys=True).encode()
+                    ).hexdigest()[:16]
+                    editor_token = str(st.session_state.get(f"_virtual_browser_session_token_{context_key}", "fresh"))
+                    table_key = f"agent_interval_table_{context_key}_{agent_source}_{selected_agent}_{fingerprint}_{editor_token}"
+                    st.caption("Click a Start time to show the event with earlier context. The current time scale is preserved.")
+                    from streamlit_components.virtual_log_viewer import render_agent_interval_table
+                    click = render_agent_interval_table(
+                        key=table_key,
+                        context_key=context_key,
+                        browser_session_token=editor_token,
+                        latest_click_order=max(
+                            st.session_state.get(f"_agent_interval_click_order_{context_key}_{editor_token}", 0),
+                            st.session_state.get(f"_virtual_viewport_order_{context_key}_{editor_token}",0)),
+                        table_revision=fingerprint,
+                        columns=list(symptom_rows.columns),
+                        rows=json.loads(rows_json),
+                        excel_base64=base64.b64encode(_agent_interval_excel_bytes(
+                            rows_json,tuple(symptom_rows.columns))).decode('ascii'),
+                        excel_filename=re.sub(r'[^A-Za-z0-9._-]+','_',f'agent_intervals_{context_key}_{selected_agent}')+'.xlsx',
+                    )
+                    if _apply_agent_interval_click(click, tuple(symptom_rows["start"]), context_key, fingerprint):
+                        st.rerun()
+                else:
+                    st.dataframe(symptom_rows, width="stretch")
 
     if not activity_validation_df.empty:
         with st.expander("Activity validation against manual tags", expanded=False):

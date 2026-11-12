@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import math
 import pandas as pd
+from services.live_gap_service import gap_break_positions
+
+AGENT_INTERVAL_LEAD_FRACTION = 1 / 12
+
+
+def agent_interval_view_start(start, visible_seconds=12 * 3600, *, lead_fraction=AGENT_INTERVAL_LEAD_FRACTION):
+    """Leave context before the event: one hour in a twelve-hour viewport."""
+    try:
+        seconds = float(visible_seconds)
+    except (TypeError, ValueError):
+        seconds = 12 * 3600
+    if not math.isfinite(seconds):
+        seconds = 12 * 3600
+    seconds = max(30.0, min(seconds, 12 * 3600))
+    return pd.Timestamp(start) - pd.Timedelta(seconds=seconds * lead_fraction)
 
 
 def dataframe_to_track_payload(
@@ -10,6 +26,7 @@ def dataframe_to_track_payload(
     track_param_labels: list[list[str]],
     parameter_units: dict[str, str] | None = None,
     parameter_ranges: dict[str, tuple[float, float]] | None = None,
+    gap_plan: dict | None = None,
 ) -> dict:
     """
     Convert the currently loaded raw buffer into a compact JSON payload.
@@ -81,4 +98,6 @@ def dataframe_to_track_payload(
         "time_start": idx_text[0] if idx_text else None,
         "time_end": idx_text[-1] if idx_text else None,
         "sample_count": len(idx_text),
+        "gap_after_indices": gap_break_positions(df.index,
+            sections=df['_section_in'] if '_section_in' in df else None, plan=gap_plan),
     }

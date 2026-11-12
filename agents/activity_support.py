@@ -126,7 +126,7 @@ def bool_to_intervals(
     start = None
     count = 0
 
-    for ts, flag in mask.items():
+    for position, (ts, flag) in enumerate(mask.items()):
         if flag and start is None:
             start = ts
             count = 1
@@ -136,7 +136,7 @@ def bool_to_intervals(
 
         elif not flag and start is not None:
             if count >= min_samples:
-                prev_ts = mask.index[mask.index.get_loc(ts) - 1]
+                prev_ts = mask.index[position - 1]
                 intervals.append(
                     {
                         "label": label,
